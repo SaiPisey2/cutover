@@ -1,6 +1,12 @@
 package pg
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/SaiPisey2/cutover/internal/redact"
+)
 
 func TestObjectName(t *testing.T) {
 	if got := ObjectName("shop-eu", "fwd"); got != "cutover_shop_eu_fwd" {
@@ -13,7 +19,20 @@ func TestObjectName(t *testing.T) {
 }
 
 func TestLiteral(t *testing.T) {
-	if got := literal("host=a password='x'y"); got != `'host=a password=''x''y'` {
+	if got := literal("host=a password='x'y"); got != `E'host=a password=''x''y'` {
 		t.Fatal(got)
+	}
+}
+
+func TestLiteralBackslash(t *testing.T) {
+	if got := literal(`a\b'c`); got != `E'a\\b''c'` {
+		t.Fatal(got)
+	}
+}
+
+func TestSubscriptionErrorsMaskConninfo(t *testing.T) {
+	err := redact.Err(errors.New(`could not connect: host=db user=app password=s3cr3t dbname=app`))
+	if strings.Contains(err.Error(), "s3cr3t") {
+		t.Fatal(err)
 	}
 }
