@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
 
 	"github.com/SaiPisey2/cutover/internal/itest"
 	"github.com/SaiPisey2/cutover/internal/ops"
@@ -284,5 +285,58 @@ func TestPausePoolUnderGlobalPauseIsPermanent(t *testing.T) {
 	var app *temporal.ApplicationError
 	if !errors.As(err, &app) || !app.NonRetryable() || app.Type() != ops.ErrTypePermanent || !strings.Contains(err.Error(), "globally paused") {
 		t.Fatalf("%#v", err)
+	}
+}
+
+// A plan table missing on the source is reported, not retried forever.
+func TestCompareDataMissingSourceTable(t *testing.T) {
+	seed(t)
+	e, a := env(t)
+	p := itest.Plan(t)
+	tables := []string{"public.orders"}
+	if _, err := e.ExecuteActivity(a.PrepareSchema, ops.TablesIn{Plan: p, Tables: tables}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := e.ExecuteActivity(a.CompareData, ops.TablesIn{Plan: p, Tables: []string{"public.ghost"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checks []pg.TableCheck
+	_ = v.Get(&checks)
+	if len(checks) != 1 || checks[0].Match || !strings.Contains(checks[0].Note, "not on the source") {
+		t.Fatalf("%+v", checks)
+	}
+}
+
+// Cancelling the activity while PAUSE waits for a transaction to drain
+// reports cancellation, not a pause timeout.
+func TestPausePoolCancelled(t *testing.T) {
+	itest.Reset(t)
+	p := itest.Plan(t)
+	ctx := context.Background()
+	pool := itest.Conn(t, itest.PoolDSN)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()); itest.Reset(t) })
+
+	var s testsuite.WorkflowTestSuite
+	e := s.NewTestActivityEnvironment()
+	bg, cancel := context.WithCancel(context.Background())
+	e.SetWorkerOptions(worker.Options{BackgroundActivityContext: bg})
+	a := ops.New()
+	e.RegisterActivity(a)
+	time.AfterFunc(300*time.Millisecond, cancel)
+	_, err = e.ExecuteActivity(a.PausePool, ops.PoolIn{Plan: p, Timeout: 10 * time.Second})
+	// A cancel through BackgroundActivityContext is not a server cancel, so
+	// the SDK reports the activity's context.Canceled as a failure carrying
+	// that message; a server cancel is reported as cancelled (fail keeps
+	// context.Canceled, see TestFailKeepsCancellation).
+	if err == nil || !strings.Contains(err.Error(), "context canceled") || strings.Contains(err.Error(), "did not complete in time") {
+		t.Fatalf("want the activity to return context.Canceled, got %v", err)
 	}
 }

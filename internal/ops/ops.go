@@ -8,9 +8,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
@@ -110,7 +112,8 @@ func permanentf(format string, a ...any) error { return &permanent{msg: fmt.Spri
 // inner errors may still hold a password. An application error built further
 // down is rebuilt the same way, keeping its type and retryability. A
 // cancellation stays context.Canceled, so Temporal reports the activity
-// cancelled rather than failed.
+// cancelled rather than failed. Errors isPermanent recognises become
+// non-retryable ErrTypePermanent; everything else is ErrTypeTransient.
 func fail(err error) error {
 	if err == nil {
 		return nil
@@ -126,11 +129,30 @@ func fail(err error) error {
 		}
 		return temporal.NewApplicationError(msg, app.Type())
 	}
-	var p *permanent
-	if errors.As(err, &p) {
+	if isPermanent(err) {
 		return temporal.NewNonRetryableApplicationError(msg, ErrTypePermanent, nil)
 	}
 	return temporal.NewApplicationError(msg, ErrTypeTransient)
+}
+
+// permanentCodes are SQLSTATEs a retry cannot fix: undefined table,
+// insufficient privilege, undefined object.
+var permanentCodes = map[string]bool{"42P01": true, "42501": true, "42704": true}
+
+// isPermanent reports whether retrying err is pointless. It must be called
+// on the original error: the SQLSTATE is lost once the error is flattened.
+func isPermanent(err error) bool {
+	var p *permanent
+	if errors.As(err, &p) {
+		return true
+	}
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && permanentCodes[pe.Code] {
+		return true
+	}
+	// pg_dump and psql refuse a server newer than themselves; covers
+	// "aborting because of server version mismatch".
+	return strings.Contains(err.Error(), "server version mismatch")
 }
 
 func pgFor(p plan.Plan, s Side) plan.Postgres {

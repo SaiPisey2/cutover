@@ -111,6 +111,9 @@ func (a *Activities) PrepareSchema(ctx context.Context, in TablesIn) (err error)
 	})
 }
 
+// UndoPrepare drops the plan tables on the target and cutover's sentinel
+// schema on both sides. It must run after StopLink: the sentinel table is in
+// the link's publication, and its schema is dropped with CASCADE.
 func (a *Activities) UndoPrepare(ctx context.Context, in TablesIn) (err error) {
 	defer func() { err = fail(err) }()
 	src, tgt, closeAll, err := both(ctx, in)
@@ -191,19 +194,21 @@ func compareData(ctx context.Context, in TablesIn) ([]pg.TableCheck, error) {
 	var out []pg.TableCheck
 	for _, name := range in.Tables {
 		chk := pg.TableCheck{Table: name}
+		// Looked up first: Estimate on a missing table is an error, and the
+		// report should say what is wrong instead.
+		t, ok := byName[name]
+		if !ok {
+			chk.Note = "not on the source: not sampled"
+			out = append(out, chk)
+			continue
+		}
 		if chk.SourceEstimate, err = pg.Estimate(ctx, src, name); err != nil {
 			return nil, err
 		}
 		if chk.TargetEstimate, err = pg.Estimate(ctx, tgt, name); err != nil {
 			return nil, err
 		}
-		t, ok := byName[name]
-		switch {
-		case !ok:
-			chk.Note = "not on the source: not sampled"
-			out = append(out, chk)
-			continue
-		case len(t.PKCols) == 0:
+		if len(t.PKCols) == 0 {
 			chk.Note = "no primary key: not sampled"
 			out = append(out, chk)
 			continue
@@ -428,10 +433,16 @@ func admin(ctx context.Context, p plan.Plan) (*pgbouncer.Admin, error) {
 	return ad, nil
 }
 
-// pauseErr maps Pause's errors: a global pause is someone else's and will
+// pauseErr maps Pause's errors: cancellation of the activity (ctx) stays
+// cancellation; a global pause is someone else's and will
 // not lift by retrying; a pause timeout is retryable (a retry sends PAUSE
 // again and waits for the drain).
-func pauseErr(err error) error {
+func pauseErr(ctx context.Context, err error) error {
+	// Pause reports ErrPauseTimeout whenever its context ends, including when
+	// the activity itself was cancelled; that must stay a cancellation.
+	if err != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return context.Canceled
+	}
 	if errors.Is(err, pgbouncer.ErrGlobalPause) {
 		return permanentf("%v: cutover will not pause or resume a pooler someone else paused as a whole", err)
 	}
@@ -452,7 +463,7 @@ func (a *Activities) PausePool(ctx context.Context, in PoolIn) (err error) {
 		defer ad.Close(context.Background())
 		pctx, cancel := context.WithTimeout(ctx, in.Timeout)
 		defer cancel()
-		return pauseErr(ad.Pause(pctx, in.Plan.Database.Name))
+		return pauseErr(ctx, ad.Pause(pctx, in.Plan.Database.Name))
 	})
 }
 
