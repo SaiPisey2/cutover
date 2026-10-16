@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/SaiPisey2/cutover/internal/plan"
 )
 
 var (
 	ErrPauseTimeout = errors.New("pgbouncer: pause did not complete in time")
 	ErrNoDatabase   = errors.New("pgbouncer: no such database")
+	ErrGlobalPause  = errors.New("pgbouncer is globally paused; resume it first")
 )
 
 // Admin is a connection to the admin console (database "pgbouncer"). It
@@ -71,19 +73,39 @@ func (a *Admin) Databases(ctx context.Context) ([]Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("show databases: %w", err)
 	}
+	return parseDatabases(rows), nil
+}
+
+func parseDatabases(rows []map[string]string) []Database {
 	out := make([]Database, 0, len(rows))
 	for _, m := range rows {
 		port, _ := strconv.Atoi(m["port"])
 		out = append(out, Database{Name: m["name"], Host: m["host"], Port: port, DB: m["database"], Paused: m["paused"] == "1"})
 	}
-	return out, nil
+	return out
+}
+
+// checkName keeps every admin command to a plan identifier, so a name can
+// never smuggle a second command or argument onto the console.
+func checkName(name string) error {
+	if !plan.Ident.MatchString(name) {
+		return fmt.Errorf("pgbouncer: database name %q must match %s", name, plan.Ident)
+	}
+	return nil
 }
 
 func (a *Admin) Database(ctx context.Context, name string) (Database, error) {
+	if err := checkName(name); err != nil {
+		return Database{}, err
+	}
 	dbs, err := a.Databases(ctx)
 	if err != nil {
 		return Database{}, err
 	}
+	return find(dbs, name)
+}
+
+func find(dbs []Database, name string) (Database, error) {
 	for _, d := range dbs {
 		if d.Name == name {
 			return d, nil
@@ -101,66 +123,39 @@ func (a *Admin) Database(ctx context.Context, name string) (Database, error) {
 // PgBouncer sets that column the moment PAUSE arrives, while transactions
 // are still draining, so a retried pause that trusted it would report
 // success early. A repeated per-database PAUSE waits for the drain again.
-// If PgBouncer refuses the repeat instead ("already suspended/paused") (global pause mode, or a
-// version that refuses the repeat), Pause polls SHOW POOLS until no server
-// connection of name is active.
+//
+// While a global PAUSE or SUSPEND is in force PgBouncer refuses PAUSE <db>
+// with "already suspended/paused". Pause returns ErrGlobalPause then: whoever
+// paused the whole pooler owns it, and cutover must not resume it for them.
 func (a *Admin) Pause(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
 	if _, err := a.Database(ctx, name); err != nil {
+		if ctx.Err() != nil {
+			return ErrPauseTimeout
+		}
 		return err
 	}
 	if _, err := a.query(ctx, "PAUSE "+name); err != nil {
 		if ctx.Err() != nil {
 			return ErrPauseTimeout
 		}
-		if !alreadyPaused(err) {
-			return fmt.Errorf("pause %s: %w", name, err)
+		if strings.Contains(strings.ToLower(err.Error()), "already suspended/paused") {
+			return ErrGlobalPause
 		}
-		return a.waitDrained(ctx, name)
+		return fmt.Errorf("pause %s: %w", name, err)
 	}
 	return nil
-}
-
-// alreadyPaused matches PgBouncer's refusal of a repeated pause. 1.24
-// answers "already suspended/paused" when a global PAUSE is in force.
-func alreadyPaused(err error) bool {
-	m := strings.ToLower(err.Error())
-	return strings.Contains(m, "already paused") || strings.Contains(m, "already suspended")
-}
-
-// waitDrained polls SHOW POOLS until name has no active server connection.
-func (a *Admin) waitDrained(ctx context.Context, name string) error {
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		rows, err := a.query(ctx, "SHOW POOLS")
-		if err != nil {
-			if ctx.Err() != nil {
-				return ErrPauseTimeout
-			}
-			return fmt.Errorf("pause %s: show pools: %w", name, err)
-		}
-		active := 0
-		for _, m := range rows {
-			if m["database"] == name {
-				n, _ := strconv.Atoi(m["sv_active"])
-				active += n
-			}
-		}
-		if active == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ErrPauseTimeout
-		case <-tick.C:
-		}
-	}
 }
 
 // Resume always sends RESUME, because a pause that timed out leaves the
 // database pausing: paused=1 in SHOW DATABASES while transactions still
 // drain. Not being paused is fine.
 func (a *Admin) Resume(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
 	if _, err := a.query(ctx, "RESUME "+name); err != nil &&
 		!strings.Contains(strings.ToLower(err.Error()), "not paused") {
 		return fmt.Errorf("resume %s: %w", name, err)
@@ -178,6 +173,9 @@ func (a *Admin) Reload(ctx context.Context) error {
 // Reconnect closes name's server connections as they are released, so the
 // next transaction opens one to the current host.
 func (a *Admin) Reconnect(ctx context.Context, name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
 	if _, err := a.query(ctx, "RECONNECT "+name); err != nil {
 		return fmt.Errorf("reconnect %s: %w", name, err)
 	}

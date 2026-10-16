@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/SaiPisey2/cutover/internal/itest"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
 )
@@ -202,5 +204,53 @@ func TestRetriedPauseStillWaitsForDrain(t *testing.T) {
 	}
 	if err := d.Resume(ctx, "app"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A global PAUSE (or SUSPEND) makes PgBouncer refuse PAUSE <db> with
+// "already suspended/paused". Pause must say so, not report success.
+func TestGlobalPauseIsRefused(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	g, err := pgconn.Connect(ctx, itest.AdminDSN)
+	if err != nil {
+		t.Fatalf("%v (run: make itest-up)", err)
+	}
+	t.Cleanup(func() {
+		if r, err := pgconn.Connect(context.Background(), itest.AdminDSN); err == nil {
+			_, _ = r.Exec(context.Background(), "RESUME").ReadAll()
+			r.Close(context.Background())
+		}
+		g.Close(context.Background())
+	})
+	if _, err := g.Exec(ctx, "PAUSE").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	a := dial(t)
+	if err := a.Pause(ctx, "app"); !errors.Is(err, pgbouncer.ErrGlobalPause) {
+		t.Fatalf("got %v, want ErrGlobalPause", err)
+	}
+	if _, err := g.Exec(ctx, "RESUME").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Pause(ctx, "app"); err != nil {
+		t.Fatalf("after global resume: %v", err)
+	}
+	if err := a.Resume(ctx, "app"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPauseWithDoneContextTimesOut(t *testing.T) {
+	itest.Reset(t)
+	a := dial(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.Pause(ctx, "app"); !errors.Is(err, pgbouncer.ErrPauseTimeout) {
+		t.Fatalf("got %v, want ErrPauseTimeout", err)
+	}
+	b := dial(t)
+	if db, err := b.Database(context.Background(), "app"); err != nil || db.Paused {
+		t.Fatalf("a pause that never ran left %+v %v", db, err)
 	}
 }

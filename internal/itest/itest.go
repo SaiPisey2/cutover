@@ -170,13 +170,7 @@ func Reset(t testing.TB) {
 			END LOOP;
 			CREATE SCHEMA public; END $$`)
 	}
-	// Docker Desktop's file share (virtiofs) can serve a routes file replaced
-	// soon after PgBouncer last read it with the old file's size: new bytes,
-	// truncated. A RELOAD of a truncated file has no [databases] entry and
-	// drops app, disconnecting its clients (reproduced: 16 of 40 rewrites
-	// from this file's old shorter format). Writing the same format as
-	// pgbouncer.WriteRoute keeps every harness routes file the same length,
-	// because SourceRoute and TargetRoute are the same length.
+	// WriteRoute's fixed-size file: see pgbouncer.RoutesFileSize.
 	if err := pgbouncer.WriteRoute(RoutesFile(t), "app", SourceRoute); err != nil {
 		t.Fatal(err)
 	}

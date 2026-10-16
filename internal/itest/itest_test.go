@@ -96,11 +96,3 @@ func TestResetCleansDirtyState(t *testing.T) {
 		t.Errorf("pool reaches %q, want source", name)
 	}
 }
-
-// Reset relies on this: on Docker Desktop a replaced routes file can be read
-// with the previous file's size, so the two routes must stay the same length.
-func TestRoutesSameLength(t *testing.T) {
-	if len(SourceRoute) != len(TargetRoute) {
-		t.Fatalf("SourceRoute and TargetRoute differ in length: %d vs %d", len(SourceRoute), len(TargetRoute))
-	}
-}
