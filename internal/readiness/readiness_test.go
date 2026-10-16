@@ -131,3 +131,58 @@ func TestPausedPoolWarnsAndClientsAreListed(t *testing.T) {
 		t.Fatal("sessions from the PgBouncer address must not block")
 	}
 }
+
+func TestFixRound1(t *testing.T) {
+	in := good()
+	r := Assess(in)
+	if !slices.Contains(codes(r, Warning), "direct-clients-unchecked") {
+		t.Fatalf("empty allow-list must warn: %+v", r.Findings)
+	}
+	in.Plan.Database.PgBouncer.Addresses = []string{"10.0.0.9"}
+	if slices.Contains(codes(Assess(in), Warning), "direct-clients-unchecked") {
+		t.Fatal("allow-list set, must not warn")
+	}
+
+	in = good()
+	in.Source.Sequences[0].Increment = -1
+	for _, f := range Assess(in).Findings {
+		if f.Code == "sequence" && !strings.Contains(f.Message, "every sequence in the plan's schemas") {
+			t.Fatalf("sequence message: %q", f.Message)
+		}
+	}
+
+	in = good()
+	in.Target.Tables = in.Source.Tables
+	for _, f := range Assess(in).Findings {
+		if f.Code == "target-not-empty" && !strings.Contains(f.Message, "drop or rename") {
+			t.Fatalf("target-not-empty message: %q", f.Message)
+		}
+	}
+	in = good()
+	in.Source.Tables[0].Unlogged = true
+	for _, f := range Assess(in).Findings {
+		if f.Code == "unlogged-table" && !strings.Contains(f.Message, "ACCESS EXCLUSIVE") {
+			t.Fatalf("unlogged message: %q", f.Message)
+		}
+	}
+
+	in = good()
+	in.PoolErr = "dial postgres://admin:hunter2@pgb:6432/pgbouncer failed"
+	for _, f := range Assess(in).Findings {
+		if strings.Contains(f.Message, "hunter2") {
+			t.Fatalf("password leaked: %q", f.Message)
+		}
+	}
+
+	in = good()
+	in.Target.UsedSlots = 10
+	if !slices.Contains(codes(Assess(in), Blocker), "slots") {
+		t.Fatal("target slot shortage must block")
+	}
+
+	in = good()
+	in.Target.Tables = []pg.Table{{Schema: "public", Name: "other"}}
+	if slices.Contains(codes(Assess(in), Blocker), "target-not-empty") {
+		t.Fatal("unplanned target table must be ignored")
+	}
+}

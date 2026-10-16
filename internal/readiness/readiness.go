@@ -11,6 +11,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/pg"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
 	"github.com/SaiPisey2/cutover/internal/plan"
+	"github.com/SaiPisey2/cutover/internal/redact"
 )
 
 type Severity string
@@ -106,7 +107,7 @@ func Assess(in Input) Report {
 		case t.Partitioned:
 			add(Blocker, "partitioned", name, "%s is partitioned; release 1 does not replicate partitioned tables", name)
 		case t.Unlogged:
-			add(Blocker, "unlogged-table", name, "%s is UNLOGGED, so its writes never reach the WAL and cannot replicate; run ALTER TABLE %s SET LOGGED first", name, name)
+			add(Blocker, "unlogged-table", name, "%s is UNLOGGED, so its writes never reach the WAL and cannot replicate; run ALTER TABLE %s SET LOGGED first (it takes an ACCESS EXCLUSIVE lock and rewrites the table)", name, name)
 		case !t.Replicable():
 			add(Blocker, "no-primary-key", name, "%s has no primary key or replica identity; add one, or set REPLICA IDENTITY FULL", name)
 		}
@@ -116,9 +117,10 @@ func Assess(in Input) Report {
 		r.Tables = append(r.Tables, name)
 	}
 	slices.Sort(r.Tables)
+	r.Tables = slices.Compact(r.Tables)
 	for _, t := range tgt.Tables {
 		if slices.Contains(r.Tables, t.Qualified()) {
-			add(Blocker, "target-not-empty", t.Qualified(), "%s already exists on the target; cutover creates the target schema itself", t.Qualified())
+			add(Blocker, "target-not-empty", t.Qualified(), "%s already exists on the target; cutover creates the target schema itself; drop or rename the table on the target, or point the plan at an empty target", t.Qualified())
 		}
 	}
 
@@ -133,16 +135,16 @@ func Assess(in Input) Report {
 	}
 	for _, s := range src.Sequences {
 		if s.Increment < 0 {
-			add(Blocker, "sequence", s.Qualified(), "%s counts down; release 1 syncs ascending sequences only", s.Qualified())
+			add(Blocker, "sequence", s.Qualified(), "%s counts down; release 1 syncs ascending sequences only (every sequence in the plan's schemas is synced at the switch, so any one of them can block)", s.Qualified())
 		}
 		if !plan.Ident.MatchString(s.Schema) || !plan.Ident.MatchString(s.Name) {
-			add(Blocker, "identifier", s.Qualified(), "%s is not a plain lowercase identifier (%s); release 1 does not quote names", s.Qualified(), plan.Ident)
+			add(Blocker, "identifier", s.Qualified(), "%s is not a plain lowercase identifier (%s); release 1 does not quote names, and every sequence in the plan's schemas is synced at the switch, so any one of them can block", s.Qualified(), plan.Ident)
 		}
 	}
 
 	switch {
 	case in.PoolErr != "":
-		add(Blocker, "pgbouncer", in.Plan.Database.Name, "cannot read PgBouncer: %s", in.PoolErr)
+		add(Blocker, "pgbouncer", in.Plan.Database.Name, "cannot read PgBouncer: %s", redact.DSN(in.PoolErr))
 	case in.Pool.Host != pgbouncer.HostOf(in.Plan.Source.Postgres.Route):
 		add(Blocker, "pgbouncer-route", in.Plan.Database.Name, "PgBouncer routes %s to %q, not the source route %q", in.Plan.Database.Name, in.Pool.Host, pgbouncer.HostOf(in.Plan.Source.Postgres.Route))
 	case in.Pool.Paused:
@@ -150,6 +152,9 @@ func Assess(in Input) Report {
 	}
 
 	prefixes := parsePrefixes(in.Plan.Database.PgBouncer.Addresses)
+	if len(prefixes) == 0 {
+		add(Warning, "direct-clients-unchecked", "source", "pgbouncer.addresses is empty, so writes that bypass PgBouncer cannot be detected; list the PgBouncer addresses to check")
+	}
 	var listed []string
 	for _, s := range src.Sessions {
 		listed = append(listed, fmt.Sprintf("%s (%d)", s.Addr, s.Count))
