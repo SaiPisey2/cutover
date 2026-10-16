@@ -1,12 +1,15 @@
 package pg
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -19,14 +22,16 @@ import (
 // proves every earlier commit has been applied.
 const SentinelTable = plan.ReservedSchema + ".sentinel"
 
-// CopySchema pipes pg_dump --schema-only --table (one per plan table) from
-// src into psql on dst in a single transaction, so a failed apply leaves dst
-// unchanged. It copies only the plan's tables and the sequences they own,
-// which is exactly what UndoPrepare drops, so Prepare after a rollback starts
-// clean. The schemas are created first if missing (pg_dump --table does not
-// emit CREATE SCHEMA). Types, functions and standalone sequences the tables
-// depend on are not copied: the apply then fails naming the missing object,
-// and the operator creates it on the target first. Passwords go through
+// CopySchema runs pg_dump --schema-only --table (one per plan table) against
+// src, and only if that succeeds applies the dump with psql on dst in a
+// single transaction, so a failed dump applies nothing and a failed apply
+// leaves dst unchanged. It copies only the plan's tables and the sequences
+// they own, which is exactly what UndoPrepare drops, so Prepare after a
+// rollback starts clean. The schemas are created first if missing (pg_dump
+// --table does not emit CREATE SCHEMA). Types, functions and standalone
+// sequences the tables depend on are not copied: the apply then fails naming
+// the missing object, and the operator creates it on the target first. The
+// dump is held in memory, capped at 256 MiB. Passwords go through
 // PGPASSWORD, never argv.
 func CopySchema(ctx context.Context, tools plan.Tools, srcDSN, dstDSN string, schemas, tables []string) error {
 	if len(tables) == 0 {
@@ -34,13 +39,24 @@ func CopySchema(ctx context.Context, tools plan.Tools, srcDSN, dstDSN string, sc
 	}
 	src, srcPW := redact.Split(srcDSN)
 	dst, dstPW := redact.Split(dstDSN)
-	args := []string{"--schema-only", "--no-owner", "--no-privileges",
-		"--no-publications", "--no-subscriptions", "--dbname", src}
+	args := []string{"--schema-only", "--no-owner", "--no-privileges", "--no-tablespaces",
+		"--no-publications", "--no-subscriptions", "--strict-names", "--dbname", src}
 	for _, t := range tables {
 		args = append(args, "--table", t) // plan.Ident names: no pattern characters
 	}
 	dump := exec.CommandContext(ctx, tools.PgDump, args...)
-	dump.Env = withPassword(srcPW)
+	dump.Env = childEnv(srcPW)
+	dump.WaitDelay = 5 * time.Second
+	out := &cappedBuffer{max: maxDump}
+	var dumpErr strings.Builder
+	dump.Stdout, dump.Stderr = out, &dumpErr
+	if err := dump.Run(); err != nil {
+		if errors.Is(err, errDumpTooBig) {
+			return errDumpTooBig
+		}
+		return fmt.Errorf("pg_dump: %v: %s", redact.DSN(err.Error()), tail(dumpErr.String()))
+	}
+
 	psqlArgs := []string{"--no-psqlrc", "--quiet", "--single-transaction",
 		"--set", "ON_ERROR_STOP=1", "--dbname", dst}
 	for _, s := range schemas {
@@ -48,43 +64,47 @@ func CopySchema(ctx context.Context, tools plan.Tools, srcDSN, dstDSN string, sc
 	}
 	psqlArgs = append(psqlArgs, "--file", "-")
 	apply := exec.CommandContext(ctx, tools.Psql, psqlArgs...)
-	apply.Env = withPassword(dstPW)
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	var dumpErr, applyErr strings.Builder
-	dump.Stdout, dump.Stderr = w, &dumpErr
-	apply.Stdin, apply.Stderr, apply.Stdout = r, &applyErr, &applyErr
-	if err := apply.Start(); err != nil {
-		r.Close()
-		w.Close()
-		return fmt.Errorf("psql: %w", err)
-	}
-	r.Close()
-	if err := dump.Start(); err != nil {
-		w.Close()
-		_ = apply.Wait()
-		return fmt.Errorf("pg_dump: %w", err)
-	}
-	w.Close()
-	derr, aerr := dump.Wait(), apply.Wait()
-	if derr != nil {
-		return fmt.Errorf("pg_dump: %v: %s", derr, tail(dumpErr.String()))
-	}
-	if aerr != nil {
-		return fmt.Errorf("psql: %v: %s", aerr, tail(applyErr.String()))
+	apply.Env = childEnv(dstPW)
+	apply.WaitDelay = 5 * time.Second
+	var applyErr strings.Builder
+	apply.Stdin, apply.Stderr, apply.Stdout = bytes.NewReader(out.Bytes()), &applyErr, &applyErr
+	if err := apply.Run(); err != nil {
+		return fmt.Errorf("psql: %v: %s", redact.DSN(err.Error()), tail(applyErr.String()))
 	}
 	return nil
 }
 
-func withPassword(pw string) []string {
-	env := os.Environ()
+// childEnv is the parent environment minus every PG* variable (a stray
+// PGSERVICE, PGOPTIONS or PGHOST must not redirect pg_dump or psql), plus
+// PGPASSWORD when there is one.
+func childEnv(pw string) []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "PG") {
+			env = append(env, e)
+		}
+	}
 	if pw != "" {
 		env = append(env, "PGPASSWORD="+pw)
 	}
 	return env
+}
+
+const maxDump = 256 << 20
+
+var errDumpTooBig = errors.New("schema dump exceeds 256 MiB")
+
+// cappedBuffer is a bytes.Buffer that refuses to grow past max.
+type cappedBuffer struct {
+	bytes.Buffer
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > b.max {
+		return 0, errDumpTooBig
+	}
+	return b.Buffer.Write(p)
 }
 
 func tail(s string) string {
@@ -183,7 +203,9 @@ func DropSentinel(ctx context.Context, c *pgx.Conn) error {
 	return err
 }
 
-// DropTables drops the named tables and the sequences they own. Missing is fine.
+// DropTables drops the named tables and the sequences they own. Missing is
+// fine. It does not cascade: a view or foreign key outside the list that
+// depends on a table makes the drop fail instead of being dropped with it.
 func DropTables(ctx context.Context, c *pgx.Conn, tables []string) error {
 	if len(tables) == 0 {
 		return nil
@@ -193,6 +215,6 @@ func DropTables(ctx context.Context, c *pgx.Conn, tables []string) error {
 		s, n, _ := strings.Cut(t, ".")
 		idents[i] = pgx.Identifier{s, n}.Sanitize()
 	}
-	_, err := c.Exec(ctx, "DROP TABLE IF EXISTS "+strings.Join(idents, ", ")+" CASCADE")
+	_, err := c.Exec(ctx, "DROP TABLE IF EXISTS "+strings.Join(idents, ", "))
 	return err
 }

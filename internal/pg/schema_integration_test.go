@@ -73,6 +73,52 @@ func TestCopySchemaAndDiff(t *testing.T) {
 	}
 }
 
+func TestCopySchemaMissingSourceTable(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	if _, err := src.Exec(ctx, "CREATE TABLE public.orders (id bigint PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	err := pg.CopySchema(ctx, itest.Tools(t), itest.SourceDSN, itest.TargetDSN,
+		[]string{"public"}, []string{"public.orders", "public.ghost"})
+	if err == nil {
+		t.Fatal("missing plan table must fail")
+	}
+	var n int
+	if err := tgt.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relname = 'orders'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("target has %d orders (%v), want nothing", n, err)
+	}
+}
+
+func TestCopySchemaAtomic(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	t.Cleanup(func() {
+		for _, dsn := range []string{itest.SourceDSN, itest.TargetDSN} {
+			_, _ = itest.Conn(t, dsn).Exec(context.Background(), "DROP SCHEMA IF EXISTS billing CASCADE")
+		}
+	})
+	if _, err := src.Exec(ctx, `DROP SCHEMA IF EXISTS billing CASCADE; CREATE SCHEMA billing;
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.Exec(ctx, "DROP SCHEMA IF EXISTS billing CASCADE; CREATE TABLE public.orders (id bigint PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	err := pg.CopySchema(ctx, itest.Tools(t), itest.SourceDSN, itest.TargetDSN,
+		[]string{"billing", "public"}, []string{"billing.invoices", "public.orders"})
+	if err == nil {
+		t.Fatal("copy over existing orders must fail")
+	}
+	var n int
+	if err := tgt.QueryRow(ctx, `SELECT count(*) FROM pg_namespace WHERE nspname = 'billing'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("billing schema left behind: %d (%v)", n, err)
+	}
+}
+
 func TestSentinelAndDropTables(t *testing.T) {
 	itest.Reset(t)
 	ctx := context.Background()
