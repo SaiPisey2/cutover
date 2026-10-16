@@ -86,6 +86,19 @@ func TestRejects(t *testing.T) {
 	}
 }
 
+func TestBadRefDoesNotLeakDSN(t *testing.T) {
+	in := override(minimal, "target:\n  postgres: {dsn: postgres://u:p@h/db, replication_dsn: env:T, route: host=b dbname=shop}\n")
+	_, err := Parse([]byte(in))
+	if err == nil || !strings.Contains(err.Error(), "target.postgres.dsn") {
+		t.Fatalf("want a dsn error, got %v", err)
+	}
+	for _, leak := range []string{"u:p@h", "postgres://"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error leaks %q: %v", leak, err)
+		}
+	}
+}
+
 func TestEmptyFile(t *testing.T) {
 	for _, in := range []string{"", "# only a comment\n"} {
 		_, err := Parse([]byte(in))
