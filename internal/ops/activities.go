@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -148,7 +149,35 @@ func (a *Activities) CheckSchema(ctx context.Context, in TablesIn) (_ []string, 
 	if err != nil {
 		return nil, err
 	}
-	return pg.Diff(s, t), nil
+	diffs := pg.Diff(s, t)
+	// Every sequence in the plan's schemas is synced inside the switch's
+	// pause; one the target lacks would abort every switch there.
+	missing, err := missingSequences(ctx, src, tgt, in.Plan.Database.Schemas)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range missing {
+		diffs = append(diffs, "sequence "+m+" is on the source but not the target; create it on the target")
+	}
+	return diffs, nil
+}
+
+func missingSequences(ctx context.Context, src, tgt *pgx.Conn, schemas []string) ([]string, error) {
+	have, err := pg.SequenceNames(ctx, tgt, schemas)
+	if err != nil {
+		return nil, fmt.Errorf("target: %w", err)
+	}
+	want, err := pg.SequenceNames(ctx, src, schemas)
+	if err != nil {
+		return nil, fmt.Errorf("source: %w", err)
+	}
+	var out []string
+	for _, w := range want {
+		if !slices.Contains(have, w) {
+			out = append(out, w)
+		}
+	}
+	return out, nil
 }
 
 // CompareData samples each table on both sides after a sentinel proves the

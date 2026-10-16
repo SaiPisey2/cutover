@@ -21,7 +21,7 @@ func good() Input {
 		ReplUser: "repl", ReplUserReplication: true,
 		Extensions: []pg.Extension{{Name: "plpgsql"}, {Name: "pgcrypto"}},
 		Tables:     []pg.Table{{Schema: "public", Name: "orders", ReplIdent: "d", PKCols: []string{"id"}}},
-		Sequences:  []pg.Sequence{{Schema: "public", Name: "orders_id_seq", LastValue: i64(5), Increment: 1}},
+		Sequences:  []pg.Sequence{{Schema: "public", Name: "orders_id_seq", LastValue: i64(5), Increment: 1, OwnedBy: "public.orders"}},
 		Sessions:   []pg.Session{{Addr: "10.0.0.9", Count: 3}},
 	}
 	tgt := pg.Facts{VersionNum: 170002, WalLevel: "logical", Superuser: true, CreateSubscription: true, MaxSlots: 10,
@@ -184,5 +184,35 @@ func TestFixRound1(t *testing.T) {
 	in.Target.Tables = []pg.Table{{Schema: "public", Name: "other"}}
 	if slices.Contains(codes(Assess(in), Blocker), "target-not-empty") {
 		t.Fatal("unplanned target table must be ignored")
+	}
+}
+
+// Prepare copies only the sequences plan tables own. Any other sequence in
+// the plan's schemas that the target lacks would make every switch abort
+// when SyncSequences runs inside the pause, so it blocks now.
+func TestSequenceMissingOnTarget(t *testing.T) {
+	in := good()
+	in.Source.Sequences = append(in.Source.Sequences, pg.Sequence{Schema: "public", Name: "ticket_no", Increment: 1})
+	r := Assess(in)
+	if !slices.Contains(codes(r, Blocker), "sequence-missing") {
+		t.Fatalf("want sequence-missing: %+v", r.Findings)
+	}
+	for _, f := range r.Findings {
+		if f.Code == "sequence-missing" && (f.Subject != "public.ticket_no" || !strings.Contains(f.Message, "public.ticket_no")) {
+			t.Fatalf("must name the sequence: %+v", f)
+		}
+	}
+	// Present on the target: fine.
+	in.Target.Sequences = []pg.Sequence{{Schema: "public", Name: "ticket_no", Increment: 1}}
+	if r := Assess(in); slices.Contains(codes(r, Blocker), "sequence-missing") {
+		t.Fatalf("%+v", r.Findings)
+	}
+	// Owned by a table outside the plan: Prepare will not copy it either.
+	in = good()
+	in.Plan.Database.Tables = []string{"public.orders"}
+	in.Source.Tables = append(in.Source.Tables, pg.Table{Schema: "public", Name: "other", ReplIdent: "d", PKCols: []string{"id"}})
+	in.Source.Sequences = append(in.Source.Sequences, pg.Sequence{Schema: "public", Name: "other_id_seq", Increment: 1, OwnedBy: "public.other"})
+	if r := Assess(in); !slices.Contains(codes(r, Blocker), "sequence-missing") {
+		t.Fatalf("a sequence owned by a table outside the plan is not copied: %+v", r.Findings)
 	}
 }

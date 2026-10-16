@@ -175,3 +175,27 @@ func TestSequenceSelectOnly(t *testing.T) {
 		t.Fatalf("sequences: %+v", f.Sequences)
 	}
 }
+
+// OwnedBy names the table a sequence belongs to (serial or identity), which
+// is what decides whether Prepare copies it.
+func TestSequenceOwnedBy(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src := itest.Conn(t, itest.SourceDSN)
+	if _, err := src.Exec(ctx, `CREATE TABLE public.a (id bigserial PRIMARY KEY);
+		CREATE TABLE public.b (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
+		CREATE SEQUENCE public.standalone`); err != nil {
+		t.Fatal(err)
+	}
+	f, err := pg.Inspect(ctx, src, []string{"public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, s := range f.Sequences {
+		got[s.Qualified()] = s.OwnedBy
+	}
+	if len(got) != 3 || got["public.a_id_seq"] != "public.a" || got["public.b_id_seq"] != "public.b" || got["public.standalone"] != "" {
+		t.Fatalf("%v", got)
+	}
+}

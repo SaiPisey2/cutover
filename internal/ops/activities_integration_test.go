@@ -374,3 +374,37 @@ func TestPausePoolCancelled(t *testing.T) {
 		t.Fatalf("want the activity to return context.Canceled, got %v", err)
 	}
 }
+
+// A sequence in the plan's schemas that the target lacks fails the
+// pre-switch schema check by name, before any pause; inside the pause
+// SyncSequences would abort every switch.
+func TestCheckSchemaFindsMissingSequence(t *testing.T) {
+	seed(t)
+	e, a := env(t)
+	p := itest.Plan(t)
+	tables := []string{"public.orders"}
+	if _, err := e.ExecuteActivity(a.PrepareSchema, ops.TablesIn{Plan: p, Tables: tables}); err != nil {
+		t.Fatal(err)
+	}
+	diffs := func() []string {
+		v, err := e.ExecuteActivity(a.CheckSchema, ops.TablesIn{Plan: p, Tables: tables})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d []string
+		if err := v.Get(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	if d := diffs(); len(d) != 0 {
+		t.Fatalf("owned sequences are copied by Prepare: %q", d)
+	}
+	if _, err := itest.Conn(t, itest.SourceDSN).Exec(context.Background(), "CREATE SEQUENCE public.ticket_no"); err != nil {
+		t.Fatal(err)
+	}
+	d := diffs()
+	if len(d) != 1 || !strings.Contains(d[0], "public.ticket_no") || !strings.Contains(d[0], "target") {
+		t.Fatalf("diffs %q", d)
+	}
+}

@@ -55,6 +55,10 @@ type Sequence struct {
 	// after setval(seq, n, false).
 	IsCalled  bool  `json:"is_called"`
 	Increment int64 `json:"increment"`
+	// OwnedBy is the qualified table owning the sequence (a serial or
+	// identity column), or "" for a standalone sequence. Prepare copies only
+	// sequences owned by plan tables.
+	OwnedBy string `json:"owned_by,omitempty"`
 }
 
 func (s Sequence) Qualified() string { return s.Schema + "." + s.Name }
@@ -224,9 +228,16 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 	type row struct {
 		Schema, Name     string
 		Start, Increment int64
+		OwnedBy          string
 	}
-	rows, _ := c.Query(ctx, `SELECT schemaname::text, sequencename::text, start_value, increment_by
-		FROM pg_sequences WHERE schemaname = ANY($1) ORDER BY 1, 2`, schemas)
+	// deptype a: OWNED BY (serial); i: identity column.
+	rows, _ := c.Query(ctx, `SELECT s.schemaname::text, s.sequencename::text, s.start_value, s.increment_by,
+		  coalesce((SELECT tn.nspname || '.' || tc.relname
+		    FROM pg_depend d JOIN pg_class tc ON tc.oid = d.refobjid JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+		    WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
+		      AND d.objid = (quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename))::regclass
+		      AND d.deptype IN ('a', 'i') LIMIT 1), '')
+		FROM pg_sequences s WHERE s.schemaname = ANY($1) ORDER BY 1, 2`, schemas)
 	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
 		return nil, fmt.Errorf("sequences: %w", err)
@@ -241,7 +252,7 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 	}
 	br := c.SendBatch(ctx, batch)
 	for _, r := range list {
-		s := Sequence{Schema: r.Schema, Name: r.Name, Increment: r.Increment}
+		s := Sequence{Schema: r.Schema, Name: r.Name, Increment: r.Increment, OwnedBy: r.OwnedBy}
 		var last int64
 		if err := br.QueryRow().Scan(&last, &s.IsCalled); err != nil {
 			br.Close()
@@ -254,6 +265,19 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 	}
 	if err := br.Close(); err != nil {
 		return nil, fmt.Errorf("sequences: %w", err)
+	}
+	return out, nil
+}
+
+// SequenceNames lists the qualified names of the sequences in schemas. It
+// needs no privilege on the sequences.
+func SequenceNames(ctx context.Context, c *pgx.Conn, schemas []string) ([]string, error) {
+	rows, _ := c.Query(ctx, `SELECT n.nspname || '.' || c.relname FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'S' AND n.nspname = ANY($1) ORDER BY 1`, schemas)
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("sequence names: %w", err)
 	}
 	return out, nil
 }

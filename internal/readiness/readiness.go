@@ -133,7 +133,14 @@ func Assess(in Input) Report {
 			add(Blocker, "extension-missing", e.Name, "extension %s is on the source but not the target; run CREATE EXTENSION %s on the target first", e.Name, e.Name)
 		}
 	}
+	onTarget := map[string]bool{}
+	for _, s := range tgt.Sequences {
+		onTarget[s.Qualified()] = true
+	}
 	for _, s := range src.Sequences {
+		if !onTarget[s.Qualified()] && !slices.Contains(r.Tables, s.OwnedBy) {
+			add(Blocker, "sequence-missing", s.Qualified(), "%s is in the plan's schemas but not on the target, and Prepare will not create it (it is not owned by a plan table); every sequence in the plan's schemas is synced at the switch, so create it on the target first", s.Qualified())
+		}
 		if s.Increment < 0 {
 			add(Blocker, "sequence", s.Qualified(), "%s counts down; release 1 syncs ascending sequences only (every sequence in the plan's schemas is synced at the switch, so any one of them can block)", s.Qualified())
 		}
