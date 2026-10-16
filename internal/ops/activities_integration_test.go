@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
@@ -17,6 +18,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/itest"
 	"github.com/SaiPisey2/cutover/internal/ops"
 	"github.com/SaiPisey2/cutover/internal/pg"
+	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/readiness"
 	"github.com/SaiPisey2/cutover/internal/secret"
 )
@@ -406,5 +408,45 @@ func TestCheckSchemaFindsMissingSequence(t *testing.T) {
 	d := diffs()
 	if len(d) != 1 || !strings.Contains(d[0], "public.ticket_no") || !strings.Contains(d[0], "target") {
 		t.Fatalf("diffs %q", d)
+	}
+}
+
+// The pre-switch session check finds a client that reaches the source
+// without PgBouncer, and says when it cannot check.
+func TestCheckSessions(t *testing.T) {
+	itest.Reset(t)
+	e, a := env(t)
+	p := itest.Plan(t)
+	cfg, err := pgx.ParseConfig(itest.SourceDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RuntimeParams["application_name"] = "direct-app"
+	direct, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { direct.Close(context.Background()) })
+	check := func(p plan.Plan) ops.SessionCheck {
+		v, err := e.ExecuteActivity(a.CheckSessions, ops.DiscoverIn{Plan: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out ops.SessionCheck
+		if err := v.Get(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := check(p); got.Checked || !strings.Contains(got.Summary(), "Could not check sessions") {
+		t.Fatalf("no addresses: %+v", got)
+	}
+	p.Database.PgBouncer.Addresses = []string{"10.255.255.0/24"}
+	if got := check(p); !got.Checked || len(got.Bypass) == 0 || !strings.Contains(got.Summary(), "bypass PgBouncer:") {
+		t.Fatalf("direct session not found: %+v", got)
+	}
+	p.Database.PgBouncer.Addresses = []string{"0.0.0.0/0", "::/0"}
+	if got := check(p); !got.Checked || len(got.Bypass) != 0 {
+		t.Fatalf("every address allowed: %+v", got)
 	}
 }

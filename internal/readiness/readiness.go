@@ -158,16 +158,19 @@ func Assess(in Input) Report {
 		add(Warning, "pgbouncer-paused", in.Plan.Database.Name, "PgBouncer has %s paused right now", in.Plan.Database.Name)
 	}
 
-	prefixes := parsePrefixes(in.Plan.Database.PgBouncer.Addresses)
-	if len(prefixes) == 0 {
+	bypass, checked := DirectClients(in.Plan.Database.PgBouncer.Addresses, src.Sessions)
+	if !checked {
 		add(Warning, "direct-clients-unchecked", "source", "pgbouncer.addresses is empty, so writes that bypass PgBouncer cannot be detected; list the PgBouncer addresses to check")
+	}
+	if !src.SeesAllSessions {
+		add(Warning, "direct-clients-unchecked", "source", "the source role is not a superuser or a member of pg_read_all_stats, so other roles' sessions are hidden and writes that bypass PgBouncer cannot be detected; GRANT pg_read_all_stats to it to check")
+	}
+	for _, s := range bypass {
+		add(Blocker, "direct-clients", s.Addr, "%d sessions from %s reach the source without PgBouncer; their writes would be lost at the switch", s.Count, s.Addr)
 	}
 	var listed []string
 	for _, s := range src.Sessions {
 		listed = append(listed, fmt.Sprintf("%s (%d)", s.Addr, s.Count))
-		if len(prefixes) > 0 && s.Addr != "local" && !within(prefixes, s.Addr) {
-			add(Blocker, "direct-clients", s.Addr, "%d sessions from %s reach the source without PgBouncer; their writes would be lost at the switch", s.Count, s.Addr)
-		}
 	}
 	if len(listed) > 0 {
 		add(Info, "sessions", "source", "client sessions on the source: %s", strings.Join(listed, ", "))
@@ -189,6 +192,22 @@ func Assess(in Input) Report {
 		return strings.Compare(a.Message, b.Message)
 	})
 	return r
+}
+
+// DirectClients returns the sessions whose client address is outside
+// addresses (PgBouncer's), skipping local ones. checked is false when
+// addresses lists nothing usable, so nothing can be told apart.
+func DirectClients(addresses []string, sessions []pg.Session) (bypass []pg.Session, checked bool) {
+	prefixes := parsePrefixes(addresses)
+	if len(prefixes) == 0 {
+		return nil, false
+	}
+	for _, s := range sessions {
+		if s.Addr != "local" && !within(prefixes, s.Addr) {
+			bypass = append(bypass, s)
+		}
+	}
+	return bypass, true
 }
 
 func parsePrefixes(addrs []string) []netip.Prefix {

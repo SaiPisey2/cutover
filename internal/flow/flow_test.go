@@ -607,3 +607,48 @@ func TestFailedReverseRestartHaltsUnwind(t *testing.T) {
 		t.Fatalf("calls %q", c.list())
 	}
 }
+
+// The switch gate tells the approvers, from a check run just before it
+// opened, whether any session reaches the source without PgBouncer.
+func TestSwitchGateShowsSessionCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mock func(*testsuite.TestWorkflowEnvironment)
+		want string
+	}{
+		{"bypass", func(env *testsuite.TestWorkflowEnvironment) {
+			var a *ops.Activities
+			env.OnActivity(a.CheckSessions, mockAny, mockAny).Return(ops.SessionCheck{Checked: true,
+				Bypass: []pg.Session{{Addr: "10.0.1.5", Count: 2}}}, nil).Once()
+		}, "2 sessions bypass PgBouncer: 10.0.1.5 (2)."},
+		{"failed", func(env *testsuite.TestWorkflowEnvironment) {
+			var a *ops.Activities
+			env.OnActivity(a.CheckSessions, mockAny, mockAny).Return(ops.SessionCheck{}, boom).Once()
+		}, "Could not check sessions: boom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newEnv()
+			c := &calls{}
+			tc.mock(env)
+			mockAll(env, c, nil, true)
+			var summary string
+			seen := action{
+				when: func(s Status) bool {
+					if s.Gate != nil && s.Gate.Name == "switch" {
+						summary = s.Gate.Summary
+						return true
+					}
+					return false
+				},
+				do: func(*testsuite.TestWorkflowEnvironment) {},
+			}
+			steps := append(append(happy()[:3], seen), happy()[3:]...)
+			if r := start(t, env, steps); r.State != StateFinished {
+				t.Fatalf("%s %q", r.State, kinds(r.Events))
+			}
+			if !strings.Contains(summary, tc.want) || !strings.Contains(summary, "two different approvers") {
+				t.Fatalf("summary %q", summary)
+			}
+		})
+	}
+}

@@ -135,7 +135,7 @@ func (r *runner) run() error {
 		if err := r.step("schema-check", r.schemaCheck(tin)); err != nil {
 			return err
 		}
-		if err := r.gate("switch", "Switch the database to the target. Needs two different approvers.", 2); err != nil {
+		if err := r.gate("switch", "Switch the database to the target. Needs two different approvers. "+r.sessionCheck(), 2); err != nil {
 			return err
 		}
 		ok, err := r.switchOver(ops.Source, ops.Target, fwd, rev, tables)
@@ -258,6 +258,17 @@ func (r *runner) schemaCheck(tin ops.TablesIn) func() error {
 		}
 		return nil
 	}
+}
+
+// sessionCheck re-runs the direct-client check right before the switch
+// gate and returns one sentence for it. It informs the approvers; a failed
+// check says so rather than holding the gate.
+func (r *runner) sessionCheck() string {
+	var sc ops.SessionCheck
+	if err := r.exec(time.Minute, acts.CheckSessions, ops.DiscoverIn{Plan: r.in.Plan}, &sc); err != nil {
+		return "Could not check sessions: " + message(err) + "."
+	}
+	return sc.Summary()
 }
 
 func summarizeChecks(checks []pg.TableCheck) string {

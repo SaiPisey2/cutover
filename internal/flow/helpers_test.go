@@ -90,6 +90,10 @@ func mockAll(env *testsuite.TestWorkflowEnvironment, c *calls, f fails, drainVis
 		func(context.Context, ops.TablesIn) error { return ret("prepare") })
 	env.OnActivity(a.UndoPrepare, mock.Anything, mock.Anything).Return(
 		func(context.Context, ops.TablesIn) error { return ret("undo-prepare") })
+	env.OnActivity(a.CheckSessions, mock.Anything, mock.Anything).Return(
+		func(context.Context, ops.DiscoverIn) (ops.SessionCheck, error) {
+			return ops.SessionCheck{Checked: true}, f["sessions"]
+		})
 	env.OnActivity(a.CheckSchema, mock.Anything, mock.Anything).Return(
 		func(context.Context, ops.TablesIn) ([]string, error) { return nil, ret("check-schema") })
 	env.OnActivity(a.CompareData, mock.Anything, mock.Anything).Return(

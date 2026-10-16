@@ -18,7 +18,7 @@ func good() Input {
 	p.Target.Postgres.Route = "host=pg-target port=5432 dbname=app"
 	src := pg.Facts{
 		VersionNum: 170004, WalLevel: "logical", Superuser: true, CreateSubscription: true, MaxSlots: 10,
-		ReplUser: "repl", ReplUserReplication: true,
+		ReplUser: "repl", ReplUserReplication: true, SeesAllSessions: true,
 		Extensions: []pg.Extension{{Name: "plpgsql"}, {Name: "pgcrypto"}},
 		Tables:     []pg.Table{{Schema: "public", Name: "orders", ReplIdent: "d", PKCols: []string{"id"}}},
 		Sequences:  []pg.Sequence{{Schema: "public", Name: "orders_id_seq", LastValue: i64(5), Increment: 1, OwnedBy: "public.orders"}},
@@ -214,5 +214,37 @@ func TestSequenceMissingOnTarget(t *testing.T) {
 	in.Source.Sequences = append(in.Source.Sequences, pg.Sequence{Schema: "public", Name: "other_id_seq", Increment: 1, OwnedBy: "public.other"})
 	if r := Assess(in); !slices.Contains(codes(r, Blocker), "sequence-missing") {
 		t.Fatalf("a sequence owned by a table outside the plan is not copied: %+v", r.Findings)
+	}
+}
+
+// Without superuser or pg_read_all_stats, other roles' sessions show NULL
+// client_addr and application_name and drop out of the session list: the
+// check cannot be trusted, and readiness must say so.
+func TestDirectClientsUncheckedWithoutStats(t *testing.T) {
+	in := good()
+	in.Plan.Database.PgBouncer.Addresses = []string{"10.0.0.0/24"}
+	if r := Assess(in); slices.Contains(codes(r, Warning), "direct-clients-unchecked") {
+		t.Fatalf("%+v", r.Findings)
+	}
+	in.Source.SeesAllSessions = false
+	r := Assess(in)
+	if !slices.Contains(codes(r, Warning), "direct-clients-unchecked") {
+		t.Fatalf("want direct-clients-unchecked: %+v", r.Findings)
+	}
+	for _, f := range r.Findings {
+		if f.Code == "direct-clients-unchecked" && !strings.Contains(f.Message, "pg_read_all_stats") {
+			t.Fatalf("must say what grants visibility: %q", f.Message)
+		}
+	}
+}
+
+func TestDirectClients(t *testing.T) {
+	sess := []pg.Session{{Addr: "10.0.0.9", Count: 3}, {Addr: "10.0.1.5", Count: 1}, {Addr: "local", Count: 2}}
+	if _, ok := DirectClients(nil, sess); ok {
+		t.Fatal("no addresses: cannot check")
+	}
+	got, ok := DirectClients([]string{"10.0.0.0/24"}, sess)
+	if !ok || len(got) != 1 || got[0].Addr != "10.0.1.5" {
+		t.Fatalf("%v %+v", ok, got)
 	}
 }

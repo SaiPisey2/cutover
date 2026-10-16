@@ -72,7 +72,7 @@ func mkRoles(t *testing.T, c *pgx.Conn, stmts ...string) {
 	t.Helper()
 	ctx := context.Background()
 	t.Cleanup(func() {
-		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "rds_replication", "rds_superuser"} {
+		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "stats_r", "nostats_r", "rds_replication", "rds_superuser"} {
 			c.Exec(ctx, "DROP OWNED BY "+r)
 			c.Exec(ctx, "DROP ROLE IF EXISTS "+r)
 		}
@@ -197,5 +197,30 @@ func TestSequenceOwnedBy(t *testing.T) {
 	}
 	if len(got) != 3 || got["public.a_id_seq"] != "public.a" || got["public.b_id_seq"] != "public.b" || got["public.standalone"] != "" {
 		t.Fatalf("%v", got)
+	}
+}
+
+// Without superuser or pg_read_all_stats, other roles' sessions are hidden
+// from the session check; Inspect says whether it could see them.
+func TestSeesAllSessions(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src := itest.Conn(t, itest.SourceDSN)
+	mkRoles(t, src, "CREATE ROLE nostats_r LOGIN", "CREATE ROLE stats_r LOGIN IN ROLE pg_read_all_stats",
+		"GRANT USAGE ON SCHEMA public TO nostats_r, stats_r")
+	for role, want := range map[string]bool{"": true, "nostats_r": false, "stats_r": true} {
+		c := itest.Conn(t, itest.SourceDSN)
+		if role != "" {
+			if _, err := c.Exec(ctx, "SET ROLE "+role); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, err := pg.Inspect(ctx, c, []string{"public"})
+		if err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if f.SeesAllSessions != want {
+			t.Errorf("%q: SeesAllSessions %v, want %v", role, f.SeesAllSessions, want)
+		}
 	}
 }

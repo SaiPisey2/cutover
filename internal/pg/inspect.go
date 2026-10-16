@@ -92,6 +92,10 @@ type Facts struct {
 	MaxSlots            int       `json:"max_slots"`
 	UsedSlots           int       `json:"used_slots"`
 	Sessions            []Session `json:"sessions"`
+	// SeesAllSessions is true when the role can see other roles' sessions
+	// (superuser, or a member of pg_read_all_stats). Without it their
+	// client_addr and application_name read as NULL, and Sessions misses them.
+	SeesAllSessions bool `json:"sees_all_sessions"`
 }
 
 func (f Facts) Major() int { return f.VersionNum / 10000 }
@@ -156,14 +160,30 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 	if f.Sequences, err = Sequences(ctx, c, schemas); err != nil {
 		return f, err
 	}
-	rows, _ = c.Query(ctx, `SELECT coalesce(host(client_addr), 'local'), count(*)::int FROM pg_stat_activity
+	if f.Sessions, f.SeesAllSessions, err = Sessions(ctx, c); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
+// Sessions lists other client sessions on this database, by client
+// address, leaving out cutover's own. all reports whether the role can see
+// every role's sessions (superuser or pg_read_all_stats); when it cannot,
+// other roles' sessions are missing from the list.
+func Sessions(ctx context.Context, c *pgx.Conn) (_ []Session, all bool, err error) {
+	if err := c.QueryRow(ctx, `SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) OR `+
+		memberOf("current_user", "pg_read_all_stats")).Scan(&all); err != nil {
+		return nil, false, fmt.Errorf("session visibility: %w", err)
+	}
+	rows, _ := c.Query(ctx, `SELECT coalesce(host(client_addr), 'local'), count(*)::int FROM pg_stat_activity
 		WHERE datname = current_database() AND pid <> pg_backend_pid()
 		  AND backend_type = 'client backend' AND application_name <> $1
 		GROUP BY 1 ORDER BY 1`, AppName)
-	if f.Sessions, err = pgx.CollectRows(rows, pgx.RowToStructByPos[Session]); err != nil {
-		return f, fmt.Errorf("sessions: %w", err)
+	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Session])
+	if err != nil {
+		return nil, false, fmt.Errorf("sessions: %w", err)
 	}
-	return f, nil
+	return out, all, nil
 }
 
 // memberOf is a SQL expression, true when the role in param is a member of

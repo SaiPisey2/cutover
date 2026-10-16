@@ -177,3 +177,19 @@ func TestStartLinkRejectsMistypedReplicationDSN(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSessionCheckSummary(t *testing.T) {
+	for _, tc := range []struct {
+		in   SessionCheck
+		want string
+	}{
+		{SessionCheck{Checked: true}, "No sessions bypass PgBouncer."},
+		{SessionCheck{Checked: true, Bypass: []pg.Session{{Addr: "10.0.1.5", Count: 2}, {Addr: "10.0.1.6", Count: 1}}},
+			"3 sessions bypass PgBouncer: 10.0.1.5 (2), 10.0.1.6 (1)."},
+		{SessionCheck{Reason: "pgbouncer.addresses is empty"}, "Could not check sessions: pgbouncer.addresses is empty."},
+	} {
+		if got := tc.in.Summary(); got != tc.want {
+			t.Errorf("got %q want %q", got, tc.want)
+		}
+	}
+}

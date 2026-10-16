@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -549,4 +550,53 @@ func (a *Activities) SyncSequences(ctx context.Context, in SeqIn) (out []pg.Sequ
 		return err
 	})
 	return out, err
+}
+
+// SessionCheck is the pre-switch look at who reaches the source without
+// PgBouncer. Checked is false, with Reason, when it could not tell.
+type SessionCheck struct {
+	Checked bool         `json:"checked"`
+	Reason  string       `json:"reason,omitempty"`
+	Bypass  []pg.Session `json:"bypass,omitempty"`
+}
+
+// Summary is one sentence for the switch gate.
+func (s SessionCheck) Summary() string {
+	if !s.Checked {
+		return "Could not check sessions: " + s.Reason + "."
+	}
+	if len(s.Bypass) == 0 {
+		return "No sessions bypass PgBouncer."
+	}
+	n := 0
+	var l []string
+	for _, b := range s.Bypass {
+		n += b.Count
+		l = append(l, fmt.Sprintf("%s (%d)", b.Addr, b.Count))
+	}
+	return fmt.Sprintf("%d sessions bypass PgBouncer: %s.", n, strings.Join(l, ", "))
+}
+
+// CheckSessions repeats Discover's direct-client check on the source just
+// before the switch gate opens: clients connected since Discover would lose
+// their writes at the switch.
+func (a *Activities) CheckSessions(ctx context.Context, in DiscoverIn) (_ SessionCheck, err error) {
+	defer func() { err = fail(err) }()
+	src, err := connect(ctx, in.Plan.Source.Postgres.DSN)
+	if err != nil {
+		return SessionCheck{}, fmt.Errorf("source: %w", err)
+	}
+	defer src.Close(context.Background())
+	sessions, all, err := pg.Sessions(ctx, src)
+	if err != nil {
+		return SessionCheck{}, err
+	}
+	bypass, checked := readiness.DirectClients(in.Plan.Database.PgBouncer.Addresses, sessions)
+	switch {
+	case !checked:
+		return SessionCheck{Reason: "pgbouncer.addresses is empty"}, nil
+	case !all:
+		return SessionCheck{Reason: "the source role cannot see other roles' sessions (needs pg_read_all_stats)"}, nil
+	}
+	return SessionCheck{Checked: true, Bypass: bypass}, nil
 }
