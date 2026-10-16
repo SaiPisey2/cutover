@@ -182,7 +182,7 @@ func (p Plan) Validate() error {
 		switch {
 		case strings.TrimSpace(pg.Route) == "":
 			bad("%s.postgres.route: required", side)
-		case strings.Contains(strings.ToLower(pg.Route), "password"):
+		case route.ContainsPassword(pg.Route):
 			bad("%s.postgres.route: must not contain a password (PgBouncer authenticates on its own)", side)
 		case strings.Contains(pg.Route, "://"):
 			bad("%s.postgres.route: must be key=value pairs, not a URI", side)

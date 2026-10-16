@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -158,5 +159,55 @@ func TestAdminRejectsBadNames(t *testing.T) {
 		if err := Repoint(ctx, a, filepath.Join(t.TempDir(), "r.ini"), name, "host=a"); err == nil {
 			t.Errorf("Repoint(%q)", name)
 		}
+	}
+}
+
+func TestRoutesRejectPasswords(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "routes.ini")
+	for _, r := range []string{"host=a password=s3cret", "host=a PASSWORD='s3cret'"} {
+		err := WriteRoute(p, "app", r)
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("WriteRoute(%q): %v", r, err)
+		}
+		// Refused before the connection is touched, so a nil one is fine.
+		err = Repoint(context.Background(), &Admin{}, p, "app", r)
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("Repoint(%q): %v", r, err)
+		}
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("a refused route was written")
+	}
+}
+
+// make itest-up writes the first routes file with printf; it must be the
+// file WriteRoute writes, or the first Reset changes the file's size.
+func TestMakefileRoutesMatchWriteRoute(t *testing.T) {
+	mk, err := os.ReadFile("../../Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cmd string
+	for _, l := range strings.Split(string(mk), "\n") {
+		if strings.Contains(l, "test/run/pgbouncer/routes.ini") && strings.Contains(l, "printf") {
+			cmd, _, _ = strings.Cut(strings.TrimSpace(l), ">")
+		}
+	}
+	if cmd == "" {
+		t.Fatal("no printf to test/run/pgbouncer/routes.ini in the Makefile")
+	}
+	got, err := exec.Command("sh", "-c", cmd).Output()
+	if err != nil {
+		t.Fatalf("%s: %v", cmd, err)
+	}
+	// itest.SourceRoute (itest builds only with the integration tag; its
+	// TestRoutesMatchMakefile ties the constant to this line).
+	p := filepath.Join(t.TempDir(), "routes.ini")
+	if err := WriteRoute(p, "app", "host=pg-source port=5432 dbname=app"); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.ReadFile(p)
+	if string(got) != string(want) {
+		t.Fatalf("Makefile writes %d bytes %q\nWriteRoute writes %d bytes %q", len(got), got, len(want), want)
 	}
 }

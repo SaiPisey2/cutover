@@ -37,6 +37,9 @@ func WriteRoute(path, db, connstr string) error {
 	if err := checkName(db); err != nil {
 		return err
 	}
+	if err := checkRoutePassword(connstr); err != nil {
+		return err
+	}
 	if strings.ContainsAny(connstr, "\r\n") {
 		return fmt.Errorf("routes: newline in connection string")
 	}
@@ -76,6 +79,16 @@ func WriteRoute(path, db, connstr string) error {
 	return nil
 }
 
+// checkRoutePassword refuses a route with a password in it, as plan
+// validation does: the routes file is world-readable and PgBouncer
+// authenticates on its own.
+func checkRoutePassword(connstr string) error {
+	if route.ContainsPassword(connstr) {
+		return fmt.Errorf("routes: route must not contain a password (PgBouncer authenticates on its own)")
+	}
+	return nil
+}
+
 // Repoint routes db to connstr: write the file, reload, confirm PgBouncer
 // reports the new host, port and database, then recycle server connections.
 // Any mismatch fails before RECONNECT, so connections are never recycled
@@ -87,6 +100,9 @@ func WriteRoute(path, db, connstr string) error {
 // changes where RELOAD does not would leave clients on the old database.
 func Repoint(ctx context.Context, a *Admin, path, db, connstr string) error {
 	if err := checkName(db); err != nil {
+		return err
+	}
+	if err := checkRoutePassword(connstr); err != nil {
 		return err
 	}
 	want, err := route.Resolve(connstr, db)

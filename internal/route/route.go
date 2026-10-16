@@ -28,8 +28,9 @@ type Target struct {
 // DefaultPort is the port PgBouncer uses when a route sets none.
 const DefaultPort = 5432
 
-// Parse splits a route into its keys and values. Errors name the position
-// and the key, never a value, because a value could be a secret.
+// Parse splits a route into its keys and values. Errors give a byte
+// position and the kind of problem, never any part of the input: a token
+// that looks like a key can be the tail of a secret (password=my secret).
 func Parse(s string) (map[string]string, error) {
 	out := map[string]string{}
 	i := 0
@@ -55,17 +56,18 @@ func Parse(s string) (map[string]string, error) {
 		for i < len(s) && isKeyChar(s[i]) {
 			i++
 		}
-		key := s[start:i]
+		key, kstart := s[start:i], start
 		if key == "" {
 			return nil, fmt.Errorf("route: expected a key at byte %d", start)
 		}
 		skip()
 		if i == len(s) || s[i] != '=' {
-			return nil, fmt.Errorf("route: key %q has no =", key)
+			return nil, fmt.Errorf("route: the key at byte %d has no =", start)
 		}
 		i++
 		skip()
 		var val strings.Builder
+		vstart := i
 		if i < len(s) && s[i] == '\'' {
 			i++
 			closed := false
@@ -84,26 +86,26 @@ func Parse(s string) (map[string]string, error) {
 				i++
 			}
 			if !closed {
-				return nil, fmt.Errorf("route: unterminated quote in %q", key)
+				return nil, fmt.Errorf("route: unterminated quote in the value at byte %d", vstart)
 			}
 			if i < len(s) && s[i] != ' ' && s[i] != '\t' {
-				return nil, fmt.Errorf("route: text after the closing quote of %q", key)
+				return nil, fmt.Errorf("route: text after a closing quote at byte %d", i)
 			}
 		} else {
 			start := i
 			for i < len(s) && s[i] != ' ' && s[i] != '\t' {
 				if s[i] == '\'' || s[i] == '=' {
-					return nil, fmt.Errorf("route: unexpected %q in the value of %q", s[i], key)
+					return nil, fmt.Errorf("route: unexpected quote or = inside an unquoted value at byte %d", i)
 				}
 				i++
 			}
 			if i == start {
-				return nil, fmt.Errorf("route: %q has an empty value (quote it: %s='')", key, key)
+				return nil, fmt.Errorf("route: empty value at byte %d (an empty value must be written '')", start)
 			}
 			val.WriteString(s[start:i])
 		}
 		if _, dup := out[key]; dup {
-			return nil, fmt.Errorf("route: %q is set twice", key)
+			return nil, fmt.Errorf("route: the key at byte %d is set twice", kstart)
 		}
 		out[key] = val.String()
 	}
@@ -124,6 +126,9 @@ func Resolve(s, defaultDB string) (Target, error) {
 	if t.Host == "" {
 		return Target{}, errors.New("route: host is required")
 	}
+	if strings.Contains(t.Host, ",") {
+		return Target{}, errors.New("route: host must name one host; multi-host routes are not supported in release 1")
+	}
 	if p, ok := kv["port"]; ok {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 1 || n > 65535 {
@@ -135,6 +140,14 @@ func Resolve(s, defaultDB string) (Target, error) {
 		t.DBName = d
 	}
 	return t, nil
+}
+
+// ContainsPassword reports whether a route mentions a password in any
+// spelling (password=, sslpassword=, or the word in a value). Routes are
+// written to PgBouncer's config and shown to operators; PgBouncer
+// authenticates on its own, so a route never needs one.
+func ContainsPassword(s string) bool {
+	return strings.Contains(strings.ToLower(s), "password")
 }
 
 // Same reports whether two targets are the same database. Host names

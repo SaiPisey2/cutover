@@ -5,6 +5,8 @@ package itest
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,5 +96,17 @@ func TestResetCleansDirtyState(t *testing.T) {
 	}
 	if name != "source" {
 		t.Errorf("pool reaches %q, want source", name)
+	}
+}
+
+// The Makefile's first routes file must route to SourceRoute;
+// pgbouncer.TestMakefileRoutesMatchWriteRoute checks the bytes.
+func TestRoutesMatchMakefile(t *testing.T) {
+	mk, err := os.ReadFile(filepath.Join(repoRoot(t), "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mk), `printf '[databases]\napp = `+SourceRoute+`\n`) {
+		t.Fatalf("Makefile itest-up does not write app = %s", SourceRoute)
 	}
 }
