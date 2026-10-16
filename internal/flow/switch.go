@@ -59,8 +59,10 @@ func (r *runner) bounded(deadline time.Time) (workflow.Context, bool) {
 // Compensations run after the budget, while writes are still held, so the
 // replication ones are bounded: restarting the old link and stopping the
 // next link each get StartToClose 15s and at most 3 attempts (backoff 1s,
-// 2s), about 48s each. If restarting the old link fails it is recorded as
-// compensation-failed and skipped; unwind or Cleanup handle what is left.
+// 2s), about 48s each. If restarting the old link fails, nothing
+// replicates out of `from`: replication-broken is recorded,
+// Status.ReplicationBroken is set and switchOver returns (false,
+// ErrReplicationBroken) after writes resume, as below.
 // If stopping the next link fails, the old link is NOT restarted, because
 // both directions live would loop: the event replication-broken is
 // recorded, Status.ReplicationBroken is set, and switchOver returns
@@ -161,10 +163,19 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 			default:
 				if err := u.run(); err != nil && !cancelled() {
 					r.event("compensation-failed", "", message(err)+"; gave up so writes can resume")
-					if u.kind == stopNext {
+					switch u.kind {
+					case stopNext:
 						broken = true
 						r.st.ReplicationBroken = true
 						r.event("replication-broken", "", "could not stop "+next.Name+"; "+old.Name+" left stopped, repair replication before switching again")
+					case startOld:
+						// Nothing replicates out of `from` now: a later switch
+						// could never drain, and a switch back that recreated
+						// the link without copying would lose the rows
+						// written meanwhile.
+						broken = true
+						r.st.ReplicationBroken = true
+						r.event("replication-broken", "", "could not restart "+old.Name+"; nothing replicates out of the "+string(from)+", repair replication before switching again")
 					}
 				}
 			}

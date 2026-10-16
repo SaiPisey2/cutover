@@ -453,3 +453,21 @@ func TestSwitchCancelledDuringResumeStillResumes(t *testing.T) {
 	runCancelled(t, env)
 	assertCalls(t, c.since("repoint:target"), []string{"repoint:target", "resume", "resume", "resume"})
 }
+
+// If restarting the old link fails after its bounded attempts, the old
+// direction has no replication: the next switch could never drain, and a
+// switch back could lose rows. That is broken replication, as for stopNext.
+func TestSwitchFailedOldRestartIsBroken(t *testing.T) {
+	for _, back := range []bool{false, true} {
+		f := fails{"start:rev": boom, "start:fwd": boom}
+		res, c := runSwitch(t, testPlan(), back, f, true)
+		want := []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target", "start:rev", "stop:rev", "start:fwd", "resume"}
+		if back {
+			want = []string{"pause", "lag:rev", "drop-sub:rev", "seq:target>source", "start:fwd", "stop:fwd", "start:rev", "resume"}
+		}
+		assertCalls(t, c.list(), want)
+		if res.OK || !res.Broken || !res.StBroken || !hasEvent(res.Events, "replication-broken") {
+			t.Fatalf("back=%v: %+v", back, res)
+		}
+	}
+}

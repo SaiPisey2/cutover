@@ -547,3 +547,63 @@ func TestCancelMidUnwindSaysWhereItStopped(t *testing.T) {
 	}
 	assertCalls(t, st.PendingUndo, []string{PhasePrepare})
 }
+
+// A forward switch whose abort could not restart the forward link leaves
+// the source with no replication to the target: no second switch, only
+// rollback.
+func TestFailedForwardRestartOnlyRollsBack(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	fwdNoCopy := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Forward(mid) && !in.CopyData })
+	env.OnActivity(a.StartLink, mockAny, fwdNoCopy).Return(func(context.Context, ops.LinkIn) error {
+		c.add("start:fwd")
+		return temporal.NewApplicationError("flaky", "test")
+	})
+	mockAll(env, c, fails{"start:rev": boom}, true)
+	steps := append(happy()[:5], approve("replication-broken", "alice"))
+	r := start(t, env, steps)
+	if r.State != StateRolledBack || c.count("pause") != 1 || !slices.Contains(kinds(r.Events), "replication-broken") {
+		t.Fatalf("%s pause x%d: %q", r.State, c.count("pause"), kinds(r.Events))
+	}
+	assertCalls(t, c.since("pause"), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target", "start:rev",
+		"stop:rev", "start:fwd", "start:fwd", "start:fwd", "resume", "stop:rev", "stop:fwd", "undo-prepare"})
+}
+
+// A switch back whose abort could not restart the reverse link halts the
+// unwind: the target is primary and nothing replicates its writes back, so
+// recreating the link or dropping the target's tables could lose rows.
+func TestFailedReverseRestartHaltsUnwind(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	rev := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Reverse(mid) })
+	env.OnActivity(a.StartLink, mockAny, rev).Return(func(context.Context, ops.LinkIn) error {
+		c.add("start:rev")
+		return nil
+	}).Once()
+	env.OnActivity(a.StartLink, mockAny, rev).Return(func(context.Context, ops.LinkIn) error {
+		c.add("start:rev")
+		return temporal.NewApplicationError("flaky", "test")
+	})
+	fwdNoCopy := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Forward(mid) && !in.CopyData })
+	env.OnActivity(a.StartLink, mockAny, fwdNoCopy).Return(func(context.Context, ops.LinkIn) error {
+		c.add("start:fwd")
+		return boom
+	}).Once()
+	mockAll(env, c, nil, true)
+	drive(t, env, append(happy()[:5], rollbackInWatch()))
+	env.ExecuteWorkflow(Migration, Input{MigrationID: mid, Plan: testPlan()})
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() == nil {
+		t.Fatalf("want a failed workflow, got %v", env.GetWorkflowError())
+	}
+	st := status(t, env)
+	if st.State != StateFailed || st.Primary != ops.Target || !st.ReplicationBroken ||
+		!slices.Contains(kinds(st.Events), "unwind-halted") {
+		t.Fatalf("%s %s: %q", st.State, st.Primary, kinds(st.Events))
+	}
+	assertCalls(t, c.since("start:fwd"), []string{"start:fwd", "stop:fwd", "start:rev", "start:rev", "start:rev", "resume"})
+	if c.count("pause") != 2 || c.count("undo-prepare") != 0 {
+		t.Fatalf("calls %q", c.list())
+	}
+}

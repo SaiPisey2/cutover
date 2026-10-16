@@ -183,8 +183,9 @@ func (r *runner) run() error {
 // second switch is refused, so every outcome is a rollback: approving it,
 // rejecting it, or a rollback signal.
 func (r *runner) brokenGate() error {
-	if err := r.gate("replication-broken", "The switch aborted, but the reverse link could not be stopped, so forward "+
-		"replication was left stopped. Writes are on the source. Switching again is refused: approve to roll back.", 1); err != nil {
+	if err := r.gate("replication-broken", "The switch aborted, and forward replication was left stopped (the reverse link "+
+		"could not be stopped, or the forward link could not be restarted). Writes are on the source. Switching again is "+
+		"refused: approve to roll back.", 1); err != nil {
 		return err
 	}
 	r.event("rollback-requested", "", "replication is broken; rollback is the only safe way on")
