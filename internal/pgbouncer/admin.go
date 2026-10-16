@@ -26,7 +26,13 @@ var (
 type Admin struct{ conn *pgconn.PgConn }
 
 func Dial(ctx context.Context, dsn string) (*Admin, error) {
-	c, err := pgconn.Connect(ctx, dsn)
+	// pgconn's parse error echoes the string, masking the password only up
+	// to the first space; say nothing about a string that does not parse.
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("pgbouncer admin: the dsn is not a valid connection string")
+	}
+	c, err := pgconn.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgbouncer admin: %w", err)
 	}

@@ -312,6 +312,10 @@ func (a *Activities) StartLink(ctx context.Context, in LinkIn) (err error) {
 				return fmt.Errorf("%s: orphaned slot: %w", in.Link.From, err)
 			}
 		}
+		// CREATE SUBSCRIPTION echoes a conninfo it cannot parse.
+		if err := checkDSN(pgFor(in.Plan, in.Link.From).ReplicationDSN); err != nil {
+			return err
+		}
 		conninfo, err := pgFor(in.Plan, in.Link.From).ReplicationDSN.Resolve()
 		if err != nil {
 			return err
@@ -428,7 +432,7 @@ func admin(ctx context.Context, p plan.Plan) (*pgbouncer.Admin, error) {
 	}
 	ad, err := pgbouncer.Dial(ctx, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("pgbouncer: %w", err)
+		return nil, fmt.Errorf("pgbouncer (%s): %w", p.Database.PgBouncer.AdminDSN, err)
 	}
 	return ad, nil
 }

@@ -10,7 +10,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.temporal.io/sdk/temporal"
 
+	"github.com/SaiPisey2/cutover/internal/pg"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
+	"github.com/SaiPisey2/cutover/internal/secret"
 )
 
 func TestLinks(t *testing.T) {
@@ -125,5 +127,53 @@ func TestFailVersionMismatchIsPermanent(t *testing.T) {
 		if !errors.As(err, &app) || !app.NonRetryable() || app.Type() != ErrTypePermanent || strings.Contains(err.Error(), "hunter2") {
 			t.Fatalf("%q: %#v", msg, err)
 		}
+	}
+}
+
+// mistyped are DSNs pgx cannot parse, with a fragment of their password that
+// pgx's own error would echo back past redact.DSN.
+var mistyped = []struct{ dsn, fragment string }{
+	{"host=h user=u password=hun ter2 dbname=app", "ter2"},
+	{"host=h user=u password='abc def dbname=app", "def"},
+	{"postgres://u:p@ss w@h/db", "ss w"},
+}
+
+// A DSN that does not parse must not reach the error at all: pgx echoes the
+// string with best-effort masking that stops at the first space.
+func TestMistypedDSNLeaksNothing(t *testing.T) {
+	for _, m := range mistyped {
+		t.Setenv("CUTOVER_TEST_MISTYPED", m.dsn)
+		ref := secret.Ref("env:CUTOVER_TEST_MISTYPED")
+		_, err := connect(context.Background(), ref)
+		if err == nil {
+			t.Fatalf("%q: want a parse error", m.dsn)
+		}
+		if msg := fail(err).Error(); strings.Contains(msg, m.fragment) || !strings.Contains(msg, "env:CUTOVER_TEST_MISTYPED") {
+			t.Fatalf("connect %q: %s", m.dsn, msg)
+		}
+		var f pg.Facts
+		err = replRole(context.Background(), nil, ref, &f)
+		if err == nil {
+			t.Fatalf("%q: want a parse error", m.dsn)
+		}
+		if msg := fail(err).Error(); strings.Contains(msg, m.fragment) || !strings.Contains(msg, "env:CUTOVER_TEST_MISTYPED") {
+			t.Fatalf("replRole %q: %s", m.dsn, msg)
+		}
+	}
+}
+
+// StartLink hands the replication DSN to CREATE SUBSCRIPTION, whose error
+// would echo it; a mistyped one is refused before any connection.
+func TestStartLinkRejectsMistypedReplicationDSN(t *testing.T) {
+	for _, m := range mistyped {
+		t.Setenv("CUTOVER_TEST_MISTYPED", m.dsn)
+		err := checkDSN(secret.Ref("env:CUTOVER_TEST_MISTYPED"))
+		if err == nil || strings.Contains(err.Error(), m.fragment) {
+			t.Fatalf("%q: %v", m.dsn, err)
+		}
+	}
+	t.Setenv("CUTOVER_TEST_MISTYPED", "host=h user=u password=x dbname=app")
+	if err := checkDSN(secret.Ref("env:CUTOVER_TEST_MISTYPED")); err != nil {
+		t.Fatal(err)
 	}
 }

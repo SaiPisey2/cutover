@@ -243,6 +243,40 @@ func TestActivityErrorsAreRedacted(t *testing.T) {
 	if strings.Contains(err.Error(), "hunter2") {
 		t.Fatalf("password leaked: %v", err)
 	}
+	// Mistyped DSNs: pgx's parse error echoes the string, masked only up to
+	// the first space. Neither the activity error nor the readiness report
+	// (the PgBouncer admin DSN lands in PoolErr) may carry a fragment.
+	for _, m := range []struct{ dsn, fragment string }{
+		{"host=127.0.0.1 user=postgres password=hun ter2 dbname=app", "ter2"},
+		{"host=127.0.0.1 user=postgres password='abc def dbname=app", "def"},
+		{"postgres://postgres:p@ss w@127.0.0.1/app", "ss w"},
+	} {
+		t.Setenv("CUTOVER_IT_BAD_DSN", m.dsn)
+		_, err := e.ExecuteActivity(a.Discover, ops.DiscoverIn{Plan: p})
+		if err == nil || strings.Contains(err.Error(), m.fragment) || !strings.Contains(err.Error(), "env:CUTOVER_IT_BAD_DSN") {
+			t.Fatalf("source %q: %v", m.dsn, err)
+		}
+		q := itest.Plan(t)
+		q.Database.PgBouncer.AdminDSN = secret.Ref("env:CUTOVER_IT_BAD_DSN")
+		v, err := e.ExecuteActivity(a.Discover, ops.DiscoverIn{Plan: q})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rep readiness.Report
+		if err := v.Get(&rep); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, f := range rep.Findings {
+			if strings.Contains(f.Message, m.fragment) {
+				t.Fatalf("admin %q: %s", m.dsn, f.Message)
+			}
+			found = found || f.Code == "pgbouncer"
+		}
+		if !found {
+			t.Fatalf("admin %q: no pgbouncer finding: %+v", m.dsn, rep.Findings)
+		}
+	}
 }
 
 func TestPauseRepointResume(t *testing.T) {

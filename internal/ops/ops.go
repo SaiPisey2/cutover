@@ -162,16 +162,34 @@ func pgFor(p plan.Plan, s Side) plan.Postgres {
 	return p.Target.Postgres
 }
 
-// connect opens a fresh connection per activity call. A connection is never
-// reused after a context timeout (pgx closes it).
-func connect(ctx context.Context, ref secret.Ref) (*pgx.Conn, error) {
+// parseDSN resolves ref and parses it. A parse failure never carries pgx's
+// message: pgx echoes the connection string, masking the password only up
+// to the first space, so a mistyped DSN would leak part of it.
+func parseDSN(ref secret.Ref) (*pgx.ConnConfig, error) {
 	dsn, err := ref.Resolve()
 	if err != nil {
 		return nil, err
 	}
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse dsn from %s: %s", ref, redact.DSN(err.Error()))
+		return nil, permanentf("dsn from %s is not a valid connection string", ref)
+	}
+	return cfg, nil
+}
+
+// checkDSN reports whether ref holds a DSN that parses, without saying
+// anything about its contents.
+func checkDSN(ref secret.Ref) error {
+	_, err := parseDSN(ref)
+	return err
+}
+
+// connect opens a fresh connection per activity call. A connection is never
+// reused after a context timeout (pgx closes it).
+func connect(ctx context.Context, ref secret.Ref) (*pgx.Conn, error) {
+	cfg, err := parseDSN(ref)
+	if err != nil {
+		return nil, err
 	}
 	cfg.RuntimeParams["application_name"] = pg.AppName
 	c, err := pgx.ConnectConfig(ctx, cfg)
@@ -186,13 +204,9 @@ func connect(ctx context.Context, ref secret.Ref) (*pgx.Conn, error) {
 // replication DSN's host is how the other database reaches this one, which
 // the worker may not be able to reach, so it is parsed, never dialled.
 func replRole(ctx context.Context, c *pgx.Conn, ref secret.Ref, f *pg.Facts) error {
-	dsn, err := ref.Resolve()
+	cfg, err := parseDSN(ref)
 	if err != nil {
 		return err
-	}
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return fmt.Errorf("parse replication dsn from %s: %s", ref, redact.DSN(err.Error()))
 	}
 	f.ReplUser = cfg.User
 	f.ReplUserReplication, err = pg.CanReplicate(ctx, c, cfg.User)
