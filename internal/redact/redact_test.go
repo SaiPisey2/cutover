@@ -16,6 +16,11 @@ func TestDSN(t *testing.T) {
 		{"host=db password = 'p w\\'x' dbname=app", "host=db password=xxxxx dbname=app"},
 		{"password=pw host=db", "password=xxxxx host=db"},
 		{"dial postgres://u:pw@h/db: connection refused", "dial postgres://u:xxxxx@h/db: connection refused"},
+		{`parse "password=pw host=db": bad`, `parse "password=xxxxx host=db": bad`},
+		{"(password=pw)", "(password=xxxxx"},
+		{"host=db sslpassword=keep", "host=db sslpassword=keep"},
+		{"postgres://u:p@ss@h/db", "postgres://u:xxxxx@h/db"},
+		{"host=db password='abc def", "host=db password=xxxxx"},
 		{"no secrets here", "no secrets here"},
 	} {
 		if got := DSN(tc.in); got != tc.want {
@@ -31,6 +36,8 @@ func TestSplit(t *testing.T) {
 		{"postgres://app@db/app", "postgres://app@db/app", ""},
 		{"host=db user=app password=pw dbname=app", "host=db user=app dbname=app", "pw"},
 		{"host=db password='p w\\'x' dbname=app", "host=db dbname=app", "p w'x"},
+		{"postgres://u:p%40ss@h/db", "postgres://u@h/db", "p@ss"},
+		{"postgres://u:p@ss@h/db", "postgres://u@h/db", "p@ss"},
 	} {
 		clean, pw := Split(tc.in)
 		if clean != tc.clean || pw != tc.pw {

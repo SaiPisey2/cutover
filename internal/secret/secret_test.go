@@ -73,3 +73,12 @@ func TestResolveFileTrimsTrailingNewline(t *testing.T) {
 		t.Fatal("empty file must be an error")
 	}
 }
+
+func TestValidateNeverEchoesValueInEnvOrFileBranch(t *testing.T) {
+	for _, r := range []Ref{"env:postgres://u:hunter2@h/db", "file:u:hunter2@h/db"} {
+		err := r.Validate()
+		if err == nil || strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("%q: error must not echo the value: %v", r, err)
+		}
+	}
+}

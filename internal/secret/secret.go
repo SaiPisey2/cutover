@@ -27,11 +27,11 @@ func (r Ref) Validate() error {
 	switch kind {
 	case "env":
 		if !envName.MatchString(rest) {
-			return fmt.Errorf("secret reference env:%s: not a valid environment variable name", rest)
+			return fmt.Errorf("secret reference env: not a valid environment variable name")
 		}
 	case "file":
 		if !filepath.IsAbs(rest) {
-			return fmt.Errorf("secret reference file:%s: must be an absolute path", rest)
+			return fmt.Errorf("secret reference file: must be an absolute path")
 		}
 	default:
 		return fmt.Errorf("secret reference: unknown kind (want env:NAME or file:/path)")

@@ -10,9 +10,9 @@ import (
 const mask = "xxxxx"
 
 var (
-	urlUserinfo = regexp.MustCompile(`(?i)(postgres(?:ql)?://[^:/@\s]*:)[^@\s]*@`)
+	urlUserinfo = regexp.MustCompile(`(?i)(postgres(?:ql)?://[^:/@\s]*:)[^\s/]*@`)
 	urlQuery    = regexp.MustCompile(`(?i)([?&]password=)[^&\s]*`)
-	keyword     = regexp.MustCompile(`(?i)(^|\s)password\s*=\s*('(?:[^'\\]|\\.)*'|[^\s']\S*)`)
+	keyword     = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_?&])password\s*=\s*('(?:[^'\\]|\\.)*'|'[\s\S]*|[^\s']\S*)`)
 )
 
 // DSN returns s with every Postgres password it contains replaced by xxxxx.
@@ -52,10 +52,13 @@ func Split(dsn string) (clean, password string) {
 	}
 	val := dsn[m[4]:m[5]]
 	if strings.HasPrefix(val, "'") {
-		val = strings.TrimSuffix(strings.TrimPrefix(val, "'"), "'")
+		val = strings.TrimPrefix(val, "'")
+		if len(val) > 0 && strings.HasSuffix(val, "'") && !strings.HasSuffix(val, `\'`) {
+			val = val[:len(val)-1]
+		}
 		val = strings.NewReplacer(`\'`, `'`, `\\`, `\`).Replace(val)
 	}
-	clean = strings.Join(strings.Fields(dsn[:m[0]]+" "+dsn[m[1]:]), " ")
+	clean = strings.Join(strings.Fields(dsn[:m[3]]+" "+dsn[m[1]:]), " ")
 	return clean, val
 }
 
