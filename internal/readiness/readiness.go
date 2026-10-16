@@ -12,6 +12,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/redact"
+	"github.com/SaiPisey2/cutover/internal/route"
 )
 
 type Severity string
@@ -149,11 +150,18 @@ func Assess(in Input) Report {
 		}
 	}
 
+	// Compared as Repoint verifies a route: host (any case), port, dbname.
+	db := in.Plan.Database.Name
+	srcRoute, routeErr := route.Resolve(in.Plan.Source.Postgres.Route, db)
+	have := route.Target{Host: in.Pool.Host, Port: in.Pool.Port, DBName: in.Pool.DB}
 	switch {
 	case in.PoolErr != "":
-		add(Blocker, "pgbouncer", in.Plan.Database.Name, "cannot read PgBouncer: %s", redact.DSN(in.PoolErr))
-	case in.Pool.Host != pgbouncer.HostOf(in.Plan.Source.Postgres.Route):
-		add(Blocker, "pgbouncer-route", in.Plan.Database.Name, "PgBouncer routes %s to %q, not the source route %q", in.Plan.Database.Name, in.Pool.Host, pgbouncer.HostOf(in.Plan.Source.Postgres.Route))
+		add(Blocker, "pgbouncer", db, "cannot read PgBouncer: %s", redact.DSN(in.PoolErr))
+	case routeErr != nil:
+		add(Blocker, "pgbouncer-route", db, "the source route does not parse: %v", routeErr)
+	case !route.Same(have, srcRoute):
+		add(Blocker, "pgbouncer-route", db, "PgBouncer routes %s to host=%q port=%d dbname=%q, not the source route host=%q port=%d dbname=%q",
+			db, have.Host, have.Port, have.DBName, srcRoute.Host, srcRoute.Port, srcRoute.DBName)
 	case in.Pool.Paused:
 		add(Warning, "pgbouncer-paused", in.Plan.Database.Name, "PgBouncer has %s paused right now", in.Plan.Database.Name)
 	}

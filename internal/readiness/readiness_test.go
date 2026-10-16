@@ -27,7 +27,7 @@ func good() Input {
 	tgt := pg.Facts{VersionNum: 170002, WalLevel: "logical", Superuser: true, CreateSubscription: true, MaxSlots: 10,
 		ReplUser: "repl", ReplUserReplication: true,
 		Extensions: []pg.Extension{{Name: "plpgsql"}, {Name: "pgcrypto"}}}
-	return Input{Plan: p, Source: src, Target: tgt, Pool: pgbouncer.Database{Name: "app", Host: "pg-source"}}
+	return Input{Plan: p, Source: src, Target: tgt, Pool: pgbouncer.Database{Name: "app", Host: "pg-source", Port: 5432, DB: "app"}}
 }
 
 func codes(r Report, s Severity) []string {
@@ -77,6 +77,9 @@ func TestBlockers(t *testing.T) {
 		{"mixed-case sequence", func(in *Input) { in.Source.Sequences[0].Name = "Orders_id_seq" }, "identifier"},
 		{"pool error", func(in *Input) { in.PoolErr = "connection refused" }, "pgbouncer"},
 		{"pool routed elsewhere", func(in *Input) { in.Pool.Host = "pg-target" }, "pgbouncer-route"},
+		{"pool routed to another port", func(in *Input) { in.Pool.Port = 6543 }, "pgbouncer-route"},
+		{"pool routed to another database", func(in *Input) { in.Pool.DB = "app_old" }, "pgbouncer-route"},
+		{"source route unparsable", func(in *Input) { in.Plan.Source.Postgres.Route = "host=pg-source port=x" }, "pgbouncer-route"},
 		{"direct clients", func(in *Input) { in.Plan.Database.PgBouncer.Addresses = []string{"10.0.1.0/24"} }, "direct-clients"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,5 +249,15 @@ func TestDirectClients(t *testing.T) {
 	got, ok := DirectClients([]string{"10.0.0.0/24"}, sess)
 	if !ok || len(got) != 1 || got[0].Addr != "10.0.1.5" {
 		t.Fatalf("%v %+v", ok, got)
+	}
+}
+
+// The route check matches Repoint's: host (any case), port and dbname, with
+// PgBouncer's defaults applied to the plan's route.
+func TestPoolRouteDefaults(t *testing.T) {
+	in := good()
+	in.Plan.Source.Postgres.Route = "host=PG-Source"
+	if r := Assess(in); slices.Contains(codes(r, Blocker), "pgbouncer-route") {
+		t.Fatalf("default port 5432 and dbname app must match: %+v", r.Findings)
 	}
 }
