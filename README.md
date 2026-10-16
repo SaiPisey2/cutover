@@ -17,10 +17,15 @@ shifting, the web console and the end-to-end demo are next.
 - every table has a primary key (or `REPLICA IDENTITY FULL`)
 - PgBouncer 1.21+ in transaction pooling mode, used by every app, with
   `%include <routes_file>` at the end of `pgbouncer.ini`
-- `pg_dump` and `psql` on the worker host
+- `pg_dump` and `psql` version 17 or later on the worker host
 - a Temporal server (`temporal server start-dev` is enough to try it)
 
 ## Try it
+
+The example plan reads its credentials from `CUTOVER_SOURCE_DSN`,
+`CUTOVER_TARGET_DSN` and `CUTOVER_PGBOUNCER_ADMIN_DSN` (export them) and
+from the files `/etc/cutover/source-repl-dsn` and `/etc/cutover/target-repl-dsn`
+(create them, one DSN each). Edit the plan to match your setup.
 
 ```bash
 temporal server start-dev --ip 127.0.0.1 &
@@ -28,7 +33,10 @@ go run ./cmd/cutover worker &
 go run ./cmd/cutover migrate --plan examples/plan.yaml
 go run ./cmd/cutover status shop
 go run ./cmd/cutover gate shop discover approve --as alice
+go run ./cmd/cutover rollback shop --as alice --reason "why"   # any time before finish
 ```
+
+Positional arguments (ID, gate, decision) come before flags.
 
 Every command takes `--temporal HOST:PORT` (default `$CUTOVER_TEMPORAL` or
 `127.0.0.1:7233`) and `--namespace` (default `default`). `status` shows the
@@ -48,7 +56,7 @@ unwind. `replication-broken` is described in the runbook below.
 ## Operating notes
 
 - **Approvers are not authenticated.** The name given to `cutover gate --as`
-  is recorded as given. Plan C adds accounts. Until then anyone with Temporal
+  is recorded as given. A later release adds accounts. Until then anyone with Temporal
   access can approve.
 - **Credentials.** The plan carries only `env:` and `file:` references,
   resolved on the worker. Postgres server logs may record the

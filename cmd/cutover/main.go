@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	fs2 "io/fs"
 	"log/slog"
 	"os"
 	"strings"
@@ -30,6 +31,8 @@ commands:
   status ID [--json]                       show phase, gate and recent events
   gate ID GATE approve|reject --as NAME [--note TEXT]
   rollback ID --as NAME --reason TEXT      roll back (any time before Finish)
+
+positional arguments come before flags (ID, GATE and the decision are positional).
 
 flags for every command:
   --temporal HOST:PORT   Temporal frontend (default $CUTOVER_TEMPORAL or 127.0.0.1:7233)
@@ -66,6 +69,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, usage)
 		return 2
 	}
+	switch args[0] {
+	case "-h", "--help", "help", "-help":
+		fmt.Fprint(stderr, usage)
+		return 0
+	}
 	err := dispatch(ctx, args[0], args[1:], stdout, stderr)
 	var ue *usageError
 	switch {
@@ -80,6 +88,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cutover: %v\n", err)
 		return 1
 	}
+}
+
+func isPathError(err error) bool {
+	var pe *fs2.PathError
+	return errors.As(err, &pe)
+}
+
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "-help" || a == "--help" {
+			return true
+		}
+	}
+	return false
 }
 
 // positional takes n leading arguments that are not flags.
@@ -131,6 +153,9 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		}
 		p, err := plan.Load(*planPath)
 		if err != nil {
+			if isPathError(err) {
+				return err
+			}
 			return usagef("%v", err)
 		}
 		mid := p.Name
@@ -154,11 +179,14 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		return nil
 
 	case "status":
+		asJSON := fs.Bool("json", false, "print the full status as JSON")
+		if wantsHelp(args) {
+			return parse(fs, []string{"-h"})
+		}
 		pos, rest, err := positional(args, 1, "status: migration ID required")
 		if err != nil {
 			return err
 		}
-		asJSON := fs.Bool("json", false, "print the full status as JSON")
 		if err := parse(fs, rest); err != nil {
 			return err
 		}
@@ -167,12 +195,8 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 			return err
 		}
 		defer c.Close()
-		v, err := c.QueryWorkflow(ctx, flow.WorkflowID(pos[0]), "", flow.QueryStatus)
+		st, err := queryStatus(ctx, c, pos[0])
 		if err != nil {
-			return err
-		}
-		var st flow.Status
-		if err := v.Get(&st); err != nil {
 			return err
 		}
 		if *asJSON {
@@ -184,12 +208,15 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		return nil
 
 	case "gate":
+		as := fs.String("as", "", "approver name")
+		note := fs.String("note", "", "note recorded with the decision")
+		if wantsHelp(args) {
+			return parse(fs, []string{"-h"})
+		}
 		pos, rest, err := positional(args, 3, "gate: want ID GATE approve or reject")
 		if err != nil {
 			return err
 		}
-		as := fs.String("as", "", "approver name")
-		note := fs.String("note", "", "note recorded with the decision")
 		if err := parse(fs, rest); err != nil {
 			return err
 		}
@@ -205,17 +232,31 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 			return err
 		}
 		defer c.Close()
-		fmt.Fprintln(stderr, "note: --as is not authenticated in this release; anyone with Temporal access can approve")
+		st, err := queryStatus(ctx, c, pos[0])
+		if err != nil {
+			return err
+		}
+		if st.Gate == nil || st.Gate.Name != pos[1] {
+			open := "none"
+			if st.Gate != nil {
+				open = st.Gate.Name
+			}
+			return fmt.Errorf("gate %s is not open (open: %s)", pos[1], open)
+		}
+		fmt.Fprintln(stderr, notAuthenticated)
 		return c.SignalWorkflow(ctx, flow.WorkflowID(pos[0]), "", flow.SignalGate,
 			flow.GateSignal{Gate: pos[1], Decision: d, ApproverID: *as, Note: *note})
 
 	case "rollback":
+		as := fs.String("as", "", "who is rolling back")
+		reason := fs.String("reason", "", "why")
+		if wantsHelp(args) {
+			return parse(fs, []string{"-h"})
+		}
 		pos, rest, err := positional(args, 1, "rollback: migration ID required")
 		if err != nil {
 			return err
 		}
-		as := fs.String("as", "", "who is rolling back")
-		reason := fs.String("reason", "", "why")
 		if err := parse(fs, rest); err != nil {
 			return err
 		}
@@ -230,10 +271,22 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 			return err
 		}
 		defer c.Close()
+		fmt.Fprintln(stderr, notAuthenticated)
 		return c.SignalWorkflow(ctx, flow.WorkflowID(pos[0]), "", flow.SignalRollback,
 			flow.RollbackSignal{ApproverID: *as, Reason: *reason})
 	}
 	return usagef("unknown command %q\n\n%s", cmd, usage)
+}
+
+const notAuthenticated = "note: --as is not authenticated in this release; anyone with Temporal access can approve"
+
+func queryStatus(ctx context.Context, c client.Client, id string) (flow.Status, error) {
+	var st flow.Status
+	v, err := c.QueryWorkflow(ctx, flow.WorkflowID(id), "", flow.QueryStatus)
+	if err != nil {
+		return st, err
+	}
+	return st, v.Get(&st)
 }
 
 func printStatus(w io.Writer, st flow.Status) {
