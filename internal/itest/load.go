@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/SaiPisey2/cutover/internal/redact"
@@ -59,11 +60,19 @@ type Load struct {
 	orders                    map[int][]int
 	skus                      map[string]int64
 	slowest                   atomic.Int64
+	stop                      sync.Once
+	result                    LoadResult
 }
 
-// StartLoad runs writers through PgBouncer until Stop. Each statement uses a
-// background context, so Stop never turns an in-flight query into a failure;
-// a held query during a pause just waits.
+// stmtTimeout bounds each load statement: well above any max_pause, and
+// below PgBouncer's query_wait_timeout (120s), so a pause that never lifts
+// fails here, clearly, as a failed query.
+const stmtTimeout = 60 * time.Second
+
+// StartLoad runs writers through PgBouncer until Stop. Each statement gets
+// its own context (stmtTimeout), never the load's, so Stop never turns an
+// in-flight query into a failure; a held query during a pause just waits.
+// The test's cleanup stops the load if the test ends without Stop.
 func StartLoad(t testing.TB, writers int) *Load {
 	t.Helper()
 	pool, err := pgxpool.New(context.Background(), PoolDSN+"&pool_max_conns="+fmt.Sprint(writers))
@@ -72,6 +81,7 @@ func StartLoad(t testing.TB, writers int) *Load {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Load{cancel: cancel, pool: pool, start: time.Now(), orders: map[int][]int{}, skus: map[string]int64{}}
+	t.Cleanup(func() { l.Stop() })
 	for w := 1; w <= writers; w++ {
 		l.wg.Add(1)
 		go func() {
@@ -88,7 +98,7 @@ func StartLoad(t testing.TB, writers int) *Load {
 			}()
 			for i := 1; ctx.Err() == nil; i++ {
 				began := time.Now()
-				_, err := pool.Exec(context.Background(), "INSERT INTO public.orders (writer, n) VALUES ($1, $2)", w, i)
+				_, err := l.exec("INSERT INTO public.orders (writer, n) VALUES ($1, $2)", w, i)
 				l.took(began)
 				if err != nil {
 					l.fail(fmt.Sprintf("insert (%d,%d)", w, i), err)
@@ -99,7 +109,7 @@ func StartLoad(t testing.TB, writers int) *Load {
 				if i%3 == 0 {
 					sku := fmt.Sprintf("sku-%02d", i%seedItems)
 					began := time.Now()
-					_, err := pool.Exec(context.Background(), "UPDATE public.items SET qty = qty + 1 WHERE sku = $1", sku)
+					_, err := l.exec("UPDATE public.items SET qty = qty + 1 WHERE sku = $1", sku)
 					l.took(began)
 					if err != nil {
 						l.fail("update "+sku, err)
@@ -113,6 +123,12 @@ func StartLoad(t testing.TB, writers int) *Load {
 		}()
 	}
 	return l
+}
+
+func (l *Load) exec(sql string, args ...any) (pgconn.CommandTag, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), stmtTimeout)
+	defer cancel()
+	return l.pool.Exec(ctx, sql, args...)
 }
 
 func (l *Load) took(began time.Time) {
@@ -134,15 +150,23 @@ func (l *Load) fail(what string, err error) {
 	}
 }
 
+// Stop ends the load and returns what it did; later calls return the same.
 func (l *Load) Stop() LoadResult {
-	l.cancel()
-	l.wg.Wait()
-	l.pool.Close()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return LoadResult{Inserted: l.inserted.Load(), Updated: l.updated.Load(), Failed: l.failed.Load(), Errors: l.errs,
-		orders: l.orders, skus: l.skus, slowest: time.Duration(l.slowest.Load())}
+	l.stop.Do(func() {
+		l.cancel()
+		l.wg.Wait()
+		l.pool.Close()
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.result = LoadResult{Inserted: l.inserted.Load(), Updated: l.updated.Load(), Failed: l.failed.Load(), Errors: l.errs,
+			orders: l.orders, skus: l.skus, slowest: time.Duration(l.slowest.Load())}
+	})
+	return l.result
 }
+
+// Slowest is the longest any acknowledged statement took, on the real
+// clock: a client-side bound on how long the switch held writes.
+func (r LoadResult) Slowest() time.Duration { return r.slowest }
 
 // Verify checks that c holds every write the load made, exactly once: no
 // failed statement, every acknowledged insert present once and nothing

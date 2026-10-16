@@ -17,12 +17,14 @@ import (
 )
 
 type act struct {
+	gate string // the gate this act answers; "" for none
 	when func(flow.Status) bool
 	do   func(*testsuite.TestWorkflowEnvironment)
 }
 
 func approve(gate, who string) act {
 	return act{
+		gate: gate,
 		when: func(s flow.Status) bool {
 			return s.Gate != nil && s.Gate.Name == gate && !slices.Contains(s.Gate.Approvals, who)
 		},
@@ -43,6 +45,7 @@ func run(t *testing.T, acts []act, edit func(*plan.Plan)) (flow.Result, itest.Lo
 	env.RegisterWorkflow(flow.ReplicateWait)
 	env.RegisterActivity(ops.New())
 	i := 0
+	seen := map[string]bool{}
 	var tick func()
 	tick = func() {
 		if i >= len(acts) {
@@ -50,9 +53,15 @@ func run(t *testing.T, acts []act, edit func(*plan.Plan)) (flow.Result, itest.Lo
 		}
 		if v, err := env.QueryWorkflow(flow.QueryStatus); err == nil {
 			var st flow.Status
-			if v.Get(&st) == nil && acts[i].when(st) {
-				acts[i].do(env)
-				i++
+			if v.Get(&st) == nil {
+				if g := st.Gate; g != nil && g.Name != acts[i].gate && !seen[g.Name] {
+					seen[g.Name] = true
+					t.Logf("unexpected gate %q open (next act expects %q): %s", g.Name, acts[i].gate, g.Summary)
+				}
+				if acts[i].when(st) {
+					acts[i].do(env)
+					i++
+				}
 			}
 		}
 		env.RegisterDelayedCallback(tick, 200*time.Millisecond)
@@ -66,6 +75,12 @@ func run(t *testing.T, acts []act, edit func(*plan.Plan)) (flow.Result, itest.Lo
 	load := itest.StartLoad(t, 4)
 	env.ExecuteWorkflow(flow.Migration, flow.Input{MigrationID: "itest", Plan: p})
 	lr := load.Stop()
+	// The real-clock bound on the hold: no acknowledged write waited as
+	// long as the pause budget (the workflow's budget runs on the test
+	// env's clock, which stands still while activities run).
+	if mp := p.Thresholds.Switch.MaxPause.D(); lr.Slowest() >= mp {
+		t.Errorf("slowest acknowledged statement took %s, not under max_pause %s", lr.Slowest(), mp)
+	}
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatal(err)
 	}
