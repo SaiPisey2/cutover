@@ -75,6 +75,10 @@ func TestRejects(t *testing.T) {
 		{"duplicate schema", "database:\n  name: shop\n  schemas: [public, public]\n  pgbouncer: {admin_dsn: env:PGB, routes_file: /r.ini}\n", `duplicate entry "public"`},
 		{"duplicate table", "database:\n  name: shop\n  tables: [public.a, public.a]\n  pgbouncer: {admin_dsn: env:PGB, routes_file: /r.ini}\n", `duplicate entry "public.a"`},
 		{"uri route", "source:\n  postgres: {dsn: env:SRC, replication_dsn: env:SRC_REPL, route: \"postgres://u@h/shop host=a\"}\n", "not a URI"},
+		{"same database both sides", "target:\n  postgres: {dsn: env:TGT, replication_dsn: env:TGT_REPL, route: host=a dbname=shop}\n", "same database"},
+		{"same database, case and defaults", "target:\n  postgres: {dsn: env:TGT, replication_dsn: env:TGT_REPL, route: \"port=5432 host='A'\"}\n", "same database"},
+		{"unparseable route", "target:\n  postgres: {dsn: env:TGT, replication_dsn: env:TGT_REPL, route: \"host='b\"}\n", "target.postgres.route"},
+		{"route without host", "target:\n  postgres: {dsn: env:TGT, replication_dsn: env:TGT_REPL, route: port=5432 dbname=shop}\n", "target.postgres.route"},
 		{"two documents", "---\nversion: 1\n", "one YAML document"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -18,6 +18,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/SaiPisey2/cutover/internal/route"
 	"github.com/SaiPisey2/cutover/internal/secret"
 )
 
@@ -170,6 +171,7 @@ func (p Plan) Validate() error {
 	if !NamePattern.MatchString(p.Name) {
 		bad("name: must match %s", NamePattern)
 	}
+	targets := map[string]route.Target{}
 	for side, pg := range map[string]Postgres{"source": p.Source.Postgres, "target": p.Target.Postgres} {
 		if err := pg.DSN.Validate(); err != nil {
 			bad("%s.postgres.dsn: %v", side, err)
@@ -184,8 +186,20 @@ func (p Plan) Validate() error {
 			bad("%s.postgres.route: must not contain a password (PgBouncer authenticates on its own)", side)
 		case strings.Contains(pg.Route, "://"):
 			bad("%s.postgres.route: must be key=value pairs, not a URI", side)
-		case !strings.Contains(pg.Route, "host="):
-			bad("%s.postgres.route: must set host=", side)
+		default:
+			// The [databases] entry is named after database.name, which is
+			// PgBouncer's dbname when the route sets none.
+			t, err := route.Resolve(pg.Route, p.Database.Name)
+			if err != nil {
+				bad("%s.postgres.route: %s", side, strings.TrimPrefix(err.Error(), "route: "))
+			} else {
+				targets[side] = t
+			}
+		}
+	}
+	if s, ok := targets["source"]; ok {
+		if t, ok := targets["target"]; ok && route.Same(s, t) {
+			bad("source and target routes point at the same database (%s:%d/%s)", t.Host, t.Port, t.DBName)
 		}
 	}
 	d := p.Database
