@@ -116,6 +116,34 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 		run  func() error
 	}
 	var undo []comp
+	// Cancellation. Once the pool may be paused, cancelling the workflow
+	// must not leave writes held: the unbounded steps (repoint-back, then
+	// resume) switch to a disconnected context and run to completion, and
+	// only then is the cancellation returned. The bounded replication
+	// compensations are skipped; unwind handles the links.
+	orig := r.ctx
+	defer func() { r.ctx = orig }()
+	cancelled := func() bool { return orig.Err() != nil }
+	detached := false
+	disconnect := func() {
+		if !detached {
+			detached = true
+			r.ctx, _ = workflow.NewDisconnectedContext(orig)
+			r.event("cancel-deferred", "", "workflow cancelled while writes may be held; restoring the route and resuming first")
+		}
+	}
+	// hold runs an unbounded step to completion, even across cancellation.
+	hold := func(fn func() error) error {
+		if cancelled() {
+			disconnect()
+		}
+		err := r.must(fn)
+		if err != nil && cancelled() && !detached {
+			disconnect()
+			err = r.must(fn)
+		}
+		return err
+	}
 	abort := func(why string) (bool, error) {
 		r.event("switch-aborted", "", why+"; writes resume on the "+string(from))
 		r.st.Sequences = nil
@@ -123,13 +151,15 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 		for i := len(undo) - 1; i >= 0; i-- {
 			switch u := undo[i]; {
 			case u.kind == repointBack:
-				if err := r.must(u.run); err != nil {
+				if err := hold(u.run); err != nil {
 					return false, err
 				}
+			case cancelled():
+				r.event("compensation-skipped", "", "workflow cancelled: replication compensation left to unwind")
 			case u.kind == startOld && broken:
 				r.event("compensation-skipped", "", "not restarting "+old.Name+": "+next.Name+" may still be live, and both directions would loop")
 			default:
-				if err := u.run(); err != nil {
+				if err := u.run(); err != nil && !cancelled() {
 					r.event("compensation-failed", "", message(err)+"; gave up so writes can resume")
 					if u.kind == stopNext {
 						broken = true
@@ -139,10 +169,13 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 				}
 			}
 		}
-		if err := r.must(resume); err != nil {
+		if err := hold(resume); err != nil {
 			return false, err
 		}
-		if broken {
+		switch {
+		case cancelled():
+			return false, orig.Err()
+		case broken:
 			return false, ErrReplicationBroken
 		}
 		return false, nil
@@ -198,8 +231,12 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 	}
 	// Point of no return.
 	r.st.Primary = to
-	if err := r.must(resume); err != nil {
+	if err := hold(resume); err != nil {
 		return true, err
+	}
+	if cancelled() {
+		r.event("switched", "", fmt.Sprintf("writes on the %s; then cancelled", to))
+		return true, orig.Err()
 	}
 	r.event("switched", "", fmt.Sprintf("writes on the %s; held for %s", to, workflow.Now(r.ctx).Sub(start)))
 	return true, r.step("drop-old-publication", func() error { return r.exec(2*time.Minute, acts.StopLink, oldIn, nil) })

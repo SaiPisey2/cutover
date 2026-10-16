@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/SaiPisey2/cutover/internal/ops"
@@ -301,7 +302,7 @@ func TestSwitchNeverAbortsAfterRepoint(t *testing.T) {
 }
 
 // The drain may not use the whole budget: the steps after it keep a reserve
-// of max(1s, max_pause/4).
+// of max(250ms, max_pause/4).
 func TestSwitchDrainLeavesReserve(t *testing.T) {
 	env := newEnv()
 	c := &calls{}
@@ -376,4 +377,79 @@ func TestSwitchOneSecondBudget(t *testing.T) {
 	if !res.OK || res.Primary != ops.Target {
 		t.Fatalf("%+v", res)
 	}
+}
+
+// blockAndCancel returns a mock body that cancels the workflow, then blocks
+// until its own activity is cancelled (or 5s pass).
+func blockAndCancel(env *testsuite.TestWorkflowEnvironment, c *calls, label string) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		c.add(label)
+		env.CancelWorkflow()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return nil
+		}
+	}
+}
+
+func runCancelled(t *testing.T, env *testsuite.TestWorkflowEnvironment) {
+	t.Helper()
+	env.SetTestTimeout(30 * time.Second)
+	env.ExecuteWorkflow(switchWorkflow, testPlan(), false)
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); !temporal.IsCanceledError(err) {
+		t.Fatalf("want a cancellation, got %v", err)
+	}
+}
+
+// Cancelled while paused, before the repoint: writes must still resume.
+func TestSwitchCancelledWhilePausedStillResumes(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	block := blockAndCancel(env, c, "seq:source>target")
+	env.OnActivity(a.SyncSequences, mockAny, mockAny).Return(
+		func(ctx context.Context, _ ops.SeqIn) ([]pg.SequenceSync, error) { return nil, block(ctx) }).Once()
+	mockAll(env, c, nil, true)
+	runCancelled(t, env)
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target", "resume"})
+}
+
+// Cancelled during the repoint: the route goes back to the source, then
+// writes resume.
+func TestSwitchCancelledDuringRepointRoutesBack(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	block := blockAndCancel(env, c, "repoint:target")
+	fwd := mock.MatchedBy(func(in ops.RepointIn) bool { return in.To == ops.Target })
+	env.OnActivity(a.Repoint, mockAny, fwd).Return(
+		func(ctx context.Context, _ ops.RepointIn) error { return block(ctx) }).Once()
+	mockAll(env, c, nil, true)
+	runCancelled(t, env)
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target",
+		"start:rev", "repoint:target", "repoint:source", "resume"})
+}
+
+// Cancelled while the forward resume is being retried: it still completes.
+func TestSwitchCancelledDuringResumeStillResumes(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	n := 0
+	env.OnActivity(a.ResumePool, mockAny, mockAny).Return(
+		func(context.Context, ops.PoolIn) error {
+			c.add("resume")
+			if n++; n == 2 {
+				env.CancelWorkflow() // lands while must waits to retry
+			}
+			return boom
+		}).Times(2)
+	mockAll(env, c, nil, true)
+	runCancelled(t, env)
+	assertCalls(t, c.since("repoint:target"), []string{"repoint:target", "resume", "resume", "resume"})
 }
