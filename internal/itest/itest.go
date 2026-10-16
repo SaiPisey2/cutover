@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/SaiPisey2/cutover/internal/pgbouncer"
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/secret"
 )
@@ -169,12 +170,14 @@ func Reset(t testing.TB) {
 			END LOOP;
 			CREATE SCHEMA public; END $$`)
 	}
-	routes := RoutesFile(t)
-	tmp := routes + ".tmp"
-	if err := os.WriteFile(tmp, []byte("[databases]\napp = "+SourceRoute+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(tmp, routes); err != nil {
+	// Docker Desktop's file share (virtiofs) can serve a routes file replaced
+	// soon after PgBouncer last read it with the old file's size: new bytes,
+	// truncated. A RELOAD of a truncated file has no [databases] entry and
+	// drops app, disconnecting its clients (reproduced: 16 of 40 rewrites
+	// from this file's old shorter format). Writing the same format as
+	// pgbouncer.WriteRoute keeps every harness routes file the same length,
+	// because SourceRoute and TargetRoute are the same length.
+	if err := pgbouncer.WriteRoute(RoutesFile(t), "app", SourceRoute); err != nil {
 		t.Fatal(err)
 	}
 	admin, err := pgconn.Connect(ctx, AdminDSN)
@@ -182,7 +185,9 @@ func Reset(t testing.TB) {
 		t.Fatalf("pgbouncer admin: %v (run: make itest-up)", err)
 	}
 	defer admin.Close(ctx)
-	for _, cmd := range []string{"ENABLE app", "RELOAD", "RESUME app", "RECONNECT app"} {
+	// RELOAD first: if an earlier test left PgBouncer without the app
+	// database, ENABLE would fail until the routes file is read again.
+	for _, cmd := range []string{"RELOAD", "ENABLE app", "RESUME app", "RECONNECT app"} {
 		_, err := admin.Exec(ctx, cmd).ReadAll()
 		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "not paused") && !strings.Contains(strings.ToLower(err.Error()), "not disabled") {
 			t.Fatalf("pgbouncer %s: %v", cmd, err)
