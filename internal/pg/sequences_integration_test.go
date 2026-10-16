@@ -5,6 +5,7 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/SaiPisey2/cutover/internal/itest"
@@ -88,5 +89,61 @@ func TestSampleDigest(t *testing.T) {
 	}
 	if est, err := pg.Estimate(ctx, tgt, "public.lines"); err != nil || est != 300 {
 		t.Fatalf("estimate %d %v", est, err)
+	}
+}
+
+func TestSampleDigestCollationAndSettings(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	rows := "INSERT INTO public.k VALUES ('a','2026-01-01 00:00:00+00'),('B','2026-01-02 00:00:00+00'),('_x','2026-01-03 00:00:00+00'),('Z','2026-01-04 00:00:00+00');"
+	if _, err := src.Exec(ctx, "CREATE TABLE public.k (id text PRIMARY KEY, at timestamptz);"+rows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.Exec(ctx, `CREATE TABLE public.k (id text COLLATE "POSIX" PRIMARY KEY, at timestamptz);`+rows); err != nil {
+		t.Fatal(err)
+	}
+	tables, err := pg.Tables(ctx, src, []string{"public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := tables[0]
+	a, _, err := pg.SampleDigest(ctx, src, k, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := pg.SampleDigest(ctx, tgt, k, 2)
+	if err != nil || a != b {
+		t.Fatalf("collation changed the sample: %q %q %v", a, b, err)
+	}
+	if _, err := tgt.Exec(ctx, "SET TimeZone='Asia/Tokyo'; SET DateStyle='German'"); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := pg.SampleDigest(ctx, tgt, k, 2)
+	if err != nil || a != c {
+		t.Fatalf("session settings changed the digest: %q %q %v", a, c, err)
+	}
+	if _, _, err := pg.SampleDigest(ctx, src, k, 0); err == nil {
+		t.Fatal("n <= 0 must error")
+	}
+}
+
+func TestSyncSequencesGuards(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	if _, err := pg.SyncSequences(ctx, src, tgt, []string{"public"}, -1); err == nil {
+		t.Fatal("negative margin must error")
+	}
+	ddl := "CREATE SEQUENCE public.big MAXVALUE 9223372036854775807;"
+	if _, err := src.Exec(ctx, ddl+"SELECT setval('public.big', 9223372036854775800)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.Exec(ctx, ddl); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pg.SyncSequences(ctx, src, tgt, []string{"public"}, 1000)
+	if err == nil || !strings.Contains(err.Error(), "public.big") {
+		t.Fatalf("overflow must error naming the sequence: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -19,6 +20,9 @@ type SequenceSync struct {
 // Logical replication does not carry sequences; without this, the first
 // insert on the new primary would collide with a replicated key.
 func SyncSequences(ctx context.Context, from, to *pgx.Conn, schemas []string, margin int64) ([]SequenceSync, error) {
+	if margin < 0 {
+		return nil, fmt.Errorf("margin must not be negative, got %d", margin)
+	}
 	src, err := Sequences(ctx, from, schemas)
 	if err != nil {
 		return nil, err
@@ -44,6 +48,9 @@ func SyncSequences(ctx context.Context, from, to *pgx.Conn, schemas []string, ma
 		d, ok := have[s.Qualified()]
 		if !ok {
 			return nil, fmt.Errorf("sequence %s: missing on the new primary", s.Qualified())
+		}
+		if *s.LastValue > math.MaxInt64-margin {
+			return nil, fmt.Errorf("sequence %s: last value %d plus margin %d overflows", s.Qualified(), *s.LastValue, margin)
 		}
 		want := *s.LastValue + margin
 		if d.LastValue != nil && *d.LastValue >= want {
