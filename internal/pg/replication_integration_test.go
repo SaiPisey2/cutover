@@ -162,8 +162,21 @@ func TestDropSlot(t *testing.T) {
 	if err := pg.EnsureSubscription(ctx, tgt, name, itest.SourceReplDSN, name, false); err != nil {
 		t.Fatal(err)
 	}
-	// The slot is active (walsender attached) here.
-	time.Sleep(500 * time.Millisecond)
+	// The slot must be active (walsender attached) before we drop it.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var active bool
+		if err := src.QueryRow(ctx, "SELECT coalesce(bool_or(active_pid IS NOT NULL), false) FROM pg_replication_slots WHERE slot_name = $1", name).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slot never became active")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err := pg.DropSlot(ctx, src, name); err != nil {
 		t.Fatalf("active slot: %v", err)
 	}
@@ -236,4 +249,44 @@ func TestWaitSentinelCancelled(t *testing.T) {
 	if visible || !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v %v, want false context.Canceled", visible, err)
 	}
+}
+
+func TestEnsureSubscriptionAsNonSuperuser(t *testing.T) {
+	ctx, src, tgt := replSetup(t)
+	name := pg.ObjectName("itest", "fwd")
+	role := "cutover_it_role"
+	for _, q := range []string{
+		"CREATE ROLE " + role + " LOGIN",
+		"GRANT pg_create_subscription TO " + role,
+		"GRANT CREATE ON DATABASE app TO " + role,
+	} {
+		if _, err := tgt.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), itest.TargetDSN)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "DROP SUBSCRIPTION IF EXISTS "+name)
+		_, _ = c.Exec(context.Background(), "DROP OWNED BY "+role)
+		_, _ = c.Exec(context.Background(), "DROP ROLE IF EXISTS "+role)
+	})
+	if err := pg.EnsurePublication(ctx, src, name, []string{"public.orders"}); err != nil {
+		t.Fatal(err)
+	}
+	// The harness uses trust auth, so a non-superuser cannot get a working
+	// subscription (password_required) and EnsureSubscription may fail
+	// past the catalog read. What must not happen is the catalog read itself
+	// being denied: subconninfo is revoked from PUBLIC.
+	rc := itest.Conn(t, "postgres://"+role+"@127.0.0.1:55433/app?sslmode=disable")
+	for range 2 {
+		err := pg.EnsureSubscription(ctx, rc, name, "host=pg-source port=5432 user=postgres password=x dbname=app", name, false)
+		if err != nil && (strings.Contains(err.Error(), "pg_subscription") || strings.Contains(err.Error(), "subconninfo")) {
+			t.Fatalf("catalog read denied for non-superuser: %v", err)
+		}
+	}
+	_ = src
 }

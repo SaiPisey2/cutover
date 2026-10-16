@@ -36,3 +36,20 @@ func TestSubscriptionErrorsMaskConninfo(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCanDetach(t *testing.T) {
+	for _, tc := range []struct {
+		msg  string
+		want bool
+	}{
+		{`ERROR: could not drop replication slot "s" on publisher: ERROR:  replication slot "s" does not exist`, true},
+		{`ERROR: could not connect to publisher when attempting to drop replication slot "s": connection refused`, true},
+		{`ERROR: could not drop replication slot "s" on publisher: ERROR:  permission denied to use replication slots`, false},
+		{`ERROR: could not drop replication slot "s" on publisher: ERROR:  replication slot "s" is active for PID 42`, false},
+		{`ERROR: must be owner of subscription s`, false},
+	} {
+		if got := canDetach(errors.New(tc.msg)); got != tc.want {
+			t.Errorf("canDetach(%q) = %v, want %v", tc.msg, got, tc.want)
+		}
+	}
+}

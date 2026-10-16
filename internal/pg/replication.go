@@ -61,9 +61,10 @@ func DropPublication(ctx context.Context, c *pgx.Conn, name string) error {
 }
 
 // EnsureSubscription creates the subscription (which creates its slot on the
-// publisher). If it exists it is brought in line: connection string and
-// publication list are altered when they differ, it is enabled, and the
-// publication is refreshed. copyData only affects tables added to the
+// publisher). If it exists it is brought in line: the connection string is
+// always set (it cannot be read back without superuser), the publication
+// list is altered when it differs, it is enabled, and the publication is
+// refreshed. copyData only affects tables added to the
 // publication since the subscription was created. conninfo is how this
 // database reaches the publisher; Postgres stores it in pg_subscription,
 // readable by superusers only. It carries a password, so every returned
@@ -76,12 +77,12 @@ func EnsureSubscription(ctx context.Context, c *pgx.Conn, name, conninfo, public
 }
 
 func ensureSubscription(ctx context.Context, c *pgx.Conn, name, conninfo, publication string, copyData bool) error {
+	// subconninfo is readable by superusers only, so never select it.
 	var enabled bool
-	var haveConn string
 	var havePubs []string
-	err := c.QueryRow(ctx, `SELECT subenabled, subconninfo, subpublications FROM pg_subscription
+	err := c.QueryRow(ctx, `SELECT subenabled, subpublications FROM pg_subscription
 		WHERE subname = $1 AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`, name).
-		Scan(&enabled, &haveConn, &havePubs)
+		Scan(&enabled, &havePubs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = c.Exec(ctx, fmt.Sprintf("CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = %t)",
 			pgx.Identifier{name}.Sanitize(), literal(conninfo), pgx.Identifier{publication}.Sanitize(), copyData))
@@ -91,10 +92,8 @@ func ensureSubscription(ctx context.Context, c *pgx.Conn, name, conninfo, public
 		return err
 	}
 	q := pgx.Identifier{name}.Sanitize()
-	if haveConn != conninfo {
-		if _, err := c.Exec(ctx, "ALTER SUBSCRIPTION "+q+" CONNECTION "+literal(conninfo)); err != nil {
-			return err
-		}
+	if _, err := c.Exec(ctx, "ALTER SUBSCRIPTION "+q+" CONNECTION "+literal(conninfo)); err != nil {
+		return err
 	}
 	if len(havePubs) != 1 || havePubs[0] != publication {
 		if _, err := c.Exec(ctx, "ALTER SUBSCRIPTION "+q+" SET PUBLICATION "+pgx.Identifier{publication}.Sanitize()+" WITH (refresh = false)"); err != nil {
@@ -110,10 +109,27 @@ func ensureSubscription(ctx context.Context, c *pgx.Conn, name, conninfo, public
 	return err
 }
 
+// canDetach reports whether a failed DROP SUBSCRIPTION may be retried
+// without the remote slot: the publisher cannot be reached, or the slot is
+// already gone. Any other failure (permissions, a slot still active) must
+// surface, or a live slot would be orphaned.
+func canDetach(err error) bool {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "42704" {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "could not connect") {
+		return true
+	}
+	return strings.Contains(msg, "could not drop replication slot") && strings.Contains(msg, "does not exist")
+}
+
 // DropSubscription drops the subscription and its slot on the publisher.
 // Missing is fine. It retries briefly while the slot is still active (the
 // walsender can outlive the apply worker). If the publisher is unreachable
-// or the remote slot is already gone, it detaches the subscription from its
+// or the remote slot is already gone (and only then; other errors are
+// returned, redacted), it detaches the subscription from its
 // slot and drops it anyway; in the unreachable case a slot on the publisher
 // is orphaned and the caller must remove it with DropSlot.
 func DropSubscription(ctx context.Context, c *pgx.Conn, name string) error {
@@ -134,8 +150,7 @@ func DropSubscription(ctx context.Context, c *pgx.Conn, name string) error {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "could not drop replication slot") && !strings.Contains(msg, "could not connect") {
+	if !canDetach(err) {
 		return redact.Err(fmt.Errorf("drop subscription %s: %w", name, err))
 	}
 	for _, stmt := range []string{
