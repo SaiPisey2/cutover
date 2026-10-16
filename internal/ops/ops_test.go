@@ -69,7 +69,7 @@ func TestFailKeepsCancellation(t *testing.T) {
 func TestPauseErrors(t *testing.T) {
 	var app *temporal.ApplicationError
 	err := fail(pauseErr(context.Background(), pgbouncer.ErrGlobalPause))
-	if !errors.As(err, &app) || !app.NonRetryable() || app.Type() != ErrTypePermanent || !strings.Contains(err.Error(), "globally paused") {
+	if !errors.As(err, &app) || !app.NonRetryable() || app.Type() != ErrTypePermanent || app.Message() != "pgbouncer is globally paused; cutover will not pause a pooler someone else paused — resume it first" {
 		t.Fatalf("global pause: %#v", err)
 	}
 	err = fail(pauseErr(context.Background(), pgbouncer.ErrPauseTimeout))

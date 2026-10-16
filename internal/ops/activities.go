@@ -444,7 +444,7 @@ func pauseErr(ctx context.Context, err error) error {
 		return context.Canceled
 	}
 	if errors.Is(err, pgbouncer.ErrGlobalPause) {
-		return permanentf("%v: cutover will not pause or resume a pooler someone else paused as a whole", err)
+		return permanentf("pgbouncer is globally paused; cutover will not pause a pooler someone else paused — resume it first")
 	}
 	return err
 }

@@ -14,6 +14,10 @@ import (
 
 var errRollback = errors.New("rollback requested")
 
+// ErrReplicationBroken is returned by a switch whose abort could not stop
+// the new link: the old link stays stopped rather than risk a loop.
+var ErrReplicationBroken = errors.New("replication broken: the new link could not be stopped, so the old one was not restarted")
+
 // acts is a nil receiver; its method values name the activities.
 var acts *ops.Activities
 

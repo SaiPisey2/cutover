@@ -94,7 +94,11 @@ type Status struct {
 	ReplicateWorkflowID string            `json:"replicate_workflow_id,omitempty"`
 	Checks              []pg.TableCheck   `json:"checks,omitempty"`
 	Sequences           []pg.SequenceSync `json:"sequences,omitempty"`
-	Events              []Event           `json:"events"`
+	// ReplicationBroken is set when a switch abort could not stop the new
+	// link, so the old one was left stopped: replication runs in neither
+	// direction safely until an operator repairs it.
+	ReplicationBroken bool    `json:"replication_broken,omitempty"`
+	Events            []Event `json:"events"`
 }
 
 type Result struct {

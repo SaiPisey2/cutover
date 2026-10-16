@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -139,9 +140,12 @@ func newEnv() *testsuite.TestWorkflowEnvironment {
 }
 
 type switchResult struct {
-	OK      bool
-	Primary ops.Side
-	Events  []Event
+	OK        bool
+	Primary   ops.Side
+	Broken    bool // switchOver returned ErrReplicationBroken
+	StBroken  bool // Status.ReplicationBroken
+	Sequences []pg.SequenceSync
+	Events    []Event
 }
 
 // switchWorkflow exercises runner.switchOver alone.
@@ -156,5 +160,10 @@ func switchWorkflow(ctx workflowContext, p plan.Plan, back bool) (switchResult, 
 		r.st.Primary = ops.Target
 	}
 	ok, err := r.switchOver(from, to, old, next, []string{"public.orders"})
-	return switchResult{OK: ok, Primary: r.st.Primary, Events: r.st.Events}, err
+	res := switchResult{OK: ok, Primary: r.st.Primary, StBroken: r.st.ReplicationBroken,
+		Sequences: r.st.Sequences, Events: r.st.Events}
+	if errors.Is(err, ErrReplicationBroken) {
+		res.Broken, err = true, nil
+	}
+	return res, err
 }

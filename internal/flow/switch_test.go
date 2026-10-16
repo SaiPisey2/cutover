@@ -109,11 +109,13 @@ func TestSwitchCompensatesWhenReverseFails(t *testing.T) {
 func TestSwitchCompensationsAreBounded(t *testing.T) {
 	flaky := temporal.NewApplicationError("flaky", "test")
 	res, c := runSwitch(t, testPlan(), false, fails{"start:rev": boom, "stop:rev": flaky}, true)
-	// stop:rev is retryable but bounded to 3 attempts; then the switch
-	// gives up on it, still restores the forward link and resumes last.
+	// stop:rev is retryable but bounded to 3 attempts. Once it gives up the
+	// reverse link may still be live, so the forward link is NOT restarted
+	// (both live would loop on Postgres 12–15); writes still resume last.
 	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target",
-		"start:rev", "stop:rev", "stop:rev", "stop:rev", "start:fwd", "resume"})
-	if res.OK || res.Primary != ops.Source || !hasEvent(res.Events, "compensation-failed") {
+		"start:rev", "stop:rev", "stop:rev", "stop:rev", "resume"})
+	if res.OK || res.Primary != ops.Source || !hasEvent(res.Events, "compensation-failed") ||
+		!hasEvent(res.Events, "replication-broken") || !res.Broken || !res.StBroken {
 		t.Fatalf("%+v", res)
 	}
 }
@@ -267,4 +269,80 @@ func TestSwitchRepointBackAndResumeRetryUntilDone(t *testing.T) {
 	if res.OK || res.Primary != ops.Source {
 		t.Fatalf("%+v", res)
 	}
+}
+
+// Clean aborts are not errors and leave replication intact.
+func TestSwitchCleanAbortIsNotBroken(t *testing.T) {
+	res, _ := runSwitch(t, testPlan(), false, fails{"start:rev": boom}, true)
+	if res.OK || res.Broken || res.StBroken || hasEvent(res.Events, "replication-broken") {
+		t.Fatalf("%+v", res)
+	}
+}
+
+// After a successful repoint the switch has happened: a failing resume is
+// retried until it works, never compensated.
+func TestSwitchNeverAbortsAfterRepoint(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	env.OnActivity(a.ResumePool, mockAny, mockAny).Return(
+		func(context.Context, ops.PoolIn) error { c.add("resume"); return boom }).Times(2)
+	mockAll(env, c, nil, true)
+	env.ExecuteWorkflow(switchWorkflow, testPlan(), false)
+	var res switchResult
+	if err := env.GetWorkflowResult(&res); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target",
+		"start:rev", "repoint:target", "resume", "resume", "resume", "stop:fwd"})
+	if !res.OK || res.Primary != ops.Target || hasEvent(res.Events, "switch-aborted") {
+		t.Fatalf("%+v", res)
+	}
+}
+
+// The drain may not use the whole budget: the steps after it keep a reserve
+// of max(1s, max_pause/4).
+func TestSwitchDrainLeavesReserve(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	var got time.Duration
+	env.OnActivity(a.MeasureLag, mockAny, mockAny).Return(
+		func(_ context.Context, in ops.LagIn) (ops.LagOut, error) {
+			c.add("lag:" + short(in.Link))
+			got = in.Timeout
+			return ops.LagOut{Visible: true}, nil
+		}).Once()
+	mockAll(env, c, nil, true)
+	p := testPlan() // max_pause 10s: reserve 2.5s
+	env.ExecuteWorkflow(switchWorkflow, p, false)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	max := p.Thresholds.Switch.MaxPause.D()
+	if got <= 0 || got > max-max/4 {
+		t.Fatalf("drain timeout %s must leave a %s reserve of %s", got, max/4, max)
+	}
+}
+
+// An aborted switch must not report sequences as synced.
+func TestSwitchAbortClearsSequences(t *testing.T) {
+	res, _ := runSwitch(t, testPlan(), false, fails{"start:rev": boom}, true)
+	if len(res.Sequences) != 0 {
+		t.Fatalf("%+v", res.Sequences)
+	}
+	res, _ = runSwitch(t, testPlan(), false, nil, true)
+	if len(res.Sequences) != 1 {
+		t.Fatalf("a switch reports its sequences: %+v", res.Sequences)
+	}
+}
+
+func TestSwitchCompensatesWhenDropSubFails(t *testing.T) {
+	_, c := runSwitch(t, testPlan(), false, fails{"drop-sub:fwd": boom}, true)
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "start:fwd", "resume"})
+}
+
+func TestSwitchCompensatesWhenSequencesFail(t *testing.T) {
+	_, c := runSwitch(t, testPlan(), false, fails{"seq:source>target": boom}, true)
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target", "start:fwd", "resume"})
 }
