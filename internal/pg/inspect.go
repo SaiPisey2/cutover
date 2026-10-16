@@ -45,10 +45,16 @@ func (t Table) Replicable() bool {
 }
 
 type Sequence struct {
-	Schema    string `json:"schema"`
-	Name      string `json:"name"`
+	Schema string `json:"schema"`
+	Name   string `json:"name"`
+	// LastValue is the sequence's last_value, read from the sequence itself;
+	// nil when it has never handed out a value and will start at its start
+	// value (is_called false at the start value).
 	LastValue *int64 `json:"last_value"`
-	Increment int64  `json:"increment"`
+	// IsCalled false means the next nextval returns LastValue itself, as
+	// after setval(seq, n, false).
+	IsCalled  bool  `json:"is_called"`
+	Increment int64 `json:"increment"`
 }
 
 func (s Sequence) Qualified() string { return s.Schema + "." + s.Name }
@@ -200,25 +206,53 @@ func Tables(ctx context.Context, c *pgx.Conn, schemas []string) ([]Table, error)
 	return out, nil
 }
 
-// Sequences lists sequences in schemas. LastValue is nil until first use. It
-// fails, naming the sequence, when the connecting role lacks both USAGE and SELECT on
-// one, because Postgres would then report a nil LastValue indistinguishable
-// from an unused sequence.
+// Sequences lists sequences in schemas, reading last_value and is_called
+// from each sequence itself (pg_sequences shows NULL for an is_called=false
+// sequence, hiding a setval(seq, n, false)). The reads go in one batch. It
+// fails, naming the sequence, when the connecting role lacks SELECT on one.
 func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, error) {
 	var denied []string
 	err := c.QueryRow(ctx, `SELECT coalesce(array_agg(schemaname || '.' || sequencename ORDER BY schemaname, sequencename), '{}')
 		FROM pg_sequences WHERE schemaname = ANY($1) AND NOT (
-		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'USAGE,SELECT'))`, schemas).Scan(&denied)
+		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'SELECT'))`, schemas).Scan(&denied)
 	if err != nil {
 		return nil, fmt.Errorf("sequence privileges: %w", err)
 	}
 	if len(denied) > 0 {
-		return nil, fmt.Errorf("no USAGE or SELECT on sequence %s", strings.Join(denied, ", "))
+		return nil, fmt.Errorf("no SELECT on sequence %s (cutover reads each sequence to sync it at the switch)", strings.Join(denied, ", "))
 	}
-	rows, _ := c.Query(ctx, `SELECT schemaname::text, sequencename::text, last_value, increment_by
+	type row struct {
+		Schema, Name     string
+		Start, Increment int64
+	}
+	rows, _ := c.Query(ctx, `SELECT schemaname::text, sequencename::text, start_value, increment_by
 		FROM pg_sequences WHERE schemaname = ANY($1) ORDER BY 1, 2`, schemas)
-	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Sequence])
+	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
+		return nil, fmt.Errorf("sequences: %w", err)
+	}
+	out := make([]Sequence, 0, len(list))
+	if len(list) == 0 {
+		return out, nil
+	}
+	batch := &pgx.Batch{}
+	for _, r := range list {
+		batch.Queue("SELECT last_value, is_called FROM " + pgx.Identifier{r.Schema, r.Name}.Sanitize())
+	}
+	br := c.SendBatch(ctx, batch)
+	for _, r := range list {
+		s := Sequence{Schema: r.Schema, Name: r.Name, Increment: r.Increment}
+		var last int64
+		if err := br.QueryRow().Scan(&last, &s.IsCalled); err != nil {
+			br.Close()
+			return nil, fmt.Errorf("sequence %s: %w", s.Qualified(), err)
+		}
+		if s.IsCalled || last != r.Start {
+			s.LastValue = &last
+		}
+		out = append(out, s)
+	}
+	if err := br.Close(); err != nil {
 		return nil, fmt.Errorf("sequences: %w", err)
 	}
 	return out, nil

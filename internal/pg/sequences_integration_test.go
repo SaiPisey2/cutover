@@ -147,3 +147,36 @@ func TestSyncSequencesGuards(t *testing.T) {
 		t.Fatalf("overflow must error naming the sequence: %v", err)
 	}
 }
+
+// setval(seq, n, false) leaves is_called false: pg_sequences then shows a
+// NULL last_value, but the source's next value is n. The target must still
+// be moved past it, or its first insert collides.
+func TestSyncSequencesNotCalled(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	if _, err := src.Exec(ctx, "CREATE SEQUENCE public.s; SELECT setval('public.s', 500, false)"); err != nil {
+		t.Fatal(err)
+	}
+	// The target's own is_called=false value counts as one below it.
+	if _, err := tgt.Exec(ctx, "CREATE SEQUENCE public.s; SELECT setval('public.s', 500, false)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, margin := range []int64{0, 1000} {
+		got, err := pg.SyncSequences(ctx, src, tgt, []string{"public"}, margin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Source != 500 {
+			t.Fatalf("margin %d: %+v", margin, got)
+		}
+	}
+	var next int64
+	if err := tgt.QueryRow(ctx, "SELECT nextval('public.s')").Scan(&next); err != nil || next <= 1500 {
+		t.Fatalf("target next %d %v: must be past the source's 500 plus margin", next, err)
+	}
+	var srcNext int64
+	if err := src.QueryRow(ctx, "SELECT nextval('public.s')").Scan(&srcNext); err != nil || srcNext != 500 {
+		t.Fatalf("source must be untouched: %d %v", srcNext, err)
+	}
+}

@@ -52,10 +52,20 @@ func SyncSequences(ctx context.Context, from, to *pgx.Conn, schemas []string, ma
 		if *s.LastValue > math.MaxInt64-margin {
 			return nil, fmt.Errorf("sequence %s: last value %d plus margin %d overflows", s.Qualified(), *s.LastValue, margin)
 		}
+		// An is_called=false source hands out LastValue next, so it counts
+		// as used: the target is set past it either way.
 		want := *s.LastValue + margin
-		if d.LastValue != nil && *d.LastValue >= want {
-			out = append(out, SequenceSync{Name: s.Qualified(), Source: *s.LastValue, Set: *d.LastValue})
-			continue
+		// An is_called=false target hands out its LastValue next, so it has
+		// effectively used one increment less.
+		if d.LastValue != nil {
+			have := *d.LastValue
+			if !d.IsCalled {
+				have -= d.Increment
+			}
+			if have >= want {
+				out = append(out, SequenceSync{Name: s.Qualified(), Source: *s.LastValue, Set: have})
+				continue
+			}
 		}
 		batch.Queue("SELECT setval($1::regclass, $2, true)", pgx.Identifier{s.Schema, s.Name}.Sanitize(), want)
 		moved = append(moved, len(out))
