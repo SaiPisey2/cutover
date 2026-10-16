@@ -111,6 +111,9 @@ func Parse(data []byte) (Plan, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&p); err != nil {
+		if errors.Is(err, io.EOF) {
+			return Plan{}, errors.New("plan: plan file is empty")
+		}
 		return Plan{}, fmt.Errorf("plan: %w", err)
 	}
 	var extra yaml.Node
@@ -179,6 +182,8 @@ func (p Plan) Validate() error {
 			bad("%s.postgres.route: required", side)
 		case strings.Contains(strings.ToLower(pg.Route), "password"):
 			bad("%s.postgres.route: must not contain a password (PgBouncer authenticates on its own)", side)
+		case strings.Contains(pg.Route, "://"):
+			bad("%s.postgres.route: must be key=value pairs, not a URI", side)
 		case !strings.Contains(pg.Route, "host="):
 			bad("%s.postgres.route: must set host=", side)
 		}
@@ -187,14 +192,24 @@ func (p Plan) Validate() error {
 	if !Ident.MatchString(d.Name) {
 		bad("database.name: must match %s", Ident)
 	}
+	seen := map[string]bool{}
 	for _, s := range d.Schemas {
+		if seen[s] {
+			bad("database.schemas: duplicate entry %q", s)
+		}
+		seen[s] = true
 		if s == ReservedSchema {
 			bad("database.schemas: %s is reserved for cutover", s)
 		} else if !Ident.MatchString(s) {
 			bad("database.schemas: %q must match %s", s, Ident)
 		}
 	}
+	seenT := map[string]bool{}
 	for _, t := range d.Tables {
+		if seenT[t] {
+			bad("database.tables: duplicate entry %q", t)
+		}
+		seenT[t] = true
 		s, n, ok := strings.Cut(t, ".")
 		if !ok || !Ident.MatchString(s) || !Ident.MatchString(n) {
 			bad("database.tables: %q must be schema.table", t)

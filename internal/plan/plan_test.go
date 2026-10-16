@@ -72,6 +72,9 @@ func TestRejects(t *testing.T) {
 		{"bad duration", "thresholds:\n  switch: {max_pause: soon}\n", `invalid duration "soon"`},
 		{"pause too long", "thresholds:\n  switch: {max_pause: 10m}\n", "max_pause"},
 		{"stable shorter than lag", "thresholds:\n  replicate: {max_lag: 10s, stable_for: 5s}\n", "stable_for"},
+		{"duplicate schema", "database:\n  name: shop\n  schemas: [public, public]\n  pgbouncer: {admin_dsn: env:PGB, routes_file: /r.ini}\n", `duplicate entry "public"`},
+		{"duplicate table", "database:\n  name: shop\n  tables: [public.a, public.a]\n  pgbouncer: {admin_dsn: env:PGB, routes_file: /r.ini}\n", `duplicate entry "public.a"`},
+		{"uri route", "source:\n  postgres: {dsn: env:SRC, replication_dsn: env:SRC_REPL, route: \"postgres://u@h/shop host=a\"}\n", "not a URI"},
 		{"two documents", "---\nversion: 1\n", "one YAML document"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,6 +83,15 @@ func TestRejects(t *testing.T) {
 				t.Fatalf("got %v, want error containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestEmptyFile(t *testing.T) {
+	for _, in := range []string{"", "# only a comment\n"} {
+		_, err := Parse([]byte(in))
+		if err == nil || !strings.Contains(err.Error(), "plan file is empty") {
+			t.Errorf("%q: got %v", in, err)
+		}
 	}
 }
 

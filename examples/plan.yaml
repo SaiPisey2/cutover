@@ -17,13 +17,14 @@ target:
 
 database:
   name: shop            # the PgBouncer database name the apps connect to
-  schemas: [public]
+  schemas: [public]     # omitted means [public]
   # tables: [public.orders, public.items]   # default: every table in schemas
   pgbouncer:
     admin_dsn: env:CUTOVER_PGBOUNCER_ADMIN_DSN
     routes_file: /etc/pgbouncer/cutover-routes.ini   # %include'd by pgbouncer.ini; cutover owns it
     # addresses: [10.0.1.9/32]  # where the source sees PgBouncer connect from; others block readiness
 
+# Thresholds: 0 or omitted means the default (shown in each example below).
 thresholds:
   replicate: {max_lag: 1s, stable_for: 5m, sample_every: 10s}
   rehearse: {sample_rows: 1000}
