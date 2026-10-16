@@ -68,8 +68,23 @@ func (r *runner) pushUndo(run func() error) {
 
 // exec runs one activity with the default policy: five attempts, backing off to 30s.
 func (r *runner) exec(timeout time.Duration, fn, in, out any) error {
+	return r.execWith(timeout, 0, fn, in, out)
+}
+
+// heldHeartbeat is the heartbeat timeout of the steps that run while
+// PgBouncer holds writes; their activities heartbeat every 500ms, so a dead
+// worker is noticed in seconds rather than at StartToClose.
+const heldHeartbeat = 2 * time.Second
+
+// execHeld is exec for a step that runs while writes are held.
+func (r *runner) execHeld(timeout time.Duration, fn, in, out any) error {
+	return r.execWith(timeout, heldHeartbeat, fn, in, out)
+}
+
+func (r *runner) execWith(timeout, heartbeat time.Duration, fn, in, out any) error {
 	ctx := workflow.WithActivityOptions(r.ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: timeout,
+		HeartbeatTimeout:    heartbeat,
 		RetryPolicy: &temporal.RetryPolicy{InitialInterval: time.Second, BackoffCoefficient: 2,
 			MaximumInterval: 30 * time.Second, MaximumAttempts: 5},
 	})

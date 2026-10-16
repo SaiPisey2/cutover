@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -468,6 +469,45 @@ func TestSwitchFailedOldRestartIsBroken(t *testing.T) {
 		assertCalls(t, c.list(), want)
 		if res.OK || !res.Broken || !res.StBroken || !hasEvent(res.Events, "replication-broken") {
 			t.Fatalf("back=%v: %+v", back, res)
+		}
+	}
+}
+
+// The steps that run while writes are held (resume, repoint-back and the
+// replication compensations) must notice a dead worker within seconds, not
+// at StartToClose: each sets a 2s heartbeat timeout (their activities
+// heartbeat every 500ms).
+func TestHeldStepsHaveHeartbeatTimeout(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	var mu sync.Mutex
+	hb := map[string]time.Duration{}
+	record := func(ctx context.Context, label string) {
+		mu.Lock()
+		hb[label] = activity.GetInfo(ctx).HeartbeatTimeout
+		mu.Unlock()
+		c.add(label)
+	}
+	back := mock.MatchedBy(func(in ops.RepointIn) bool { return in.To == ops.Source })
+	env.OnActivity(a.Repoint, mockAny, back).Return(
+		func(ctx context.Context, _ ops.RepointIn) error { record(ctx, "repoint:source"); return nil }).Once()
+	env.OnActivity(a.ResumePool, mockAny, mockAny).Return(
+		func(ctx context.Context, _ ops.PoolIn) error { record(ctx, "resume"); return nil }).Once()
+	env.OnActivity(a.StopLink, mockAny, mockAny).Return(
+		func(ctx context.Context, in ops.LinkIn) error { record(ctx, "stop:"+short(in.Link)); return nil }).Once()
+	fwd := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Forward(mid) })
+	env.OnActivity(a.StartLink, mockAny, fwd).Return(
+		func(ctx context.Context, in ops.LinkIn) error { record(ctx, "start:fwd"); return nil }).Once()
+	mockAll(env, c, fails{"repoint:target": boom}, true)
+	env.ExecuteWorkflow(switchWorkflow, testPlan(), false)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, c.since("repoint:target"), []string{"repoint:target", "repoint:source", "stop:rev", "start:fwd", "resume"})
+	for _, l := range []string{"repoint:source", "stop:rev", "start:fwd", "resume"} {
+		if hb[l] != 2*time.Second {
+			t.Errorf("%s: heartbeat timeout %s, want 2s", l, hb[l])
 		}
 	}
 }

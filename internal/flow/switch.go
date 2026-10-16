@@ -95,11 +95,13 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 	oldIn := ops.LinkIn{Plan: p, Link: old, Tables: tables}
 	nextIn := ops.LinkIn{Plan: p, Link: next, Tables: tables}
 
-	// compensate runs one bounded compensation: StartToClose 15s, 3 attempts.
+	// compensate runs one bounded compensation: StartToClose 15s, heartbeat
+	// timeout 2s, 3 attempts.
 	compensate := func(fn, in any) func() error {
 		return func() error {
 			ctx := workflow.WithActivityOptions(r.ctx, workflow.ActivityOptions{
 				StartToCloseTimeout: 15 * time.Second,
+				HeartbeatTimeout:    heldHeartbeat,
 				RetryPolicy: &temporal.RetryPolicy{InitialInterval: time.Second, BackoffCoefficient: 2,
 					MaximumInterval: 2 * time.Second, MaximumAttempts: 3},
 			})
@@ -107,7 +109,7 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 		}
 	}
 	// Resume always runs last and retries without limit, like repoint-back.
-	resume := func() error { return r.exec(time.Minute, acts.ResumePool, pool, nil) }
+	resume := func() error { return r.execHeld(time.Minute, acts.ResumePool, pool, nil) }
 	const (
 		startOld = iota + 1
 		stopNext
@@ -235,7 +237,7 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 		return abort(err.Error())
 	}
 	undo = append(undo, comp{kind: repointBack, run: func() error {
-		return r.exec(time.Minute, acts.Repoint, ops.RepointIn{Plan: p, To: from}, nil)
+		return r.execHeld(time.Minute, acts.Repoint, ops.RepointIn{Plan: p, To: from}, nil)
 	}})
 	if err := call(deadline, "repoint", acts.Repoint, ops.RepointIn{Plan: p, To: to}, nil); err != nil {
 		return abort(err.Error())
