@@ -1,0 +1,8 @@
+docs/
+*.db
+/bin/
+ui/node_modules/
+*.kubeconfig
+kubeconfig*
+.env
+test/run/
