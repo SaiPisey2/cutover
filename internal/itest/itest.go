@@ -125,7 +125,7 @@ func Plan(t testing.TB) plan.Plan {
 }
 
 // Reset returns the harness to empty: no subscriptions, publications, slots,
-// user tables or sentinel on either side, and PgBouncer routed to the source
+// non-system schemas or sentinel on either side, and PgBouncer routed to the source
 // and not paused.
 func Reset(t testing.TB) {
 	t.Helper()
@@ -133,7 +133,7 @@ func Reset(t testing.TB) {
 	src, tgt := Conn(t, SourceDSN), Conn(t, TargetDSN)
 	for _, c := range []*pgx.Conn{src, tgt} {
 		mustExec(t, c, `DO $$ DECLARE s record; BEGIN
-			FOR s IN SELECT subname FROM pg_subscription LOOP
+			FOR s IN SELECT subname FROM pg_subscription WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()) LOOP
 				EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', s.subname);
 				EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', s.subname);
 				EXECUTE format('DROP SUBSCRIPTION %I', s.subname);
@@ -161,9 +161,20 @@ func Reset(t testing.TB) {
 			FOR p IN SELECT pubname FROM pg_publication LOOP
 				EXECUTE format('DROP PUBLICATION %I', p.pubname);
 			END LOOP; END $$`)
-		mustExec(t, c, "DROP SCHEMA IF EXISTS _cutover CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+		mustExec(t, c, "SET lock_timeout = '5s'")
+		mustExec(t, c, `DO $$ DECLARE n record; BEGIN
+			FOR n IN SELECT nspname FROM pg_namespace
+				WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema' LOOP
+				EXECUTE format('DROP SCHEMA %I CASCADE', n.nspname);
+			END LOOP;
+			CREATE SCHEMA public; END $$`)
 	}
-	if err := os.WriteFile(RoutesFile(t), []byte("[databases]\napp = "+SourceRoute+"\n"), 0o644); err != nil {
+	routes := RoutesFile(t)
+	tmp := routes + ".tmp"
+	if err := os.WriteFile(tmp, []byte("[databases]\napp = "+SourceRoute+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, routes); err != nil {
 		t.Fatal(err)
 	}
 	admin, err := pgconn.Connect(ctx, AdminDSN)
@@ -171,9 +182,9 @@ func Reset(t testing.TB) {
 		t.Fatalf("pgbouncer admin: %v (run: make itest-up)", err)
 	}
 	defer admin.Close(ctx)
-	for _, cmd := range []string{"RELOAD", "RESUME app", "RECONNECT app"} {
+	for _, cmd := range []string{"ENABLE app", "RELOAD", "RESUME app", "RECONNECT app"} {
 		_, err := admin.Exec(ctx, cmd).ReadAll()
-		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "not paused") {
+		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "not paused") && !strings.Contains(strings.ToLower(err.Error()), "not disabled") {
 			t.Fatalf("pgbouncer %s: %v", cmd, err)
 		}
 	}
