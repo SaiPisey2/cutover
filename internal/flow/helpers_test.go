@@ -3,8 +3,10 @@ package flow
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/stretchr/testify/mock"
@@ -135,6 +137,8 @@ func newEnv() *testsuite.TestWorkflowEnvironment {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
 	env.RegisterActivity(ops.New())
+	env.RegisterWorkflow(Migration)
+	env.RegisterWorkflow(ReplicateWait)
 	env.RegisterWorkflow(switchWorkflow)
 	return env
 }
@@ -166,4 +170,87 @@ func switchWorkflow(ctx workflowContext, p plan.Plan, back bool) (switchResult, 
 		res.Broken, err = true, nil
 	}
 	return res, err
+}
+
+// action fires when its condition holds on the queried status, once.
+type action struct {
+	when func(Status) bool
+	do   func(env *testsuite.TestWorkflowEnvironment)
+}
+
+func atGate(gate, who string, d Decision) action {
+	return action{
+		when: func(s Status) bool {
+			return s.Gate != nil && s.Gate.Name == gate && !slices.Contains(s.Gate.Approvals, who)
+		},
+		do: func(env *testsuite.TestWorkflowEnvironment) {
+			env.SignalWorkflow(SignalGate, GateSignal{Gate: gate, Decision: d, ApproverID: who})
+		},
+	}
+}
+
+func approve(gate, who string) action { return atGate(gate, who, Approve) }
+
+// happy is the full approval sequence.
+func happy() []action {
+	return []action{approve("discover", "alice"), approve("prepare", "alice"), approve("rehearse", "alice"),
+		approve("switch", "alice"), approve("switch", "bob"), approve("finish", "alice")}
+}
+
+// maxTicks bounds drive: about a week of workflow time. An action that never
+// fires then fails the test at once instead of ticking forever.
+const maxTicks = 20000
+
+// drive checks the workflow's status every 30s of workflow time and fires
+// actions in order.
+func drive(t *testing.T, env *testsuite.TestWorkflowEnvironment, actions []action) {
+	i, ticks := 0, 0
+	var tick func()
+	tick = func() {
+		if i >= len(actions) {
+			return
+		}
+		if ticks++; ticks > maxTicks {
+			t.Errorf("drive: action %d never fired", i)
+			env.CancelWorkflow()
+			return
+		}
+		v, err := env.QueryWorkflow(QueryStatus)
+		if err == nil {
+			var st Status
+			if err := v.Get(&st); err != nil {
+				t.Errorf("status: %v", err)
+				return
+			}
+			if actions[i].when(st) {
+				actions[i].do(env)
+				i++
+			}
+		}
+		env.RegisterDelayedCallback(tick, 30*time.Second)
+	}
+	env.RegisterDelayedCallback(tick, time.Second)
+}
+
+func result(t *testing.T, env *testsuite.TestWorkflowEnvironment) Result {
+	t.Helper()
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	var r Result
+	if err := env.GetWorkflowResult(&r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func kinds(evs []Event) []string {
+	out := make([]string, len(evs))
+	for i, e := range evs {
+		out[i] = e.Kind
+	}
+	return out
 }

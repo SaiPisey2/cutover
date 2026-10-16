@@ -113,6 +113,9 @@ func (r *runner) pollRollback() error {
 // while no gate was open are discarded first: an approval only counts for
 // a gate the approver could see.
 func (r *runner) gate(name, summary string, needs int) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
 	for {
 		var s GateSignal
 		if !r.gateCh.ReceiveAsync(&s) {
@@ -132,6 +135,7 @@ func (r *runner) gate(name, summary string, needs int) error {
 		var sig GateSignal
 		var rb *RollbackSignal
 		sel := workflow.NewSelector(r.ctx)
+		sel.AddReceive(r.ctx.Done(), func(workflow.ReceiveChannel, bool) {})
 		sel.AddReceive(r.gateCh, func(c workflow.ReceiveChannel, _ bool) { c.Receive(r.ctx, &sig) })
 		sel.AddReceive(r.rbCh, func(c workflow.ReceiveChannel, _ bool) {
 			var s RollbackSignal
@@ -139,6 +143,9 @@ func (r *runner) gate(name, summary string, needs int) error {
 			rb = &s
 		})
 		sel.Select(r.ctx)
+		if err := r.ctx.Err(); err != nil {
+			return err // cancelled while waiting
+		}
 		if rb != nil {
 			if err := r.takeRollback(*rb); err != nil {
 				return err
@@ -179,7 +186,8 @@ func (r *runner) step(name string, fn func() error) error {
 			return err
 		}
 		err := fn()
-		if err == nil || errors.Is(err, errRollback) {
+		// A cancelled workflow is not a failed step: no retry gate opens.
+		if err == nil || errors.Is(err, errRollback) || r.ctx.Err() != nil {
 			return err
 		}
 		msg := message(err)
