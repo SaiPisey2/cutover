@@ -1,0 +1,26 @@
+name: cutover-it
+services:
+  pg-source:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10",
+              "-c", "max_wal_senders=10", "-c", "cluster_name=source"]
+    environment: {POSTGRES_DB: app, POSTGRES_HOST_AUTH_METHOD: trust}
+    ports: ["127.0.0.1:55432:5432"]
+    healthcheck: {test: ["CMD", "pg_isready", "-U", "postgres", "-d", "app"], interval: 1s, timeout: 3s, retries: 30}
+  pg-target:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10",
+              "-c", "max_wal_senders=10", "-c", "cluster_name=target"]
+    environment: {POSTGRES_DB: app, POSTGRES_HOST_AUTH_METHOD: trust}
+    ports: ["127.0.0.1:55433:5432"]
+    healthcheck: {test: ["CMD", "pg_isready", "-U", "postgres", "-d", "app"], interval: 1s, timeout: 3s, retries: 30}
+  pgbouncer:
+    build: ./pgbouncer
+    depends_on:
+      pg-source: {condition: service_healthy}
+      pg-target: {condition: service_healthy}
+    ports: ["127.0.0.1:56432:6432"]
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./run/pgbouncer:/etc/pgbouncer/routes
