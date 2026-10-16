@@ -138,7 +138,7 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 			return err
 		}
 		defer c.Close()
-		w := worker.New(c, flow.TaskQueue, worker.Options{})
+		w := worker.New(c, flow.TaskQueue, flow.WorkerOptions())
 		flow.Register(w)
 		return w.Run(worker.InterruptCh())
 

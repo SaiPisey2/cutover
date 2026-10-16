@@ -3,18 +3,21 @@
 package flow_test
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
@@ -38,10 +41,22 @@ import (
 // that is not enforced.
 const holdMargin = 2 * time.Second
 
+// quiet keeps the SDK's client log at warnings and above.
+func quiet() sdklog.Logger {
+	return sdklog.NewStructuredLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+}
+
+// workerOptions are the product's worker options, named for the test.
+func workerOptions(identity string) worker.Options {
+	o := flow.WorkerOptions()
+	o.Identity = identity
+	return o
+}
+
 // devServer starts a real Temporal dev server (in memory, headless) on a
 // free 127.0.0.1 port, using the installed temporal CLI so nothing is
-// downloaded.
-func devServer(t *testing.T) client.Client {
+// downloaded. It returns a client and the server's host:port.
+func devServer(t *testing.T) (client.Client, string) {
 	t.Helper()
 	bin, err := exec.LookPath("temporal")
 	if err != nil {
@@ -58,12 +73,66 @@ func devServer(t *testing.T) client.Client {
 	l.Close()
 	srv, err := testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{ExistingPath: bin, LogLevel: "error",
 		ClientOptions: &client.Options{HostPort: hostPort, Namespace: "default",
-			Logger: sdklog.NewStructuredLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))}})
+			Logger: quiet()}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
-	return srv.Client()
+	return srv.Client(), hostPort
+}
+
+// attempt is one activity attempt the history records as started: the last
+// attempt of each activity, with the failure of the attempt before it.
+type attempt struct {
+	Type, Identity string
+	Attempt        int32
+	LastTimeout    enumspb.TimeoutType // of the previous attempt, if it timed out
+	LastFailure    string
+}
+
+func (a attempt) String() string {
+	s := fmt.Sprintf("%s@%s#%d", a.Type, a.Identity, a.Attempt)
+	if a.LastFailure != "" {
+		s += " (previous: " + a.LastFailure
+		if a.LastTimeout != enumspb.TIMEOUT_TYPE_UNSPECIFIED {
+			s += ", " + a.LastTimeout.String()
+		}
+		s += ")"
+	}
+	return s
+}
+
+// afterPause reads the workflow's history and returns the PausePool
+// attempt and every activity attempt started after it, in order.
+func afterPause(t *testing.T, c client.Client, id, runID string) (attempt, []attempt) {
+	t.Helper()
+	types := map[int64]string{} // scheduled event ID → activity type
+	var all []attempt
+	it := c.GetWorkflowHistory(context.Background(), id, runID, false, 0)
+	for it.HasNext() {
+		e, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a := e.GetActivityTaskScheduledEventAttributes(); a != nil {
+			types[e.GetEventId()] = a.GetActivityType().GetName()
+		}
+		if a := e.GetActivityTaskStartedEventAttributes(); a != nil {
+			at := attempt{Type: types[a.GetScheduledEventId()], Identity: a.GetIdentity(), Attempt: a.GetAttempt()}
+			if f := a.GetLastFailure(); f != nil {
+				at.LastFailure = f.GetMessage()
+				if ti := f.GetTimeoutFailureInfo(); ti != nil {
+					at.LastTimeout = ti.GetTimeoutType()
+				}
+			}
+			all = append(all, at)
+		}
+	}
+	i := slices.IndexFunc(all, func(a attempt) bool { return a.Type == "PausePool" })
+	if i < 0 {
+		t.Fatalf("no PausePool in the history: %v", all)
+	}
+	return all[i], all[i+1:]
 }
 
 // waitFor polls the workflow's status until ok holds, or fails the test.
@@ -180,10 +249,10 @@ func TestWorkerCrashDuringSwitch(t *testing.T) {
 	itest.Reset(t)
 	itest.Seed(t, itest.Conn(t, itest.SourceDSN))
 	ctx := context.Background()
-	c := devServer(t)
+	c, _ := devServer(t)
 
 	crash := &crashing{Activities: ops.New(), hit: make(chan struct{}, 1)}
-	w1 := worker.New(c, flow.TaskQueue, worker.Options{Identity: "w1"})
+	w1 := worker.New(c, flow.TaskQueue, workerOptions("w1"))
 	flow.RegisterWorkflows(w1)
 	w1.RegisterActivity(crash)
 	if err := w1.Start(); err != nil {
@@ -216,7 +285,7 @@ func TestWorkerCrashDuringSwitch(t *testing.T) {
 	crashed := time.Now()
 	w1.Stop() // the worker dies with PgBouncer paused
 	stopped = true
-	w2 := worker.New(c, flow.TaskQueue, worker.Options{Identity: "w2"})
+	w2 := worker.New(c, flow.TaskQueue, workerOptions("w2"))
 	flow.Register(w2)
 	if err := w2.Start(); err != nil {
 		t.Fatal(err)
@@ -250,31 +319,15 @@ func TestWorkerCrashDuringSwitch(t *testing.T) {
 	// The history shows who did what: w1 paused, the drain that w1 was
 	// running when it died was retried and completed by w2, and w2 did
 	// the repoint.
-	started := map[int64]string{} // scheduled event ID → activity type
-	var doneBy []string           // "type@identity#attempt", in history order
-	it := c.GetWorkflowHistory(ctx, id, run.GetRunID(), false, 0)
-	for it.HasNext() {
-		e, err := it.Next()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if a := e.GetActivityTaskScheduledEventAttributes(); a != nil {
-			started[e.GetEventId()] = a.GetActivityType().GetName()
-		}
-		if a := e.GetActivityTaskStartedEventAttributes(); a != nil {
-			doneBy = append(doneBy, started[a.GetScheduledEventId()]+"@"+a.GetIdentity()+"#"+strconv.Itoa(int(a.GetAttempt())))
-		}
+	pause, after := afterPause(t, c, id, run.GetRunID())
+	if pause.Identity != "w1" {
+		t.Fatalf("pause not run by w1: %v", pause)
 	}
-	pause := slices.IndexFunc(doneBy, func(s string) bool { return strings.HasPrefix(s, "PausePool@") })
-	if pause < 0 || !strings.HasPrefix(doneBy[pause], "PausePool@w1#") {
-		t.Fatalf("pause not run by w1: %v", doneBy)
-	}
-	after := doneBy[pause+1:]
-	t.Logf("activities from the pause on (type@worker#attempt): %v", after)
-	if len(after) == 0 || !strings.HasPrefix(after[0], "MeasureLag@w2#") || after[0] == "MeasureLag@w2#1" {
+	t.Logf("activities from the pause on: %v", after)
+	if len(after) == 0 || after[0].Type != "MeasureLag" || after[0].Identity != "w2" || after[0].Attempt < 2 {
 		t.Errorf("the drain after the pause should be a retry run by w2, got %v", after)
 	}
-	if !slices.ContainsFunc(after, func(s string) bool { return strings.HasPrefix(s, "Repoint@w2#") }) {
+	if !slices.ContainsFunc(after, func(a attempt) bool { return a.Type == "Repoint" && a.Identity == "w2" }) {
 		t.Errorf("w2 did not repoint: %v", after)
 	}
 
@@ -331,11 +384,11 @@ func TestPauseBudgetOnRealClock(t *testing.T) {
 	src := itest.Conn(t, itest.SourceDSN)
 	itest.Seed(t, src)
 	ctx := context.Background()
-	c := devServer(t)
+	c, _ := devServer(t)
 
 	maxPause := 2 * time.Second
 	slow := &slowSequences{Activities: ops.New(), hang: 3 * maxPause, returned: make(chan struct{})}
-	w := worker.New(c, flow.TaskQueue, worker.Options{Identity: "w"})
+	w := worker.New(c, flow.TaskQueue, workerOptions("w"))
 	flow.RegisterWorkflows(w)
 	w.RegisterActivity(slow)
 	if err := w.Start(); err != nil {
@@ -362,8 +415,8 @@ func TestPauseBudgetOnRealClock(t *testing.T) {
 	logEvents(t, st.Events)
 	started, _ := event(st.Events, "switch-started")
 	aborted, _ := event(st.Events, "switch-aborted")
-	if !strings.HasPrefix(aborted.Message, "sequences:") {
-		t.Errorf("abort reason %q, want the sequences step", aborted.Message)
+	if !strings.HasPrefix(aborted.Message, "sequences:") || !strings.Contains(aborted.Message, "ScheduleToClose") {
+		t.Errorf("abort reason %q, want the sequences step timed out by the budget (ScheduleToClose)", aborted.Message)
 	}
 	// Event times are the server's workflow clock: the abort comes at the
 	// budget, not when the stuck step gives up (3 × max_pause).
@@ -419,6 +472,191 @@ func TestPauseBudgetOnRealClock(t *testing.T) {
 		t.Errorf("writes by origin %v: want all on the source", o)
 	}
 	poolOn(t, "source")
+	if bound := maxPause + holdMargin; lr.Slowest() >= bound {
+		t.Errorf("slowest statement %s, want under max_pause %s + %s", lr.Slowest(), maxPause, holdMargin)
+	}
+}
+
+// crashToken is what the child worker prints when it is hung in the drain.
+const crashToken = "CUTOVER-CRASH-HIT"
+
+// hung is the real activities, except that the drain after the pause
+// prints crashToken and hangs WITHOUT heartbeating: the process is about
+// to be killed, and only the heartbeat timeout can free the attempt.
+type hung struct {
+	*ops.Activities
+	paused atomic.Bool
+}
+
+func (h *hung) PausePool(ctx context.Context, in ops.PoolIn) error {
+	err := h.Activities.PausePool(ctx, in)
+	if err == nil {
+		h.paused.Store(true)
+	}
+	return err
+}
+
+func (h *hung) MeasureLag(ctx context.Context, in ops.LagIn) (ops.LagOut, error) {
+	if h.paused.Load() {
+		fmt.Println(crashToken)
+		<-ctx.Done()
+		return ops.LagOut{}, ctx.Err()
+	}
+	return h.Activities.MeasureLag(ctx, in)
+}
+
+// TestCrashWorkerChild is the worker TestWorkerKilledDuringSwitch runs in a
+// child process and kills. It does nothing unless CUTOVER_CRASH_WORKER
+// names the dev server.
+func TestCrashWorkerChild(t *testing.T) {
+	hostPort := os.Getenv("CUTOVER_CRASH_WORKER")
+	if hostPort == "" {
+		t.Skip("helper process for TestWorkerKilledDuringSwitch")
+	}
+	c, err := client.Dial(client.Options{HostPort: hostPort, Namespace: "default", Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := worker.New(c, flow.TaskQueue, workerOptions("w1"))
+	flow.RegisterWorkflows(w)
+	w.RegisterActivity(&hung{Activities: ops.New()})
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	// Until the parent kills this process; the cap only matters if the
+	// parent died first.
+	time.Sleep(5 * time.Minute)
+}
+
+// watchFor is the child's stdout: it echoes the child's output and closes
+// hit once the token has been written.
+type watchFor struct {
+	token []byte
+	hit   chan struct{}
+	once  sync.Once
+	buf   []byte
+}
+
+func (w *watchFor) Write(p []byte) (int, error) {
+	os.Stdout.Write(p)
+	w.buf = append(w.buf, p...)
+	if bytes.Contains(w.buf, w.token) {
+		w.once.Do(func() { close(w.hit) })
+	}
+	if len(w.buf) > 4096 {
+		w.buf = w.buf[len(w.buf)-len(w.token):]
+	}
+	return len(p), nil
+}
+
+// TestWorkerKilledDuringSwitch kills the worker process (SIGKILL) while it
+// is draining with the pool paused, under the default max_pause. The dead
+// worker reports nothing: the drain attempt ends only by its heartbeat
+// timeout, and the workflow's sticky queue on the dead worker has to time
+// out before another worker gets the next workflow task. A second worker
+// must still finish the switch inside the budget.
+func TestWorkerKilledDuringSwitch(t *testing.T) {
+	itest.Reset(t)
+	itest.Seed(t, itest.Conn(t, itest.SourceDSN))
+	ctx := context.Background()
+	c, hostPort := devServer(t)
+
+	p := itest.Plan(t) // sets the DSN variables the child inherits
+	maxPause := p.Thresholds.Switch.MaxPause.D()
+	if maxPause != 10*time.Second {
+		t.Fatalf("max_pause %s, want the 10s default", maxPause)
+	}
+
+	out := &watchFor{token: []byte(crashToken + "\n"), hit: make(chan struct{})}
+	child := exec.Command(os.Args[0], "-test.run=^TestCrashWorkerChild$", "-test.v")
+	child.Env = append(os.Environ(), "CUTOVER_CRASH_WORKER="+hostPort)
+	child.Stdout, child.Stderr = out, os.Stderr
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var reap sync.Once
+	kill := func() {
+		reap.Do(func() {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		})
+	}
+	t.Cleanup(kill)
+
+	id := flow.WorkflowID("killed")
+	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: flow.TaskQueue},
+		flow.Migration, flow.Input{MigrationID: "killed", Plan: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	load := itest.StartLoad(t, 4)
+	toSwitch(t, c, id)
+
+	select {
+	case <-out.hit:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the child worker never reached the drain")
+	}
+	killed := time.Now()
+	kill() // SIGKILL: no failure is reported, no clean shutdown
+	if st := child.ProcessState; st == nil || st.Success() {
+		t.Fatalf("child worker not killed: %v", st)
+	}
+	w2 := worker.New(c, flow.TaskQueue, workerOptions("w2"))
+	flow.Register(w2)
+	if err := w2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Stop()
+	t.Logf("child killed (%s) and w2 started in %s", child.ProcessState, time.Since(killed).Round(time.Millisecond))
+
+	decide(t, c, id, "finish", "alice", flow.Approve)
+	wctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	var res flow.Result
+	if err := run.Get(wctx, &res); err != nil {
+		t.Fatal(err)
+	}
+	lr := load.Stop()
+	logEvents(t, res.Events)
+	if res.State != flow.StateFinished {
+		t.Fatalf("state %s: %+v", res.State, res.Events)
+	}
+	sw, ok := event(res.Events, "switched")
+	if !ok {
+		t.Fatal("w2 must complete the switch, not abort it")
+	}
+	if _, ok := event(res.Events, "switch-aborted"); ok {
+		t.Error("the switch aborted before it completed")
+	}
+	st, _ := event(res.Events, "switch-started")
+	took := sw.At.Sub(st.At)
+	t.Logf("switch-started to switched (server clock): %s, max_pause %s; %s", took.Round(time.Millisecond), maxPause, sw.Message)
+	if took >= maxPause {
+		t.Errorf("switch took %s on the server clock, want under max_pause %s", took, maxPause)
+	}
+
+	pause, after := afterPause(t, c, id, run.GetRunID())
+	if pause.Identity != "w1" {
+		t.Fatalf("pause not run by the child worker w1: %v", pause)
+	}
+	t.Logf("activities from the pause on: %v", after)
+	if len(after) == 0 || after[0].Type != "MeasureLag" || after[0].Identity != "w2" || after[0].Attempt < 2 ||
+		after[0].LastTimeout != enumspb.TIMEOUT_TYPE_HEARTBEAT {
+		t.Errorf("the drain after the pause should be retried by w2 after the dead attempt's heartbeat timeout, got %v", after)
+	}
+	if !slices.ContainsFunc(after, func(a attempt) bool { return a.Type == "Repoint" && a.Identity == "w2" }) {
+		t.Errorf("w2 did not repoint: %v", after)
+	}
+
+	tgt := itest.Conn(t, itest.TargetDSN)
+	itest.Verify(t, tgt, lr)
+	if o := itest.Origins(t, tgt); o["source"] == 0 || o["target"] == 0 {
+		t.Errorf("writes by origin %v: want some on each side", o)
+	}
+	poolOn(t, "target")
 	if bound := maxPause + holdMargin; lr.Slowest() >= bound {
 		t.Errorf("slowest statement %s, want under max_pause %s + %s", lr.Slowest(), maxPause, holdMargin)
 	}
