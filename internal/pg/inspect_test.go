@@ -1,6 +1,9 @@
 package pg
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestReplicable(t *testing.T) {
 	for _, tc := range []struct {
@@ -13,6 +16,8 @@ func TestReplicable(t *testing.T) {
 		{Table{ReplIdent: "i"}, true},
 		{Table{ReplIdent: "n", PKCols: []string{"id"}}, false},
 		{Table{ReplIdent: "d", PKCols: []string{"id"}, Partitioned: true}, false},
+		{Table{ReplIdent: "d", PKCols: []string{"id"}, Unlogged: true}, false},
+		{Table{ReplIdent: "f", Unlogged: true}, false},
 	} {
 		if got := tc.t.Replicable(); got != tc.want {
 			t.Errorf("%+v: got %v", tc.t, got)
@@ -27,5 +32,13 @@ func TestNames(t *testing.T) {
 	}
 	if (Facts{VersionNum: 170004}).Major() != 17 {
 		t.Fatal("major")
+	}
+}
+
+func TestInspectNeedsSchemas(t *testing.T) {
+	for _, s := range [][]string{nil, {}} {
+		if _, err := Inspect(context.Background(), nil, s); err == nil {
+			t.Fatalf("schemas %v: want error", s)
+		}
 	}
 }

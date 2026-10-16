@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -20,15 +21,18 @@ type Table struct {
 	Partitioned bool     `json:"partitioned"`
 	ReplIdent   string   `json:"repl_ident"` // d default, f full, i index, n nothing
 	PKCols      []string `json:"pk_cols"`
+	// Unlogged tables are not written to WAL, so logical replication skips them.
+	Unlogged bool `json:"unlogged"`
 }
 
 func (t Table) Qualified() string { return t.Schema + "." + t.Name }
 func (t Table) Ident() string     { return pgx.Identifier{t.Schema, t.Name}.Sanitize() }
 
 // Replicable reports whether logical replication can carry updates and
-// deletes for t. Release 1 does not replicate partitioned tables.
+// deletes for t. Release 1 does not replicate partitioned tables, and
+// unlogged tables never reach the WAL.
 func (t Table) Replicable() bool {
-	if t.Partitioned {
+	if t.Partitioned || t.Unlogged {
 		return false
 	}
 	switch t.ReplIdent {
@@ -82,9 +86,15 @@ type Facts struct {
 
 func (f Facts) Major() int { return f.VersionNum / 10000 }
 
-// Inspect gathers the facts readiness needs. It only reads.
+// Inspect gathers the facts readiness needs. It only reads. schemas must not
+// be empty. Replication is true for a superuser, a REPLICATION role or a member
+// of rds_replication / rds_superuser. Inspect fails, naming the sequence, when
+// the connecting role cannot read a sequence in schemas.
 func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) {
 	var f Facts
+	if len(schemas) == 0 {
+		return f, fmt.Errorf("inspect: no schemas given")
+	}
 	var vs, slots string
 	if err := c.QueryRow(ctx, `SELECT current_setting('server_version_num'), current_setting('wal_level'),
 		current_setting('max_replication_slots'), pg_database_size(current_database())`).
@@ -101,15 +111,25 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 	if err := c.QueryRow(ctx, "SELECT count(*) FROM pg_replication_slots").Scan(&f.UsedSlots); err != nil {
 		return f, fmt.Errorf("slots: %w", err)
 	}
-	if err := c.QueryRow(ctx, "SELECT rolsuper, rolreplication FROM pg_roles WHERE rolname = current_user").
-		Scan(&f.Superuser, &f.Replication); err != nil {
+	var user string
+	if err := c.QueryRow(ctx, "SELECT current_user::text, rolsuper FROM pg_roles WHERE rolname = current_user").
+		Scan(&user, &f.Superuser); err != nil {
 		return f, fmt.Errorf("role: %w", err)
 	}
+	if f.Replication, err = CanReplicate(ctx, c, user); err != nil {
+		return f, err
+	}
 	f.CreateSubscription = f.Superuser
-	if !f.Superuser && f.VersionNum >= 160000 {
-		if err := c.QueryRow(ctx, "SELECT pg_has_role(current_user, 'pg_create_subscription', 'MEMBER')").
+	if !f.Superuser {
+		// pg_create_subscription exists from 16; before that, managed services
+		// grant the right through rds_superuser.
+		role := "rds_superuser"
+		if f.VersionNum >= 160000 {
+			role = "pg_create_subscription"
+		}
+		if err := c.QueryRow(ctx, "SELECT "+memberOf("$1", role), user).
 			Scan(&f.CreateSubscription); err != nil {
-			return f, fmt.Errorf("pg_create_subscription: %w", err)
+			return f, fmt.Errorf("%s: %w", role, err)
 		}
 	}
 	rows, _ := c.Query(ctx, "SELECT extname::text, extversion FROM pg_extension ORDER BY 1")
@@ -136,11 +156,24 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 	return f, nil
 }
 
-// CanReplicate reports whether role exists and is a superuser or has
-// REPLICATION. A missing role is false, not an error.
+// memberOf is a SQL expression, true when the role in param is a member of
+// the named role. The CASE keeps pg_has_role, which errors on unknown role
+// names, from running when the named role does not exist.
+func memberOf(param, role string) string {
+	return fmt.Sprintf(`CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '%[2]s')
+		THEN pg_has_role(%[1]s::name, '%[2]s', 'MEMBER') ELSE false END`, param, role)
+}
+
+// CanReplicate reports whether role exists and is a superuser, has
+// REPLICATION, or is a member of rds_replication or rds_superuser (managed
+// services such as RDS cannot grant REPLICATION). A missing role is false, not
+// an error.
 func CanReplicate(ctx context.Context, c *pgx.Conn, role string) (bool, error) {
 	var ok bool
-	if err := c.QueryRow(ctx, `SELECT coalesce((SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = $1), false)`, role).
+	if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AND (
+		(SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = $1)
+		OR `+memberOf("$1", "rds_replication")+`
+		OR `+memberOf("$1", "rds_superuser")+`)`, role).
 		Scan(&ok); err != nil {
 		return false, fmt.Errorf("role %s: %w", role, err)
 	}
@@ -154,7 +187,8 @@ func Tables(ctx context.Context, c *pgx.Conn, schemas []string) ([]Table, error)
 		SELECT n.nspname::text, c.relname::text, c.relkind = 'p', c.relreplident::text,
 		       coalesce((SELECT array_agg(a.attname::text ORDER BY array_position(i.indkey::int2[], a.attnum))
 		                 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-		                 WHERE i.indrelid = c.oid AND i.indisprimary), '{}')
+		                 WHERE i.indrelid = c.oid AND i.indisprimary), '{}'),
+			       c.relpersistence = 'u'
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition AND n.nspname = ANY($1)
 		ORDER BY 1, 2`, schemas)
@@ -165,8 +199,22 @@ func Tables(ctx context.Context, c *pgx.Conn, schemas []string) ([]Table, error)
 	return out, nil
 }
 
-// Sequences lists sequences in schemas. LastValue is nil until first use.
+// Sequences lists sequences in schemas. LastValue is nil until first use. It
+// fails, naming the sequence, when the connecting role lacks USAGE or SELECT on
+// one, because Postgres would then report a nil LastValue indistinguishable
+// from an unused sequence.
 func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, error) {
+	var denied []string
+	err := c.QueryRow(ctx, `SELECT coalesce(array_agg(schemaname || '.' || sequencename ORDER BY schemaname, sequencename), '{}')
+		FROM pg_sequences WHERE schemaname = ANY($1) AND NOT (
+		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'USAGE') AND
+		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'SELECT'))`, schemas).Scan(&denied)
+	if err != nil {
+		return nil, fmt.Errorf("sequence privileges: %w", err)
+	}
+	if len(denied) > 0 {
+		return nil, fmt.Errorf("no USAGE and SELECT on sequence %s", strings.Join(denied, ", "))
+	}
 	rows, _ := c.Query(ctx, `SELECT schemaname::text, sequencename::text, last_value, increment_by
 		FROM pg_sequences WHERE schemaname = ANY($1) ORDER BY 1, 2`, schemas)
 	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Sequence])
