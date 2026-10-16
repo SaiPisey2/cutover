@@ -97,8 +97,11 @@ type Status struct {
 	// ReplicationBroken is set when a switch abort could not stop the new
 	// link, so the old one was left stopped: replication runs in neither
 	// direction safely until an operator repairs it.
-	ReplicationBroken bool    `json:"replication_broken,omitempty"`
-	Events            []Event `json:"events"`
+	ReplicationBroken bool `json:"replication_broken,omitempty"`
+	// PendingUndo lists, in the order they would run, the undo phases a
+	// stopped unwind left undone.
+	PendingUndo []string `json:"pending_undo,omitempty"`
+	Events      []Event  `json:"events"`
 }
 
 type Result struct {

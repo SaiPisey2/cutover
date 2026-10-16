@@ -192,7 +192,13 @@ func (r *runner) step(name string, fn func() error) error {
 		}
 		msg := message(err)
 		r.event("step-failed", "", name+": "+msg)
-		if err := r.gate("retry-"+name, "Step "+name+" failed: "+msg+". Approve to retry, or roll back.", 1); err != nil {
+		// Once rollback is closed (past Finish, or already rolling back),
+		// the gate offers only a retry.
+		next := "Approve to retry, or roll back."
+		if r.closed != "" {
+			next = "Approve to retry."
+		}
+		if err := r.gate("retry-"+name, "Step "+name+" failed: "+msg+". "+next, 1); err != nil {
 			return err
 		}
 	}

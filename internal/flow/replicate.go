@@ -20,6 +20,7 @@ type ReplicateIn struct {
 	Tables      []string   `json:"tables"`
 	CopyDone    bool       `json:"copy_done"`
 	StableSince *time.Time `json:"stable_since,omitempty"`
+	Samples     int        `json:"samples"`
 }
 
 type ReplicateStatus struct {
@@ -37,7 +38,7 @@ func lagTimeout(th plan.Replicate) time.Duration { return max(5*time.Second, 5*t
 // under max_lag for stable_for without a break. Any slow or unseen sample
 // restarts the window.
 func ReplicateWait(ctx workflow.Context, in ReplicateIn) (ReplicateStatus, error) {
-	st := ReplicateStatus{CopyDone: in.CopyDone, StableSince: in.StableSince}
+	st := ReplicateStatus{CopyDone: in.CopyDone, StableSince: in.StableSince, Samples: in.Samples}
 	if err := workflow.SetQueryHandler(ctx, QueryStatus, func() (ReplicateStatus, error) { return st, nil }); err != nil {
 		return st, err
 	}
@@ -51,7 +52,7 @@ func ReplicateWait(ctx workflow.Context, in ReplicateIn) (ReplicateStatus, error
 	for i := 0; ; i++ {
 		if i == replicateIterations {
 			return st, workflow.NewContinueAsNewError(ctx, ReplicateWait, ReplicateIn{Plan: in.Plan, Link: in.Link,
-				Tables: in.Tables, CopyDone: st.CopyDone, StableSince: st.StableSince})
+				Tables: in.Tables, CopyDone: st.CopyDone, StableSince: st.StableSince, Samples: st.Samples})
 		}
 		if !st.CopyDone {
 			if err := workflow.ExecuteActivity(actx, acts.CopyProgress, li).Get(ctx, &st.Copy); err != nil {

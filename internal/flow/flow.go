@@ -40,8 +40,12 @@ func Migration(ctx workflow.Context, in Input) (Result, error) {
 		r.event(r.st.State, "", "")
 		return Result{State: r.st.State, Events: r.st.Events}, nil
 	case r.ctx.Err() != nil:
+		what := "nothing further was undone"
+		if r.st.State == StateRollingBack {
+			what = "the unwind stopped here"
+		}
 		r.st.State = StateFailed
-		r.event("cancelled", "", fmt.Sprintf("cancelled with writes on the %s; nothing further was undone", r.st.Primary))
+		r.event("cancelled", "", fmt.Sprintf("cancelled with writes on the %s; %s", r.st.Primary, what))
 	default:
 		r.st.State = StateFailed
 		r.event("failed", "", message(err))
@@ -187,17 +191,38 @@ func (r *runner) brokenGate() error {
 	return errRollback
 }
 
+// switchBackTries is how many clean aborts in a row switchBack makes
+// before it stops at a gate; undoTries is the same for an undo step.
+const (
+	switchBackTries = 3
+	undoTries       = 5
+)
+
 // switchBack repeats the reverse switch until it succeeds; an aborted
-// attempt has already resumed writes on the target. It does nothing once
-// the source is primary, so a retry after success never switches twice,
-// and it halts the unwind if replication is broken.
+// attempt has already resumed writes on the target. After switchBackTries
+// clean aborts in a row it waits at gate retry-switch-back, and each
+// approval buys that many more attempts. It does nothing once the source
+// is primary, so a retry after success never switches twice, and it halts
+// the unwind if replication is broken.
 func (r *runner) switchBack(rev, fwd ops.Link, tables []string) error {
+	aborts := 0
 	for {
 		if r.st.Primary == ops.Source {
 			return nil
 		}
 		if r.st.ReplicationBroken {
 			return fmt.Errorf("%w: %w", errHalt, ErrReplicationBroken)
+		}
+		switch {
+		case aborts == switchBackTries:
+			if err := r.gate("retry-switch-back", r.lastAbort()+"; writes are on the target; fix replication and approve to try again", 1); err != nil {
+				return err
+			}
+			aborts = 0
+		case aborts > 0:
+			if err := workflow.Sleep(r.ctx, 10*time.Second); err != nil {
+				return err
+			}
 		}
 		ok, err := r.switchOver(ops.Target, ops.Source, rev, fwd, tables)
 		if errors.Is(err, ErrReplicationBroken) {
@@ -206,10 +231,19 @@ func (r *runner) switchBack(rev, fwd ops.Link, tables []string) error {
 		if ok || err != nil {
 			return err
 		}
-		if err := workflow.Sleep(r.ctx, 10*time.Second); err != nil {
-			return err
+		aborts++
+	}
+}
+
+// lastAbort is the reason the latest switch aborted.
+func (r *runner) lastAbort() string {
+	for i := len(r.st.Events) - 1; i >= 0; i-- {
+		if e := r.st.Events[i]; e.Kind == "switch-aborted" {
+			why, _, _ := strings.Cut(e.Message, "; writes resume on")
+			return "The switch back aborted: " + why
 		}
 	}
+	return "The switch back aborted"
 }
 
 func (r *runner) schemaCheck(tin ops.TablesIn) func() error {
@@ -303,9 +337,9 @@ func (r *runner) watch(d time.Duration) error {
 }
 
 // unwind runs every undo step in reverse. Rollback signals during it are
-// ignored: it is already rolling back. Each step is retried until it
-// succeeds, except one that halts (errHalt): the unwind then stops where it
-// is and returns the error, leaving the remaining steps undone.
+// ignored: it is already rolling back. A failing step is retried (see
+// runUndo). A step that halts (errHalt), or a cancellation, stops the
+// unwind where it is: Status.PendingUndo then lists what is left undone.
 func (r *runner) unwind() error {
 	r.st.State = StateRollingBack
 	r.closed = "already rolling back"
@@ -313,25 +347,49 @@ func (r *runner) unwind() error {
 		u := r.undo[i]
 		r.st.Phase = u.phase
 		r.event("undo-started", "", "")
-		var halt error
-		err := r.must(func() error {
-			err := u.run()
-			if errors.Is(err, errHalt) {
-				halt = err
-				return nil
-			}
-			return err
-		})
-		if err == nil {
-			err = halt
-		}
-		if err != nil {
-			r.event("undo-failed", "", message(err))
+		if err := r.runUndo(u); err != nil {
 			r.undo = r.undo[:i+1]
+			r.st.PendingUndo = nil
+			for k := i; k >= 0; k-- {
+				r.st.PendingUndo = append(r.st.PendingUndo, r.undo[k].phase)
+			}
+			if errors.Is(err, errHalt) {
+				r.event("unwind-halted", "", u.phase+": "+message(err))
+			} else {
+				r.event("undo-failed", "", message(err))
+			}
 			return err
 		}
 		r.undo = r.undo[:i]
 		r.event("undone", "", "")
 	}
 	return nil
+}
+
+// runUndo tries one undo step up to undoTries times, 10s apart, then waits
+// at gate retry-undo-<phase>; each approval buys undoTries more attempts.
+// A halting error or a cancellation returns at once.
+func (r *runner) runUndo(u undoStep) error {
+	for {
+		var msg string
+		for n := 1; ; n++ {
+			err := u.run()
+			if err == nil || errors.Is(err, errHalt) || r.ctx.Err() != nil {
+				return err
+			}
+			msg = message(err)
+			if n == undoTries {
+				r.event("compensation-failed", "", msg)
+				break
+			}
+			r.event("compensation-failed", "", msg+"; retrying in 10s")
+			if err := workflow.Sleep(r.ctx, 10*time.Second); err != nil {
+				return err
+			}
+		}
+		if err := r.gate("retry-undo-"+u.phase, fmt.Sprintf("Undoing %s failed %d times: %s. Approve to try %d more times.",
+			u.phase, undoTries, msg, undoTries), 1); err != nil {
+			return err
+		}
+	}
 }

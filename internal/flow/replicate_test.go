@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
@@ -63,5 +64,28 @@ func TestReplicateWaitContinuesAsNew(t *testing.T) {
 	var can *workflow.ContinueAsNewError
 	if err := env.GetWorkflowError(); !errors.As(err, &can) {
 		t.Fatalf("want continue-as-new, got %v", err)
+	}
+	// The next run carries the state on, including the samples taken.
+	var next ReplicateIn
+	if err := converter.GetDefaultDataConverter().FromPayloads(can.Input, &next); err != nil {
+		t.Fatal(err)
+	}
+	if !next.CopyDone || next.Samples != 3 || next.StableSince != nil {
+		t.Fatalf("next run %+v", next)
+	}
+}
+
+// Samples count across continue-as-new: the next run starts from them.
+func TestReplicateWaitCarriesSamples(t *testing.T) {
+	env := newEnv()
+	var a *ops.Activities
+	env.OnActivity(a.MeasureLag, mockAny, mockAny).Return(ops.LagOut{Lag: 10 * time.Millisecond, Visible: true}, nil)
+	env.ExecuteWorkflow(ReplicateWait, ReplicateIn{Plan: replicatePlan(), Link: ops.Forward(mid), CopyDone: true, Samples: 10})
+	var st ReplicateStatus
+	if err := env.GetWorkflowResult(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Samples != 14 {
+		t.Fatalf("samples %d", st.Samples)
 	}
 }

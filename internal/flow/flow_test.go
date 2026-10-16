@@ -388,3 +388,162 @@ func TestCancelDuringStepIsNotAFailure(t *testing.T) {
 		t.Fatalf("%q", kinds(st.Events))
 	}
 }
+
+// --- fix round 1 ---
+
+func rollbackInWatch() action {
+	return action{
+		when: func(s Status) bool { return s.Phase == PhaseFinish && s.Gate == nil },
+		do: func(env *testsuite.TestWorkflowEnvironment) {
+			env.SignalWorkflow(SignalRollback, RollbackSignal{ApproverID: "alice", Reason: "p99 regressed"})
+		},
+	}
+}
+
+// invisibleRev makes the switch-back drain miss the sentinel n times: each
+// is a clean abort of the reverse switch.
+func invisibleRev(env *testsuite.TestWorkflowEnvironment, c *calls, n int) {
+	var a *ops.Activities
+	rev := mock.MatchedBy(func(in ops.LagIn) bool { return in.Link == ops.Reverse(mid) })
+	env.OnActivity(a.MeasureLag, mockAny, rev).Return(func(context.Context, ops.LagIn) (ops.LagOut, error) {
+		c.add("lag:rev")
+		return ops.LagOut{Visible: false}, nil
+	}).Times(n)
+}
+
+func hasGate(evs []Event, prefix string) bool {
+	return slices.ContainsFunc(evs, func(e Event) bool { return e.Kind == "gate-opened" && strings.HasPrefix(e.Message, prefix) })
+}
+
+func TestSwitchBackRetriesCleanAborts(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	invisibleRev(env, c, 2)
+	mockAll(env, c, nil, true)
+	r := start(t, env, append(happy()[:5], rollbackInWatch()))
+	if r.State != StateRolledBack || c.count("pause") != 4 || hasGate(r.Events, "retry-switch-back") {
+		t.Fatalf("%s pause x%d: %q", r.State, c.count("pause"), kinds(r.Events))
+	}
+}
+
+func TestSwitchBackGateAfterThreeAborts(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	invisibleRev(env, c, 3)
+	mockAll(env, c, nil, true)
+	var summary string
+	open := action{
+		when: func(s Status) bool {
+			if s.Gate != nil && s.Gate.Name == "retry-switch-back" {
+				summary = s.Gate.Summary
+				return true
+			}
+			return false
+		},
+		do: func(*testsuite.TestWorkflowEnvironment) {},
+	}
+	r := start(t, env, append(happy()[:5], rollbackInWatch(), open, approve("retry-switch-back", "alice")))
+	if r.State != StateRolledBack || c.count("pause") != 5 {
+		t.Fatalf("%s pause x%d: %q", r.State, c.count("pause"), kinds(r.Events))
+	}
+	if !strings.Contains(summary, "did not drain") || !strings.Contains(summary, "writes are on the target") {
+		t.Fatalf("summary %q", summary)
+	}
+	assertCalls(t, c.since("repoint:source"), []string{"repoint:source", "resume", "stop:rev", "stop:fwd", "undo-prepare"})
+}
+
+func TestBrokenSwitchBackHaltsUnwind(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	fwd := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Forward(mid) })
+	// The forward switch's publication drop succeeds; stopping the new
+	// forward link during the switch-back's abort does not.
+	env.OnActivity(a.StopLink, mockAny, fwd).Return(func(context.Context, ops.LinkIn) error {
+		c.add("stop:fwd")
+		return nil
+	}).Once()
+	env.OnActivity(a.StopLink, mockAny, fwd).Return(func(context.Context, ops.LinkIn) error {
+		c.add("stop:fwd")
+		return boom
+	}).Once()
+	fwdNoCopy := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Forward(mid) && !in.CopyData })
+	env.OnActivity(a.StartLink, mockAny, fwdNoCopy).Return(func(context.Context, ops.LinkIn) error {
+		c.add("start:fwd")
+		return boom
+	}).Once()
+	mockAll(env, c, nil, true)
+	drive(t, env, append(happy()[:5], rollbackInWatch()))
+	env.ExecuteWorkflow(Migration, Input{MigrationID: mid, Plan: testPlan()})
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() == nil {
+		t.Fatalf("want a failed workflow, got %v", env.GetWorkflowError())
+	}
+	st := status(t, env)
+	if st.State != StateFailed || st.Primary != ops.Target || !st.ReplicationBroken ||
+		!slices.Contains(kinds(st.Events), "unwind-halted") || len(st.PendingUndo) == 0 {
+		t.Fatalf("%s %s pending %q: %q", st.State, st.Primary, st.PendingUndo, kinds(st.Events))
+	}
+	assertCalls(t, c.since("start:fwd"), []string{"start:fwd", "stop:fwd", "resume"})
+	if c.count("pause") != 2 || c.count("undo-prepare") != 0 {
+		t.Fatalf("calls %q", c.list())
+	}
+	assertCalls(t, st.PendingUndo, []string{PhaseSwitch, PhaseReplicate, PhasePrepare})
+}
+
+func TestUndoStepGateAfterFiveFailures(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	env.OnActivity(a.UndoPrepare, mockAny, mockAny).Return(func(context.Context, ops.TablesIn) error {
+		c.add("undo-prepare")
+		return boom
+	}).Times(5)
+	mockAll(env, c, nil, true)
+	steps := []action{approve("discover", "alice"), approve("prepare", "alice"), atGate("rehearse", "alice", Reject),
+		approve("retry-undo-prepare", "alice")}
+	r := start(t, env, steps)
+	if r.State != StateRolledBack || c.count("undo-prepare") != 6 || !hasGate(r.Events, "retry-undo-prepare") {
+		t.Fatalf("%s undo x%d: %q", r.State, c.count("undo-prepare"), kinds(r.Events))
+	}
+}
+
+func TestRetryGateDuringUnwindOffersNoRollback(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	rev := mock.MatchedBy(func(in ops.LinkIn) bool { return in.Link == ops.Reverse(mid) })
+	env.OnActivity(a.StopLink, mockAny, rev).Return(func(context.Context, ops.LinkIn) error {
+		c.add("stop:rev")
+		return boom
+	}).Once()
+	mockAll(env, c, nil, true)
+	var summary string
+	retry := approve("retry-drop-old-publication", "alice")
+	when := retry.when
+	retry.when = func(s Status) bool {
+		if when(s) {
+			summary = s.Gate.Summary
+			return true
+		}
+		return false
+	}
+	r := start(t, env, append(happy()[:5], rollbackInWatch(), retry))
+	if r.State != StateRolledBack || summary == "" || strings.Contains(summary, "roll back") {
+		t.Fatalf("%s summary %q", r.State, summary)
+	}
+}
+
+func TestCancelMidUnwindSaysWhereItStopped(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	block := blockAndCancel(env, c, "undo-prepare")
+	env.OnActivity(a.UndoPrepare, mockAny, mockAny).Return(func(ctx context.Context, _ ops.TablesIn) error { return block(ctx) }).Once()
+	mockAll(env, c, nil, true)
+	st := cancelled(t, env, []action{approve("discover", "alice"), approve("prepare", "alice"), atGate("rehearse", "alice", Reject)})
+	i := slices.IndexFunc(st.Events, func(e Event) bool { return e.Kind == "cancelled" })
+	if i < 0 || !strings.Contains(st.Events[i].Message, "the unwind stopped here") {
+		t.Fatalf("%+v", st.Events)
+	}
+	assertCalls(t, st.PendingUndo, []string{PhasePrepare})
+}
