@@ -170,10 +170,11 @@ func memberOf(param, role string) string {
 // an error.
 func CanReplicate(ctx context.Context, c *pgx.Conn, role string) (bool, error) {
 	var ok bool
-	if err := c.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AND (
+	if err := c.QueryRow(ctx, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) THEN
 		(SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = $1)
 		OR `+memberOf("$1", "rds_replication")+`
-		OR `+memberOf("$1", "rds_superuser")+`)`, role).
+		OR `+memberOf("$1", "rds_superuser")+`
+		ELSE false END`, role).
 		Scan(&ok); err != nil {
 		return false, fmt.Errorf("role %s: %w", role, err)
 	}
@@ -200,20 +201,19 @@ func Tables(ctx context.Context, c *pgx.Conn, schemas []string) ([]Table, error)
 }
 
 // Sequences lists sequences in schemas. LastValue is nil until first use. It
-// fails, naming the sequence, when the connecting role lacks USAGE or SELECT on
+// fails, naming the sequence, when the connecting role lacks both USAGE and SELECT on
 // one, because Postgres would then report a nil LastValue indistinguishable
 // from an unused sequence.
 func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, error) {
 	var denied []string
 	err := c.QueryRow(ctx, `SELECT coalesce(array_agg(schemaname || '.' || sequencename ORDER BY schemaname, sequencename), '{}')
 		FROM pg_sequences WHERE schemaname = ANY($1) AND NOT (
-		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'USAGE') AND
-		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'SELECT'))`, schemas).Scan(&denied)
+		  has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'USAGE,SELECT'))`, schemas).Scan(&denied)
 	if err != nil {
 		return nil, fmt.Errorf("sequence privileges: %w", err)
 	}
 	if len(denied) > 0 {
-		return nil, fmt.Errorf("no USAGE and SELECT on sequence %s", strings.Join(denied, ", "))
+		return nil, fmt.Errorf("no USAGE or SELECT on sequence %s", strings.Join(denied, ", "))
 	}
 	rows, _ := c.Query(ctx, `SELECT schemaname::text, sequencename::text, last_value, increment_by
 		FROM pg_sequences WHERE schemaname = ANY($1) ORDER BY 1, 2`, schemas)

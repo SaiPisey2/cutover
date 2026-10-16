@@ -72,7 +72,7 @@ func mkRoles(t *testing.T, c *pgx.Conn, stmts ...string) {
 	t.Helper()
 	ctx := context.Background()
 	t.Cleanup(func() {
-		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "rds_replication", "rds_superuser"} {
+		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "rds_replication", "rds_superuser"} {
 			c.Exec(ctx, "DROP OWNED BY "+r)
 			c.Exec(ctx, "DROP ROLE IF EXISTS "+r)
 		}
@@ -93,6 +93,9 @@ func TestRdsRoles(t *testing.T) {
 		"CREATE ROLE rr_member LOGIN IN ROLE rds_replication",
 		"CREATE ROLE rs_member LOGIN IN ROLE rds_superuser",
 		"CREATE ROLE plain_r LOGIN")
+	if ok, err := pg.CanReplicate(ctx, src, "no_such_role"); err != nil || ok {
+		t.Errorf("missing role with rds roles present: %v %v", ok, err)
+	}
 	for role, want := range map[string]bool{"rr_member": true, "rs_member": true, "plain_r": false} {
 		if ok, err := pg.CanReplicate(ctx, src, role); err != nil || ok != want {
 			t.Errorf("CanReplicate %s: %v %v", role, ok, err)
@@ -148,5 +151,27 @@ func TestSequencePrivilege(t *testing.T) {
 	_, err = pg.Inspect(ctx, c, []string{"public"})
 	if err == nil || !strings.Contains(err.Error(), "public.fresh_seq") {
 		t.Fatalf("want error naming public.fresh_seq, got %v", err)
+	}
+}
+
+func TestSequenceSelectOnly(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src := itest.Conn(t, itest.SourceDSN)
+	mkRoles(t, src, "CREATE ROLE seq_sel LOGIN")
+	if _, err := src.Exec(ctx, `CREATE SEQUENCE public.used_seq; SELECT nextval('public.used_seq');
+		GRANT USAGE ON SCHEMA public TO seq_sel; GRANT SELECT ON SEQUENCE public.used_seq TO seq_sel`); err != nil {
+		t.Fatal(err)
+	}
+	c := itest.Conn(t, itest.SourceDSN)
+	if _, err := c.Exec(ctx, "SET ROLE seq_sel"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := pg.Inspect(ctx, c, []string{"public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Sequences) != 1 || f.Sequences[0].LastValue == nil || *f.Sequences[0].LastValue != 1 {
+		t.Fatalf("sequences: %+v", f.Sequences)
 	}
 }
