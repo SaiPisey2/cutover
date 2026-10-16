@@ -346,3 +346,34 @@ func TestSwitchCompensatesWhenSequencesFail(t *testing.T) {
 	_, c := runSwitch(t, testPlan(), false, fails{"seq:source>target": boom}, true)
 	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target", "start:fwd", "resume"})
 }
+
+// The smallest budget still switches: max_pause 1s leaves the drain about
+// 750ms (the reserve is max(250ms, max_pause/4)).
+func TestSwitchOneSecondBudget(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	var a *ops.Activities
+	var got time.Duration
+	env.OnActivity(a.MeasureLag, mockAny, mockAny).Return(
+		func(_ context.Context, in ops.LagIn) (ops.LagOut, error) {
+			c.add("lag:" + short(in.Link))
+			got = in.Timeout
+			return ops.LagOut{Visible: true}, nil
+		}).Once()
+	mockAll(env, c, nil, true)
+	p := testPlan()
+	p.Thresholds.Switch.MaxPause = plan.Duration(time.Second)
+	env.ExecuteWorkflow(switchWorkflow, p, false)
+	var res switchResult
+	if err := env.GetWorkflowResult(&res); err != nil {
+		t.Fatal(err)
+	}
+	if got < 600*time.Millisecond || got > 750*time.Millisecond {
+		t.Fatalf("drain timeout %s, want about 750ms", got)
+	}
+	assertCalls(t, c.list(), []string{"pause", "lag:fwd", "drop-sub:fwd", "seq:source>target",
+		"start:rev", "repoint:target", "resume", "stop:fwd"})
+	if !res.OK || res.Primary != ops.Target {
+		t.Fatalf("%+v", res)
+	}
+}

@@ -11,11 +11,14 @@ import (
 	"github.com/SaiPisey2/cutover/internal/pg"
 )
 
+// minStep is the least time worth starting a switch step with.
+const minStep = 100 * time.Millisecond
+
 // bounded returns activity options whose timeouts end at deadline, or false
-// when less than a second is left.
+// when less than minStep is left.
 func (r *runner) bounded(deadline time.Time) (workflow.Context, bool) {
 	rem := deadline.Sub(workflow.Now(r.ctx))
-	if rem < time.Second {
+	if rem < minStep {
 		return nil, false
 	}
 	return workflow.WithActivityOptions(r.ctx, workflow.ActivityOptions{
@@ -33,10 +36,10 @@ func (r *runner) bounded(deadline time.Time) (workflow.Context, bool) {
 //	start next link (copy_data=false) → repoint → resume
 //
 // Every step up to the repoint runs inside the max_pause budget. The drain
-// may use only the budget minus a reserve of max(1s, max_pause/4), so the
-// steps after it keep time. If a step fails or the budget runs out, the
-// completed steps are undone in reverse and writes resume on `from`; it
-// returns (false, nil).
+// may use only the budget minus a reserve of max(250ms, max_pause/4), so the
+// steps after it keep time; with max_pause 1s the drain gets about 750ms.
+// If a step fails or the budget runs out, the completed steps are undone in
+// reverse and writes resume on `from`; it returns (false, nil).
 //
 // A successful repoint is the point of no return: PgBouncer now routes to
 // `to`, so Primary becomes `to` at once and the switch never aborts after
@@ -83,7 +86,7 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 	maxPause := p.Thresholds.Switch.MaxPause.D()
 	start := workflow.Now(r.ctx)
 	deadline := start.Add(maxPause)
-	reserve := max(time.Second, maxPause/4)
+	reserve := max(250*time.Millisecond, maxPause/4)
 	r.event("switch-started", "", fmt.Sprintf("%s to %s, pause budget %s", from, to, maxPause))
 
 	pool := ops.PoolIn{Plan: p}
@@ -155,8 +158,13 @@ func (r *runner) switchOver(from, to ops.Side, old, next ops.Link, tables []stri
 		}
 		return nil
 	}
-	// left is the Timeout input for an activity bounded by `until`.
-	left := func(until time.Time) time.Duration { return until.Sub(workflow.Now(r.ctx)) - 500*time.Millisecond }
+	// left is the Timeout input for an activity bounded by `until`: the time
+	// remaining less a slack (a tenth, at most 500ms) so the activity can
+	// answer before Temporal times it out.
+	left := func(until time.Time) time.Duration {
+		rem := until.Sub(workflow.Now(r.ctx))
+		return rem - min(500*time.Millisecond, rem/10)
+	}
 
 	if err := call(deadline, "pause", acts.PausePool, ops.PoolIn{Plan: p, Timeout: left(deadline)}, nil); err != nil {
 		return abort(err.Error())
