@@ -1,0 +1,31 @@
+# A cutover plan: what moves, where it moves, and the limits that stop it.
+# Credentials are references (env:NAME or file:/abs/path), never values.
+version: 1
+name: shop
+
+source:
+  postgres:
+    dsn: env:CUTOVER_SOURCE_DSN                        # how the worker reaches the source
+    replication_dsn: file:/etc/cutover/source-repl-dsn # how the target database reaches the source
+    route: host=10.0.1.5 port=5432 dbname=shop         # PgBouncer's connection string, no password
+
+target:
+  postgres:
+    dsn: env:CUTOVER_TARGET_DSN
+    replication_dsn: file:/etc/cutover/target-repl-dsn # how the source reaches the target (reverse)
+    route: host=10.8.0.7 port=5432 dbname=shop
+
+database:
+  name: shop            # the PgBouncer database name the apps connect to
+  schemas: [public]
+  # tables: [public.orders, public.items]   # default: every table in schemas
+  pgbouncer:
+    admin_dsn: env:CUTOVER_PGBOUNCER_ADMIN_DSN
+    routes_file: /etc/pgbouncer/cutover-routes.ini   # %include'd by pgbouncer.ini; cutover owns it
+    # addresses: [10.0.1.9/32]  # where the source sees PgBouncer connect from; others block readiness
+
+thresholds:
+  replicate: {max_lag: 1s, stable_for: 5m, sample_every: 10s}
+  rehearse: {sample_rows: 1000}
+  switch: {max_pause: 10s, sequence_margin: 1000}
+  finish: {watch: 24h}
