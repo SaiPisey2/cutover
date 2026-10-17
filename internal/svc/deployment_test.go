@@ -424,3 +424,21 @@ func TestDeploymentUndoIgnoresOwnReplicaSetsAndPods(t *testing.T) {
 		t.Fatal("namespace with a stray pod was deleted")
 	}
 }
+
+func TestDeploymentUndoKeepsNamespaceWithSamePlanOtherService(t *testing.T) {
+	ctx := context.Background()
+	tgt := fake.NewClientset()
+	d := prepared(t, sourceObjects(), tgt)
+	tgt.Tracker().Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "billing-cfg", Namespace: "shop",
+		Labels:      map[string]string{ManagedByLabel: ManagedBy},
+		Annotations: map[string]string{PlanAnnotation: "shop", ServiceAnnotation: "billing"}}})
+	if err := d.Undo(ctx, kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.CoreV1().Namespaces().Get(ctx, "shop", metav1.GetOptions{}); err != nil {
+		t.Fatal("namespace deleted although another service of the plan still has objects in it")
+	}
+	if _, err := tgt.CoreV1().ConfigMaps("shop").Get(ctx, "billing-cfg", metav1.GetOptions{}); err != nil {
+		t.Fatal("the other service's object was removed")
+	}
+}

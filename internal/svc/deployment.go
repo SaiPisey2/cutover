@@ -577,7 +577,7 @@ func (d deployment) Undo(ctx context.Context, tgt Side) error {
 }
 
 // emptyNamespace reports whether the namespace holds nothing that is not
-// cutover's for this plan. After Undo removed its own objects, anything
+// cutover's for this plan and this service. After Undo removed its own objects, anything
 // else (workloads, storage, ingress, RBAC, user config) means a person is
 // using the namespace and it stays. The cluster's own root CA config map,
 // the default service account, service-account tokens, and replica sets
@@ -588,7 +588,7 @@ func (d deployment) emptyNamespace(ctx context.Context, c kubernetes.Interface) 
 		return false, nil
 	}
 	lo := metav1.ListOptions{}
-	foreign := func(m metav1.ObjectMeta) bool { return !d.ownedBy(m) }
+	foreign := func(m metav1.ObjectMeta) bool { return !d.mine(&m) }
 	core, apps := c.CoreV1(), c.AppsV1()
 
 	deps, err := apps.Deployments(ns).List(ctx, lo)
