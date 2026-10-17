@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +31,8 @@ var (
 	ErrInvalid  = errors.New("invalid route")
 )
 
+var errNoEnvoy = errors.New("no Envoy is connected to the xDS server; start the front door's Envoy (cutover envoy-bootstrap)")
+
 // ackTypes are the types every Envoy must ACK before a stage counts as applied.
 var ackTypes = []string{resource.ListenerType, resource.RouteType, resource.ClusterType}
 
@@ -49,7 +50,7 @@ type XDS struct {
 	grpc   *grpc.Server
 	boot   string
 	applyM sync.Mutex // serializes Apply
-	mu     sync.Mutex // guards routes, seq and current
+	mu     sync.Mutex // guards routes, seq and cur
 	routes []Route
 	seq    int
 	cur    string // version of the snapshot last set
@@ -149,7 +150,7 @@ func (x *XDS) Apply(ctx context.Context, r Route) error {
 	next := append(slices.Clone(others), r)
 	slices.SortFunc(next, func(a, b Route) int { return strings.Compare(a.Key(), b.Key()) })
 
-	if prev, ok := x.Route(r.Key()); ok && reflect.DeepEqual(prev, r) {
+	if prev, ok := x.Route(r.Key()); ok && signature([]Route{prev}, []Route{prev}) == signature([]Route{r}, []Route{r}) {
 		x.mu.Lock()
 		v := x.cur
 		x.mu.Unlock()
@@ -375,10 +376,10 @@ func (a *ackTracker) wait(ctx context.Context, v string, timeout time.Duration) 
 		switch {
 		case nack != "":
 			return errors.New(nack)
-		case n > 0 && done:
+		case n == 0:
+			return errNoEnvoy
+		case done:
 			return nil
-		case time.Now().After(deadline) && n == 0:
-			return errors.New("no Envoy is connected to the xDS server; start the front door's Envoy (cutover envoy-bootstrap)")
 		case time.Now().After(deadline):
 			return fmt.Errorf("envoy did not confirm configuration %s within %s", v, timeout)
 		}

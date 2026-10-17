@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
@@ -25,6 +27,7 @@ type fakeEnvoy struct {
 	stream discoverygrpc.AggregatedDiscoveryService_StreamAggregatedResourcesClient
 	mu     sync.Mutex
 	got    map[string][]string // type -> versions received
+	names  map[string][]string // cluster version -> cluster names
 	nack   func(typ, version string) bool
 }
 
@@ -39,7 +42,7 @@ func dialEnvoy(t *testing.T, addr string, nack func(typ, version string) bool) *
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &fakeEnvoy{t: t, stream: st, got: map[string][]string{}, nack: nack}
+	e := &fakeEnvoy{t: t, stream: st, got: map[string][]string{}, names: map[string][]string{}, nack: nack}
 	node := &corev3.Node{Id: NodeID, Cluster: "cutover"}
 	for i, typ := range []string{resource.ClusterType, resource.ListenerType, resource.RouteType} {
 		req := &discoverygrpc.DiscoveryRequest{TypeUrl: typ}
@@ -54,6 +57,9 @@ func dialEnvoy(t *testing.T, addr string, nack func(typ, version string) bool) *
 		}
 	}
 	go e.loop()
+	// The server answers only once it has registered the stream, so the
+	// first response means Apply will see this Envoy as connected.
+	waitFor(t, func() bool { return len(e.versions(resource.ClusterType)) > 0 })
 	return e
 }
 
@@ -66,6 +72,16 @@ func (e *fakeEnvoy) loop() {
 		}
 		e.mu.Lock()
 		e.got[resp.TypeUrl] = append(e.got[resp.TypeUrl], resp.VersionInfo)
+		if resp.TypeUrl == resource.ClusterType {
+			var ns []string
+			for _, a := range resp.Resources {
+				var c clusterv3.Cluster
+				if a.UnmarshalTo(&c) == nil {
+					ns = append(ns, c.Name)
+				}
+			}
+			e.names[resp.VersionInfo] = ns
+		}
 		e.mu.Unlock()
 		req := &discoverygrpc.DiscoveryRequest{TypeUrl: resp.TypeUrl, ResponseNonce: resp.Nonce, VersionInfo: resp.VersionInfo}
 		if resp.TypeUrl == resource.RouteType {
@@ -81,6 +97,12 @@ func (e *fakeEnvoy) loop() {
 			return
 		}
 	}
+}
+
+func (e *fakeEnvoy) clusterNames(v string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string{}, e.names[v]...)
 }
 
 func (e *fakeEnvoy) versions(typ string) []string {
@@ -180,7 +202,7 @@ func TestApplyNackRestoresAndFails(t *testing.T) {
 	x, addr := startXDS(t, store, 0)
 	var reject string
 	var mu sync.Mutex
-	dialEnvoy(t, addr, func(typ, v string) bool {
+	e := dialEnvoy(t, addr, func(typ, v string) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return typ == resource.ClusterType && v == reject
@@ -189,6 +211,8 @@ func TestApplyNackRestoresAndFails(t *testing.T) {
 	if err := x.Apply(ctx, base()); err != nil {
 		t.Fatal(err)
 	}
+	vs := e.versions(resource.ClusterType)
+	before := e.clusterNames(vs[len(vs)-1])
 	// Reject whatever version comes next.
 	mu.Lock()
 	reject = x.nextVersion()
@@ -204,6 +228,20 @@ func TestApplyNackRestoresAndFails(t *testing.T) {
 	}
 	if saved, _ := store.Load(); len(saved) != 1 || saved[0].Target != nil {
 		t.Fatalf("a rejected change must not be saved: %+v", saved)
+	}
+	// The old configuration is pushed again: a later cluster and route
+	// version than the rejected one, carrying the pre-change clusters.
+	waitFor(t, func() bool {
+		cv, rv := e.versions(resource.ClusterType), e.versions(resource.RouteType)
+		i := slices.Index(cv, reject)
+		return i >= 0 && len(cv) > i+1 && cv[len(cv)-1] != reject && len(rv) > 0 && rv[len(rv)-1] == cv[len(cv)-1] &&
+			slices.Equal(e.clusterNames(cv[len(cv)-1]), before)
+	})
+	mu.Lock()
+	reject = ""
+	mu.Unlock()
+	if err := x.Apply(ctx, r); err != nil {
+		t.Fatalf("an Apply after a rejected one must work: %v", err)
 	}
 }
 
@@ -282,5 +320,44 @@ func TestStopBeforeServeMakesServeReturn(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Serve after Stop must return promptly")
+	}
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if ok() {
+			return
+		}
+	}
+	t.Fatal("condition not met in time")
+}
+
+func TestApplyEmptyMirrorMethodsIsUnchanged(t *testing.T) {
+	x, addr := startXDS(t, newStore(t), 0)
+	e := dialEnvoy(t, addr, nil)
+	ctx := context.Background()
+	if err := x.Apply(ctx, base()); err != nil {
+		t.Fatal(err)
+	}
+	n := len(e.versions(resource.ClusterType))
+	r := base()
+	r.MirrorMethods = []string{}
+	if err := x.Apply(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.versions(resource.ClusterType)) != n {
+		t.Fatal("nil and empty MirrorMethods are the same route; nothing may be sent")
+	}
+}
+
+func TestApplyWithoutEnvoyFailsFast(t *testing.T) {
+	x, _ := startXDS(t, newStore(t), 0)
+	began := time.Now()
+	if err := x.Apply(context.Background(), base()); err == nil {
+		t.Fatal("want error")
+	}
+	if time.Since(began) > time.Second {
+		t.Fatal("with no Envoy connected Apply must not wait for the ack timeout")
 	}
 }
