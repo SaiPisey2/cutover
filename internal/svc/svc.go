@@ -86,19 +86,3 @@ func blocked(fs []Finding) error {
 	}
 	return nil
 }
-
-type deployment struct {
-	plan string
-	svc  plan.Service
-}
-
-func (deployment) Inspect(context.Context, Side, Side) (Facts, error) {
-	return Facts{}, errors.New("deployment: not built yet")
-}
-func (deployment) Prepare(context.Context, Side, Side) error {
-	return errors.New("deployment: not built yet")
-}
-func (deployment) Healthy(context.Context, Side) (bool, string, error) {
-	return false, "", errors.New("deployment: not built yet")
-}
-func (deployment) Undo(context.Context, Side) error { return errors.New("deployment: not built yet") }
