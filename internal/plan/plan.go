@@ -28,11 +28,15 @@ type Plan struct {
 	Source     Env        `yaml:"source" json:"source"`
 	Target     Env        `yaml:"target" json:"target"`
 	Database   Database   `yaml:"database" json:"database"`
+	FrontDoor  *FrontDoor `yaml:"frontdoor" json:"frontdoor,omitempty"`
+	Services   []Service  `yaml:"services" json:"services,omitempty"`
 	Thresholds Thresholds `yaml:"thresholds" json:"thresholds"`
 }
 
 type Env struct {
-	Postgres Postgres `yaml:"postgres" json:"postgres"`
+	Postgres Postgres        `yaml:"postgres" json:"postgres"`
+	Hosts    map[string]Host `yaml:"hosts" json:"hosts,omitempty"`
+	Kube     *Kube           `yaml:"kube" json:"kube,omitempty"`
 }
 
 type Postgres struct {
@@ -53,6 +57,8 @@ type PgBouncer struct {
 	AdminDSN   secret.Ref `yaml:"admin_dsn" json:"admin_dsn"`
 	RoutesFile string     `yaml:"routes_file" json:"routes_file"`
 	Addresses  []string   `yaml:"addresses" json:"addresses,omitempty"`
+	// Host, when set, is where routes_file lives: it is written over SSH.
+	Host *Host `yaml:"host" json:"host,omitempty"`
 }
 
 type Tools struct {
@@ -63,6 +69,7 @@ type Tools struct {
 type Thresholds struct {
 	Replicate Replicate `yaml:"replicate" json:"replicate"`
 	Rehearse  Rehearse  `yaml:"rehearse" json:"rehearse"`
+	Shift     Shift     `yaml:"shift" json:"shift"`
 	Switch    Switch    `yaml:"switch" json:"switch"`
 	Finish    Finish    `yaml:"finish" json:"finish"`
 }
@@ -75,6 +82,8 @@ type Replicate struct {
 
 type Rehearse struct {
 	SampleRows int `yaml:"sample_rows" json:"sample_rows"`
+	// Window is how long Rehearse mirrors and measures traffic.
+	Window Duration `yaml:"window" json:"window"`
 }
 
 type Switch struct {
@@ -152,6 +161,7 @@ func ApplyDefaults(p *Plan) {
 	if th.Rehearse.SampleRows == 0 {
 		th.Rehearse.SampleRows = 1000
 	}
+	applyServiceDefaults(p)
 }
 
 func setDur(d *Duration, v time.Duration) {
@@ -263,6 +273,7 @@ func (p Plan) Validate() error {
 	if th.Finish.Watch <= 0 {
 		bad("thresholds.finish.watch: must be positive")
 	}
+	p.validateServices(bad)
 	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 	return errors.Join(errs...)
 }

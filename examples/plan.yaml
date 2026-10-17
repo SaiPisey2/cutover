@@ -4,12 +4,18 @@ version: 1
 name: shop
 
 source:
+  hosts:
+    app1: {address: 10.0.1.20, user: deploy, key: file:/etc/cutover/ssh-key, known_hosts: /etc/cutover/known_hosts}
+  # kube: {kubeconfig: /etc/cutover/source.kubeconfig, context: prod-a}
   postgres:
     dsn: env:CUTOVER_SOURCE_DSN                        # how the worker reaches the source
     replication_dsn: file:/etc/cutover/source-repl-dsn # how the target database reaches the source
     route: host=10.0.1.5 port=5432 dbname=shop         # PgBouncer's connection string, no password
 
 target:
+  hosts:
+    app1: {address: 10.8.0.20, user: deploy, key: file:/etc/cutover/ssh-key, known_hosts: /etc/cutover/known_hosts, sudo: true}
+  # kube: {kubeconfig: /etc/cutover/target.kubeconfig, context: prod-b}
   postgres:
     dsn: env:CUTOVER_TARGET_DSN
     replication_dsn: file:/etc/cutover/target-repl-dsn # how the source reaches the target (reverse)
@@ -24,9 +30,29 @@ database:
     routes_file: /etc/pgbouncer/cutover-routes.ini   # %include'd by pgbouncer.ini; cutover owns it
     # addresses: [10.0.1.9/32]  # where the source sees PgBouncer connect from; others block readiness
 
+# The front door: cutover server's API (on the worker's host or reachable
+# from it) and the public IPs that every route's DNS name resolves to.
+frontdoor:
+  api: http://127.0.0.1:7600
+  token: file:/etc/cutover/frontdoor-token
+  addresses: [203.0.113.10]
+
+# Services move with the database. Kinds: compose and systemd (over SSH),
+# deployment (Kubernetes), external (you run both copies; cutover moves
+# only the traffic). A service without a route is copied but not routed.
+services:
+  - name: api
+    kind: compose
+    route: {host: shop.example.com, prefix: /, health_path: /healthz}
+    # mirror_methods: [GET, HEAD]   # default; [] turns mirroring off
+    compose: {project: shop, service: api}
+    source: {host: app1, endpoint: 10.0.1.20:8080}
+    target: {host: app1, endpoint: 10.8.0.20:8080}
+
 # Thresholds: 0 or omitted means the default (shown in each example below).
 thresholds:
   replicate: {max_lag: 1s, stable_for: 5m, sample_every: 10s}
-  rehearse: {sample_rows: 1000}
+  rehearse: {sample_rows: 1000, window: 5m}
+  shift: {steps: [1, 10, 50, 100], hold: 5m, preapprove: false, max_error_delta: 0.5, max_p99: 2, min_requests: 50, sample_every: 10s}
   switch: {max_pause: 10s, sequence_margin: 1000}
   finish: {watch: 24h}

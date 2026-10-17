@@ -28,6 +28,9 @@ func TestExampleLoads(t *testing.T) {
 	if p.Name != "shop" || p.Thresholds.Switch.MaxPause.D() != 10*time.Second {
 		t.Fatalf("unexpected plan: %+v", p)
 	}
+	if len(p.Services) == 0 || p.FrontDoor == nil {
+		t.Fatalf("the example plan shows services and the front door: %+v", p)
+	}
 }
 
 func TestDefaults(t *testing.T) {
