@@ -8,11 +8,13 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/SaiPisey2/cutover/internal/frontdoor"
 	"github.com/SaiPisey2/cutover/internal/pg"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/redact"
 	"github.com/SaiPisey2/cutover/internal/route"
+	"github.com/SaiPisey2/cutover/internal/svc"
 )
 
 type Severity string
@@ -53,6 +55,13 @@ type Input struct {
 	Target  pg.Facts           `json:"target"`
 	Pool    pgbouncer.Database `json:"pool"`
 	PoolErr string             `json:"pool_err,omitempty"`
+
+	Services    []svc.Facts         `json:"services,omitempty"`
+	ServiceErrs map[string]string   `json:"service_errs,omitempty"`
+	Routes      []frontdoor.Route   `json:"routes,omitempty"`
+	RoutesErr   string              `json:"routes_err,omitempty"`
+	DNS         map[string][]string `json:"dns,omitempty"`
+	DNSErr      map[string]string   `json:"dns_err,omitempty"`
 }
 
 func Assess(in Input) Report {
@@ -193,6 +202,7 @@ func Assess(in Input) Report {
 	}
 	add(Info, "size", "source", "%d tables, %d sequences, %d MiB", len(r.Tables), len(src.Sequences), src.SizeBytes>>20)
 	add(Info, "ddl-freeze", "", "schema changes are frozen until Finish: logical replication does not carry DDL")
+	assessServices(in, add)
 	// Map iteration above varies; sort so the console and evidence digests are stable.
 	rank := map[Severity]int{Blocker: 0, Warning: 1, Info: 2}
 	slices.SortStableFunc(r.Findings, func(a, b Finding) int {
