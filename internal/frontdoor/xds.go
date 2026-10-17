@@ -274,14 +274,14 @@ func ListenXDS(addr string) (net.Listener, error) {
 	if path, ok := strings.CutPrefix(addr, "unix:"); ok {
 		return net.Listen("unix", path)
 	}
-	if err := requireLoopback(addr); err != nil {
+	if err := RequireLoopback(addr); err != nil {
 		return nil, fmt.Errorf("xds: %w", err)
 	}
 	return net.Listen("tcp", addr)
 }
 
-// requireLoopback refuses any address that is not 127.0.0.0/8, ::1 or "localhost".
-func requireLoopback(addr string) error {
+// RequireLoopback refuses any address that is not 127.0.0.0/8, ::1 or "localhost".
+func RequireLoopback(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return err
