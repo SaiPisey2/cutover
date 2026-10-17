@@ -32,6 +32,7 @@ func TestRouteValidate(t *testing.T) {
 		{"weight without target", func(r *Route) { r.TargetWeight = 5 }, "target_weight must be 0 without a target"},
 		{"target only below 100", func(r *Route) { r.Source, r.Target, r.TargetWeight = nil, tgt, 50 }, "target_weight must be 100 without a source"},
 		{"mirror without target", func(r *Route) { r.Mirror, r.MirrorMethods = true, []string{"GET"} }, "mirroring needs both a source and a target"},
+		{"mirror with weight", func(r *Route) { r.Target, r.TargetWeight, r.Mirror, r.MirrorMethods = tgt, 10, true, []string{"GET"} }, "mirroring needs target_weight 0"},
 		{"mirror without methods", func(r *Route) { r.Target, r.Mirror = tgt, true }, "mirroring needs at least one method"},
 		{"unsafe method", func(r *Route) { r.Target, r.Mirror, r.MirrorMethods = tgt, true, []string{"DELETE"} }, `"DELETE" is not a safe method`},
 		{"owner", func(r *Route) { r.Owner = "Shop" }, "owner"},
@@ -67,6 +68,13 @@ func TestCheckConflicts(t *testing.T) {
 	b.Prefix = "/web"
 	if err := CheckConflicts([]Route{a}, b); err != nil {
 		t.Fatal(err)
+	}
+	c := base()
+	c.Owner, c.Prefix = "other", "/billing/"
+	d := base()
+	d.Prefix = "/billing"
+	if err := CheckConflicts([]Route{d}, c); err == nil {
+		t.Fatal("a trailing slash must not hide a conflict")
 	}
 	// The same key replaces itself; never a conflict.
 	if err := CheckConflicts([]Route{a}, a); err != nil {

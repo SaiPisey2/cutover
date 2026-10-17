@@ -130,6 +130,8 @@ func (r Route) Validate() error {
 			bad("mirroring needs both a source and a target")
 		case len(r.MirrorMethods) == 0:
 			bad("mirroring needs at least one method")
+		case r.TargetWeight != 0:
+			bad("mirroring needs target_weight 0")
 		}
 	}
 	for _, m := range r.MirrorMethods {
@@ -147,9 +149,18 @@ func (r Route) Validate() error {
 // CheckConflicts refuses r if another route already serves its host and prefix.
 func CheckConflicts(existing []Route, r Route) error {
 	for _, e := range existing {
-		if e.Key() != r.Key() && e.Host == r.Host && e.Prefix == r.Prefix {
+		if e.Key() != r.Key() && e.Host == r.Host && trimPrefix(e.Prefix) == trimPrefix(r.Prefix) {
 			return fmt.Errorf("%s%s is already routed by %s", r.Host, r.Prefix, e.Key())
 		}
 	}
 	return nil
+}
+
+// trimPrefix drops one trailing "/" so "/billing" and "/billing/" compare
+// equal; "/" itself stays "/".
+func trimPrefix(p string) string {
+	if p != "/" {
+		return strings.TrimSuffix(p, "/")
+	}
+	return p
 }
