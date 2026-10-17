@@ -17,18 +17,18 @@ import (
 )
 
 func Client(k plan.Kube) (kubernetes.Interface, error) {
-	b, err := os.ReadFile(k.Kubeconfig)
-	if err != nil {
+	if _, err := os.Stat(k.Kubeconfig); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("kubeconfig %s does not exist", k.Kubeconfig)
 		}
 		return nil, fmt.Errorf("kubeconfig %s cannot be read", k.Kubeconfig)
 	}
-	// Load errors can quote the file, which holds credentials: say only
-	// that it does not parse.
-	cfg, err := clientcmd.Load(b)
+	// LoadFromFile resolves relative certificate paths against the file's
+	// directory. Its errors can quote the file, which holds credentials:
+	// say only that it does not load.
+	cfg, err := clientcmd.LoadFromFile(k.Kubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("kubeconfig %s does not parse as a kubeconfig", k.Kubeconfig)
+		return nil, fmt.Errorf("kubeconfig %s does not load as a kubeconfig", k.Kubeconfig)
 	}
 	if _, ok := cfg.Contexts[k.Context]; !ok {
 		return nil, fmt.Errorf("kubeconfig %s has no context %q", k.Kubeconfig, k.Context)

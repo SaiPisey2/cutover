@@ -35,7 +35,8 @@ func (d deployment) name() string { return d.svc.Deployment.Name }
 // refs are the objects the deployment needs copied alongside it.
 type refs struct {
 	configMaps, secrets []string
-	optional            map[string]bool // "ConfigMap/x" or "Secret/x"
+	optional            map[string]bool // "ConfigMap/x" or "Secret/x": every reference is optional
+	required            map[string]bool // some reference is not optional
 	serviceAccount      string
 	services            []string
 }
@@ -47,14 +48,20 @@ func addRef(list *[]string, name string) {
 }
 
 func (d deployment) collect(ctx context.Context, c kubernetes.Interface, dep *appsv1.Deployment) (refs, []Finding, error) {
-	r := refs{optional: map[string]bool{}}
+	r := refs{optional: map[string]bool{}, required: map[string]bool{}}
 	var fs []Finding
 	pod := dep.Spec.Template.Spec
 	subj := d.ns() + "/" + d.name()
 	opt := func(kind, name string, o *bool) {
+		key := kind + "/" + name
 		if o != nil && *o {
-			r.optional[kind+"/"+name] = true
+			if !r.required[key] {
+				r.optional[key] = true
+			}
+			return
 		}
+		r.required[key] = true
+		delete(r.optional, key)
 	}
 	for _, v := range pod.Volumes {
 		switch {
@@ -114,6 +121,7 @@ func (d deployment) collect(ctx context.Context, c kubernetes.Interface, dep *ap
 	}
 	for _, ps := range pod.ImagePullSecrets {
 		addRef(&r.secrets, ps.Name)
+		opt("Secret", ps.Name, nil)
 	}
 	if sa := pod.ServiceAccountName; sa != "" && sa != "default" {
 		r.serviceAccount = sa
@@ -354,8 +362,14 @@ func (d deployment) Prepare(ctx context.Context, src, tgt Side) error {
 	if err := blocked(w.findings); err != nil {
 		return err
 	}
-	sc, _ := src.Kube(ctx)
-	tc, _ := tgt.Kube(ctx)
+	sc, err := src.Kube(ctx)
+	if err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
+	tc, err := tgt.Kube(ctx)
+	if err != nil {
+		return fmt.Errorf("target: %w", err)
+	}
 	ns := d.ns()
 	if _, err := tc.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); apierrors.IsNotFound(err) {
 		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns,
@@ -422,7 +436,13 @@ func (d deployment) Prepare(ctx context.Context, src, tgt Side) error {
 			return fmt.Errorf("source: %w", err)
 		}
 		spec := *o.Spec.DeepCopy()
+		headless := spec.ClusterIP == corev1.ClusterIPNone
 		spec.ClusterIP, spec.ClusterIPs, spec.HealthCheckNodePort = "", nil, 0
+		if headless {
+			// A headless service must stay headless: the target would
+			// otherwise allocate a virtual IP and break per-pod DNS.
+			spec.ClusterIP, spec.ClusterIPs = corev1.ClusterIPNone, []string{corev1.ClusterIPNone}
+		}
 		for i := range spec.Ports {
 			spec.Ports[i].NodePort = 0
 		}
@@ -556,36 +576,123 @@ func (d deployment) Undo(ctx context.Context, tgt Side) error {
 	return del("Namespace", ns, func() error { return c.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}) })
 }
 
-// emptyNamespace reports whether the namespace holds nothing a person
-// put there: no deployments or services, no config maps but the
-// cluster's own root CA, no secrets but service-account tokens.
+// emptyNamespace reports whether the namespace holds nothing that is not
+// cutover's for this plan. After Undo removed its own objects, anything
+// else (workloads, storage, ingress, RBAC, user config) means a person is
+// using the namespace and it stays. The cluster's own root CA config map,
+// the default service account, service-account tokens, and replica sets
+// and pods that belong to cutover's Deployment do not count.
 func (d deployment) emptyNamespace(ctx context.Context, c kubernetes.Interface) (bool, error) {
 	ns := d.ns()
-	deps, err := c.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
-	if err != nil || len(deps.Items) > 0 {
+	if strings.HasPrefix(ns, "kube-") {
+		return false, nil
+	}
+	lo := metav1.ListOptions{}
+	foreign := func(m metav1.ObjectMeta) bool { return !d.ownedBy(m) }
+	core, apps := c.CoreV1(), c.AppsV1()
+
+	deps, err := apps.Deployments(ns).List(ctx, lo)
+	if err != nil {
 		return false, err
 	}
-	svcs, err := c.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
-	if err != nil || len(svcs.Items) > 0 {
+	for _, o := range deps.Items {
+		if foreign(o.ObjectMeta) {
+			return false, nil
+		}
+	}
+	svcs, err := core.Services(ns).List(ctx, lo)
+	if err != nil {
 		return false, err
 	}
-	cms, err := c.CoreV1().ConfigMaps(ns).List(ctx, metav1.ListOptions{})
+	for _, o := range svcs.Items {
+		if foreign(o.ObjectMeta) {
+			return false, nil
+		}
+	}
+	cms, err := core.ConfigMaps(ns).List(ctx, lo)
 	if err != nil {
 		return false, err
 	}
 	for _, o := range cms.Items {
-		if o.Name != "kube-root-ca.crt" {
+		if o.Name != "kube-root-ca.crt" && foreign(o.ObjectMeta) {
 			return false, nil
 		}
 	}
-	secs, err := c.CoreV1().Secrets(ns).List(ctx, metav1.ListOptions{})
+	secs, err := core.Secrets(ns).List(ctx, lo)
 	if err != nil {
 		return false, err
 	}
 	for _, o := range secs.Items {
-		if o.Type != corev1.SecretTypeServiceAccountToken {
+		if o.Type != corev1.SecretTypeServiceAccountToken && foreign(o.ObjectMeta) {
 			return false, nil
 		}
 	}
-	return !strings.HasPrefix(ns, "kube-"), nil
+	sas, err := core.ServiceAccounts(ns).List(ctx, lo)
+	if err != nil {
+		return false, err
+	}
+	for _, o := range sas.Items {
+		if o.Name != "default" && foreign(o.ObjectMeta) {
+			return false, nil
+		}
+	}
+	sts, err := apps.StatefulSets(ns).List(ctx, lo)
+	if err != nil || len(sts.Items) > 0 {
+		return false, err
+	}
+	dss, err := apps.DaemonSets(ns).List(ctx, lo)
+	if err != nil || len(dss.Items) > 0 {
+		return false, err
+	}
+	jobs, err := c.BatchV1().Jobs(ns).List(ctx, lo)
+	if err != nil || len(jobs.Items) > 0 {
+		return false, err
+	}
+	cjs, err := c.BatchV1().CronJobs(ns).List(ctx, lo)
+	if err != nil || len(cjs.Items) > 0 {
+		return false, err
+	}
+	pvcs, err := core.PersistentVolumeClaims(ns).List(ctx, lo)
+	if err != nil || len(pvcs.Items) > 0 {
+		return false, err
+	}
+	ings, err := c.NetworkingV1().Ingresses(ns).List(ctx, lo)
+	if err != nil || len(ings.Items) > 0 {
+		return false, err
+	}
+	roles, err := c.RbacV1().Roles(ns).List(ctx, lo)
+	if err != nil || len(roles.Items) > 0 {
+		return false, err
+	}
+	rbs, err := c.RbacV1().RoleBindings(ns).List(ctx, lo)
+	if err != nil || len(rbs.Items) > 0 {
+		return false, err
+	}
+	// Replica sets and pods that cutover's Deployment created are
+	// cleaned up with it; any other is somebody's.
+	ownedRS := map[string]bool{}
+	rss, err := apps.ReplicaSets(ns).List(ctx, lo)
+	if err != nil {
+		return false, err
+	}
+	for _, o := range rss.Items {
+		if !slices.ContainsFunc(o.OwnerReferences, func(r metav1.OwnerReference) bool {
+			return r.Kind == "Deployment" && r.Name == d.name()
+		}) {
+			return false, nil
+		}
+		ownedRS[o.Name] = true
+	}
+	pods, err := core.Pods(ns).List(ctx, lo)
+	if err != nil {
+		return false, err
+	}
+	for _, o := range pods.Items {
+		if !slices.ContainsFunc(o.OwnerReferences, func(r metav1.OwnerReference) bool {
+			return r.Kind == "ReplicaSet" && ownedRS[r.Name]
+		}) {
+			return false, nil
+		}
+	}
+	return true, nil
 }

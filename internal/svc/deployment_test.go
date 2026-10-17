@@ -10,11 +10,13 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/SaiPisey2/cutover/internal/plan"
 )
@@ -283,5 +285,142 @@ func TestDeploymentFactsListContainerPorts(t *testing.T) {
 	want := []string{"2112/TCP", "9090/UDP", "http:8080/TCP"}
 	if !slices.Equal(facts.Ports, want) {
 		t.Fatalf("ports %v, want %v", facts.Ports, want)
+	}
+}
+
+func prepared(t *testing.T, objs []runtime.Object, tgt *fake.Clientset) deployment {
+	t.Helper()
+	p, s := deployPlan()
+	d, _ := For(p, s)
+	if err := d.Prepare(context.Background(), kubeSide(fake.NewClientset(objs...)), kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	return d.(deployment)
+}
+
+func TestDeploymentPrepareKeepsHeadlessService(t *testing.T) {
+	objs := sourceObjects()
+	objs = append(objs, &corev1.Service{ObjectMeta: meta("worker-hl"), Spec: corev1.ServiceSpec{
+		Selector: map[string]string{"app": "worker"}, ClusterIP: corev1.ClusterIPNone, ClusterIPs: []string{corev1.ClusterIPNone}}})
+	tgt := fake.NewClientset()
+	prepared(t, objs, tgt)
+	hl, err := tgt.CoreV1().Services("shop").Get(context.Background(), "worker-hl", metav1.GetOptions{})
+	if err != nil || hl.Spec.ClusterIP != corev1.ClusterIPNone || len(hl.Spec.ClusterIPs) != 1 || hl.Spec.ClusterIPs[0] != corev1.ClusterIPNone {
+		t.Fatalf("headless service %+v %v", hl, err)
+	}
+}
+
+func TestDeploymentRefRequiredWinsOverOptional(t *testing.T) {
+	p, s := deployPlan()
+	d, _ := For(p, s)
+	objs := sourceObjects()
+	for _, o := range objs {
+		if dep, ok := o.(*appsv1.Deployment); ok {
+			// "maybe" is already referenced optionally; add a required reference.
+			dep.Spec.Template.Spec.Containers[0].EnvFrom = append(dep.Spec.Template.Spec.Containers[0].EnvFrom,
+				corev1.EnvFromSource{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "maybe"}}})
+		}
+	}
+	facts, err := d.Inspect(context.Background(), kubeSide(fake.NewClientset(objs...)), kubeSide(fake.NewClientset()))
+	if err != nil || !codes(facts.Findings)["k8s-ref-missing"] {
+		t.Fatalf("want k8s-ref-missing, got %+v %v", facts.Findings, err)
+	}
+}
+
+func TestDeploymentPrepareReturnsClientErrors(t *testing.T) {
+	p, s := deployPlan()
+	d, _ := For(p, s)
+	bad := Side{Kube: func(context.Context) (kubernetes.Interface, error) { return nil, errors.New("no client") }}
+	if err := d.Prepare(context.Background(), kubeSide(fake.NewClientset(sourceObjects()...)), bad); err == nil {
+		t.Fatal("a target client error must surface")
+	}
+}
+
+func TestDeploymentPrepareBlocksWhenObjectAppearsAfterInspect(t *testing.T) {
+	p, s := deployPlan()
+	d, _ := For(p, s)
+	tgt := fake.NewClientset()
+	tgt.PrependReactor("create", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		tgt.Tracker().Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "worker-cfg", Namespace: "shop"}})
+		return true, nil, apierrors.NewAlreadyExists(corev1.Resource("configmaps"), "worker-cfg")
+	})
+	err := d.Prepare(context.Background(), kubeSide(fake.NewClientset(sourceObjects()...)), kubeSide(tgt))
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestDeploymentUndoLeavesOtherPlansAndServices(t *testing.T) {
+	ctx := context.Background()
+	mark := func(name, plan, svc string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "shop",
+			Labels:      map[string]string{ManagedByLabel: ManagedBy},
+			Annotations: map[string]string{PlanAnnotation: plan, ServiceAnnotation: svc}}}
+	}
+	tgt := fake.NewClientset(mark("other-plan", "other", "worker"), mark("other-svc", "shop", "billing"))
+	d := prepared(t, sourceObjects(), tgt)
+	if err := d.Undo(ctx, kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"other-plan", "other-svc"} {
+		if _, err := tgt.CoreV1().ConfigMaps("shop").Get(ctx, n, metav1.GetOptions{}); err != nil {
+			t.Errorf("undo removed %s: %v", n, err)
+		}
+	}
+	if _, err := tgt.CoreV1().ConfigMaps("shop").Get(ctx, "worker-cfg", metav1.GetOptions{}); err == nil {
+		t.Error("own config map survived")
+	}
+}
+
+func TestDeploymentUndoKeepsOwnNamespaceWithForeignWorkloads(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		obj  func() runtime.Object
+	}{
+		{"statefulset", func() runtime.Object {
+			return &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "shop"}}
+		}},
+		{"pvc", func() runtime.Object {
+			return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "shop"}}
+		}},
+	} {
+		tgt := fake.NewClientset()
+		d := prepared(t, sourceObjects(), tgt)
+		if err := tgt.Tracker().Add(tc.obj()); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Undo(ctx, kubeSide(tgt)); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if _, err := tgt.CoreV1().Namespaces().Get(ctx, "shop", metav1.GetOptions{}); err != nil {
+			t.Errorf("%s: namespace deleted although it holds foreign data", tc.name)
+		}
+	}
+}
+
+func TestDeploymentUndoIgnoresOwnReplicaSetsAndPods(t *testing.T) {
+	ctx := context.Background()
+	tgt := fake.NewClientset()
+	d := prepared(t, sourceObjects(), tgt)
+	tgt.Tracker().Add(&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "worker-abc", Namespace: "shop",
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "worker"}}}})
+	tgt.Tracker().Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-abc-1", Namespace: "shop",
+		OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "worker-abc"}}}})
+	if err := d.Undo(ctx, kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.CoreV1().Namespaces().Get(ctx, "shop", metav1.GetOptions{}); err == nil {
+		t.Fatal("namespace with only cutover's workload leftovers should be deleted")
+	}
+	// A pod nobody of ours owns keeps the namespace.
+	tgt = fake.NewClientset()
+	d = prepared(t, sourceObjects(), tgt)
+	tgt.Tracker().Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "stray", Namespace: "shop"}})
+	if err := d.Undo(ctx, kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.CoreV1().Namespaces().Get(ctx, "shop", metav1.GetOptions{}); err != nil {
+		t.Fatal("namespace with a stray pod was deleted")
 	}
 }
