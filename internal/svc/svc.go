@@ -87,25 +87,11 @@ func blocked(fs []Finding) error {
 	return nil
 }
 
-type systemd struct {
-	plan string
-	svc  plan.Service
-}
 type deployment struct {
 	plan string
 	svc  plan.Service
 }
 
-func (systemd) Inspect(context.Context, Side, Side) (Facts, error) {
-	return Facts{}, errors.New("systemd: not built yet")
-}
-func (systemd) Prepare(context.Context, Side, Side) error {
-	return errors.New("systemd: not built yet")
-}
-func (systemd) Healthy(context.Context, Side) (bool, string, error) {
-	return false, "", errors.New("systemd: not built yet")
-}
-func (systemd) Undo(context.Context, Side) error { return errors.New("systemd: not built yet") }
 func (deployment) Inspect(context.Context, Side, Side) (Facts, error) {
 	return Facts{}, errors.New("deployment: not built yet")
 }
