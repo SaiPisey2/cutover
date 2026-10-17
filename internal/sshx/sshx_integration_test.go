@@ -140,3 +140,39 @@ func TestCancelStopsCommand(t *testing.T) {
 		t.Fatalf("cancelled command: %v after %s", err, time.Since(began))
 	}
 }
+
+// A transfer cut short must never leave a partial file at the target,
+// with or without sudo.
+func TestCancelledWriteNeverReplacesTarget(t *testing.T) {
+	for _, tc := range []struct{ user, dir string }{{"cutover", "/srv/cutover-cancel"}, {"nosudo", "/home/nosudo"}} {
+		t.Run(tc.user, func(t *testing.T) {
+			c := dial(t, tc.user)
+			bg := context.Background()
+			fresh, existing := tc.dir+"/fresh.bin", tc.dir+"/existing.bin"
+			if err := c.WriteFile(bg, existing, 0o644, []byte("original")); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				c.Run(bg, c.Root("rm -f "+sshx.Quote(fresh)+" "+sshx.Quote(existing)+" "+sshx.Quote(tc.dir)+"/*.cutover-*"), nil)
+			})
+			big := make([]byte, 128<<20)
+			rand.Read(big)
+			for _, target := range []string{fresh, existing} {
+				ctx, cancel := context.WithTimeout(bg, 100*time.Millisecond)
+				err := c.WriteFile(ctx, target, 0o644, big)
+				cancel()
+				if err == nil {
+					t.Fatal("write finished before the cancel; payload too small")
+				}
+			}
+			time.Sleep(3 * time.Second) // let any orphaned remote shell finish
+			if ok, _ := c.Exists(bg, fresh); ok {
+				t.Fatal("partial file appeared at a new target")
+			}
+			got, err := c.ReadFile(bg, existing)
+			if err != nil || string(got) != "original" {
+				t.Fatalf("existing file changed: %d bytes %v", len(got), err)
+			}
+		})
+	}
+}

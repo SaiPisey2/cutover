@@ -3,8 +3,12 @@ package sshx
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +18,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/secret"
@@ -86,5 +91,40 @@ func TestDialHandshakeBoundedByContext(t *testing.T) {
 	}
 	if d := time.Since(began); d > 3*time.Second {
 		t.Fatalf("Dial took %s", d)
+	}
+}
+
+func TestHostKeysMatchesHashedEntry(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	k, _ := ssh.NewPublicKey(pub)
+	addr := "127.0.0.1:2222"
+	salt := []byte("0123456789abcdef0123")
+	m := hmac.New(sha1.New, salt)
+	m.Write([]byte(knownhosts.Normalize(addr)))
+	host := "|1|" + base64.StdEncoding.EncodeToString(salt) + "|" + base64.StdEncoding.EncodeToString(m.Sum(nil))
+	file := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(file, []byte(host+" "+string(ssh.MarshalAuthorizedKey(k))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, algos, err := hostKeys(file, addr)
+	if err != nil || len(algos) != 1 || algos[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("algos %v err %v", algos, err)
+	}
+	if _, _, err := hostKeys(file, "127.0.0.1:2223"); err == nil {
+		t.Fatal("a different port must not match the hashed entry")
+	}
+}
+
+func TestRelativePathsRejected(t *testing.T) {
+	c := &Client{}
+	ctx := context.Background()
+	if err := c.WriteFile(ctx, "rel/x", 0o600, []byte("x")); !errors.Is(err, errNotAbs) {
+		t.Fatal(err)
+	}
+	if _, err := c.ReadFile(ctx, "rel"); !errors.Is(err, errNotAbs) {
+		t.Fatal(err)
+	}
+	if _, err := c.Exists(ctx, "-rf"); !errors.Is(err, errNotAbs) {
+		t.Fatal(err)
 	}
 }

@@ -8,6 +8,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -103,6 +108,11 @@ func Dial(ctx context.Context, h plan.Host) (*Client, error) {
 	cc, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 	close(stop)
 	<-stopped
+	if err == nil && ctx.Err() != nil {
+		cc.Close()
+		conn.Close()
+		return nil, fmt.Errorf("ssh %s: %w", addr, ctx.Err())
+	}
 	if err != nil {
 		conn.Close()
 		if ctx.Err() != nil {
@@ -132,15 +142,10 @@ func hostKeys(file, addr string) (ssh.HostKeyCallback, []string, error) {
 	}
 	want := knownhosts.Normalize(addr)
 	var algos []string
-	hashed := false
 	sc := bufio.NewScanner(bytes.NewReader(b))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "|1|") {
-			hashed = true
 			continue
 		}
 		_, hosts, key, _, _, err := ssh.ParseKnownHosts([]byte(line))
@@ -148,7 +153,7 @@ func hostKeys(file, addr string) (ssh.HostKeyCallback, []string, error) {
 			continue
 		}
 		for _, h := range hosts {
-			if h == want {
+			if h == want || hashedMatch(h, want) {
 				switch t := key.Type(); t {
 				case ssh.KeyAlgoRSA:
 					algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
@@ -158,13 +163,33 @@ func hostKeys(file, addr string) (ssh.HostKeyCallback, []string, error) {
 			}
 		}
 	}
-	if len(algos) == 0 && !hashed {
-		return nil, nil, fmt.Errorf("ssh %s is not in %s; add its key (check it first) before cutover connects", addr, file)
+	if err := sc.Err(); err != nil {
+		return nil, nil, fmt.Errorf("known_hosts %s: %w", file, err)
 	}
 	if len(algos) == 0 {
-		algos = nil // hashed entries: let the callback decide
+		return nil, nil, fmt.Errorf("ssh %s is not in %s; add its key (check it first) before cutover connects", addr, file)
 	}
 	return cb, algos, nil
+}
+
+// hashedMatch reports whether h is an OpenSSH hashed known_hosts host
+// (|1|salt|hash) for the normalized name want.
+func hashedMatch(h, want string) bool {
+	parts := strings.Split(h, "|")
+	if len(parts) != 4 || parts[1] != "1" {
+		return false
+	}
+	salt, err := base64.StdEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	sum, err := base64.StdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	m := hmac.New(sha1.New, salt)
+	m.Write([]byte(want))
+	return hmac.Equal(m.Sum(nil), sum)
 }
 
 // limited keeps at most max bytes and records whether more arrived.
@@ -195,7 +220,11 @@ func (l *limited) Write(p []byte) (int, error) {
 }
 
 // Run runs cmd in a new session. stdin, when not nil, is fed to the
-// command and never echoed anywhere. A cancelled ctx kills the command.
+// command and never echoed anywhere. A cancelled ctx abandons the
+// session: the remote command may keep running (under sudo the kill
+// reaches sudo, not its child), and a WriteFile temp file may be left
+// behind. The checksum in WriteFile guarantees the target is never
+// replaced by a partial file.
 func (c *Client) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, error) {
 	s, err := c.c.NewSession()
 	if err != nil {
@@ -249,28 +278,47 @@ func (c *Client) Root(cmd string) string {
 	return "sh -c " + Quote(cmd)
 }
 
+var errNotAbs = errors.New("ssh path must be absolute")
+
 // WriteFile replaces p atomically: a temp file in the same directory,
-// mode set, synced, then renamed over p. Parent directories are created.
+// filled, verified against the sha256 of data, mode set, synced, then
+// renamed over p. A transfer cut short fails the check and leaves p
+// untouched. Parent directories are created.
 func (c *Client) WriteFile(ctx context.Context, p string, mode os.FileMode, data []byte) error {
+	if !path.IsAbs(p) {
+		return fmt.Errorf("%w: %q", errNotAbs, p)
+	}
+	sum := sha256.Sum256(data)
 	script := fmt.Sprintf(`set -e
-mkdir -p %s
-t=$(mktemp %s)
-trap 'rm -f "$t"' EXIT
+mkdir -p -- %s
+t=$(mktemp -- %s)
+trap 'rm -f -- "$t"' EXIT
 cat > "$t"
+got=$(sha256sum < "$t")
+if [ "${got%%%% *}" != %s ]; then echo "checksum mismatch: transfer incomplete" >&2; exit 1; fi
 chmod %o "$t"
 sync
-mv -f "$t" %s
+mv -f -- "$t" %s
 trap - EXIT
-sync`, Quote(path.Dir(p)), Quote(p+".cutover-XXXXXX"), mode.Perm(), Quote(p))
+sync`, Quote(path.Dir(p)), Quote(p+".cutover-XXXXXX"), Quote(hex.EncodeToString(sum[:])), mode.Perm(), Quote(p))
+	if data == nil {
+		data = []byte{}
+	}
 	_, err := c.Run(ctx, c.Root(script), data)
 	return err
 }
 
 func (c *Client) ReadFile(ctx context.Context, p string) ([]byte, error) {
-	return c.Run(ctx, c.Root("cat "+Quote(p)), nil)
+	if !path.IsAbs(p) {
+		return nil, fmt.Errorf("%w: %q", errNotAbs, p)
+	}
+	return c.Run(ctx, c.Root("cat -- "+Quote(p)), nil)
 }
 
 func (c *Client) Exists(ctx context.Context, p string) (bool, error) {
+	if !path.IsAbs(p) {
+		return false, fmt.Errorf("%w: %q", errNotAbs, p)
+	}
 	out, err := c.Run(ctx, c.Root("if test -e "+Quote(p)+"; then echo yes; else echo no; fi"), nil)
 	if err != nil {
 		return false, err
