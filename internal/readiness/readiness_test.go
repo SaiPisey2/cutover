@@ -261,3 +261,23 @@ func TestPoolRouteDefaults(t *testing.T) {
 		t.Fatalf("default port 5432 and dbname app must match: %+v", r.Findings)
 	}
 }
+
+// A rollback syncs sequences from the target back to the source. One the
+// target has and the source lacks would abort it once used, so say so now.
+func TestSequenceOnlyOnTarget(t *testing.T) {
+	in := good()
+	in.Target.Sequences = append(in.Target.Sequences, pg.Sequence{Schema: "public", Name: "audit_seq", Increment: 1})
+	r := Assess(in)
+	if r.Blocked() {
+		t.Fatalf("must not block: %+v", r.Findings)
+	}
+	found := false
+	for _, f := range r.Findings {
+		if f.Code == "sequence-target-only" && f.Severity == Warning && f.Subject == "public.audit_seq" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want sequence-target-only warning: %+v", r.Findings)
+	}
+}

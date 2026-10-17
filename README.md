@@ -26,10 +26,14 @@ shifting, the web console and the end-to-end demo are next.
   sentinel writes and the sequence sync run while PgBouncer holds writes
 - the source `dsn` role is a superuser or a member of `pg_read_all_stats`, or
   sessions that bypass PgBouncer cannot be seen (readiness warns
-  `direct-clients-unchecked`); the role needs `SELECT` on every sequence in
-  the plan's schemas
+  `direct-clients-unchecked`)
+- both `dsn` roles have `SELECT` on every sequence in the plan's schemas
+  (sequences are synced in both directions)
 - sequences not owned by a plan table (standalone ones) already exist on the
-  target: Prepare copies only the plan tables and the sequences they own
+  target: Prepare copies only the plan tables and the sequences they own.
+  A sequence only the target has is fine until something uses it; after
+  that a rollback cannot sync it back (readiness warns
+  `sequence-target-only`)
 - a Temporal server (`temporal server start-dev` is enough to try it)
 
 ## Try it

@@ -134,9 +134,17 @@ func Assess(in Input) Report {
 			add(Blocker, "extension-missing", e.Name, "extension %s is on the source but not the target; run CREATE EXTENSION %s on the target first", e.Name, e.Name)
 		}
 	}
-	onTarget := map[string]bool{}
+	onTarget, onSource := map[string]bool{}, map[string]bool{}
 	for _, s := range tgt.Sequences {
 		onTarget[s.Qualified()] = true
+	}
+	for _, s := range src.Sequences {
+		onSource[s.Qualified()] = true
+	}
+	for _, s := range tgt.Sequences {
+		if !onSource[s.Qualified()] {
+			add(Warning, "sequence-target-only", s.Qualified(), "%s is on the target but not the source; if anything uses it after the switch, a rollback cannot sync it back and will stop, so create it on the source too", s.Qualified())
+		}
 	}
 	for _, s := range src.Sequences {
 		if !onTarget[s.Qualified()] && !slices.Contains(r.Tables, s.OwnedBy) {

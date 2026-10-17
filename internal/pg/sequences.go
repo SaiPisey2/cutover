@@ -42,12 +42,15 @@ func SyncSequences(ctx context.Context, from, to *pgx.Conn, schemas []string, ma
 		if s.Increment < 0 {
 			return nil, fmt.Errorf("sequence %s: descending sequences are not supported", s.Qualified())
 		}
+		// Never used: nothing to carry, even if the other side lacks it. A
+		// switch-back runs this from the target, which may hold sequences
+		// the source never had.
+		if s.LastValue == nil {
+			continue
+		}
 		d, ok := have[s.Qualified()]
 		if !ok {
 			return nil, fmt.Errorf("sequence %s: missing on the new primary", s.Qualified())
-		}
-		if s.LastValue == nil {
-			continue
 		}
 		if *s.LastValue > math.MaxInt64-margin {
 			return nil, fmt.Errorf("sequence %s: last value %d plus margin %d overflows", s.Qualified(), *s.LastValue, margin)

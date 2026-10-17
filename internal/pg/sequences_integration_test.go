@@ -180,3 +180,25 @@ func TestSyncSequencesNotCalled(t *testing.T) {
 		t.Fatalf("source must be untouched: %d %v", srcNext, err)
 	}
 }
+
+// A switch-back syncs from the target to the source. A sequence only the
+// target has, never used, has nothing to carry and must not abort it; a
+// used one would leave the source behind, so it still errors.
+func TestSyncSequencesOneSidedUnused(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	if _, err := tgt.Exec(ctx, "CREATE SEQUENCE public.local_only"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.SyncSequences(ctx, tgt, src, []string{"public"}, 1000); err != nil {
+		t.Fatalf("unused sequence missing on the other side must be skipped: %v", err)
+	}
+	if _, err := tgt.Exec(ctx, "SELECT nextval('public.local_only')"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pg.SyncSequences(ctx, tgt, src, []string{"public"}, 1000)
+	if err == nil || !strings.Contains(err.Error(), "public.local_only") {
+		t.Fatalf("used sequence missing on the other side must error naming it: %v", err)
+	}
+}
