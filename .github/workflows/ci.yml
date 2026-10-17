@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# Nothing here writes to the repository. Actions are pinned to commit SHAs
+# because a tag like @v7 can be moved by its owner at any time.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27'
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo "gofmt found unformatted files" >&2
+            exit 1
+          fi
+      - run: make vet
+      - run: make test
+      - run: CGO_ENABLED=0 go build ./cmd/cutover
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27'
+      # pg_dump refuses a server newer than itself, and the harness runs
+      # Postgres 17. The runner ships an older client.
+      - name: Install Postgres 17 client
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+      # The crash tests start a real Temporal dev server. Pinned to the
+      # version they were verified against, checked against its checksum.
+      - name: Install Temporal CLI 1.7.2
+        run: |
+          curl -fsSLo temporal.tgz https://github.com/temporalio/cli/releases/download/v1.7.2/temporal_cli_1.7.2_linux_amd64.tar.gz
+          echo "e2f548af84e820b7d71f25fc6461a4e6a1ab7cdb6a80fde3c375641b0772375b  temporal.tgz" | sha256sum -c -
+          tar -xzf temporal.tgz temporal
+          sudo mv temporal /usr/local/bin/temporal
+          rm temporal.tgz
+          temporal --version
+      - run: make itest-up
+      - run: make itest
+      - name: Container logs
+        if: failure()
+        run: docker compose -f test/compose.yaml logs --no-color --tail 200
+      - if: always()
+        run: make itest-down
+
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check commit trailers
+        run: |
+          if git log --format='%H %B' | grep -iE 'co-authored-by:|generated with|noreply@'; then
+            echo "commit history contains an attribution trailer" >&2
+            exit 1
+          fi
+          echo "history clean"
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27'
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
