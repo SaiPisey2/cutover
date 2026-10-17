@@ -59,6 +59,7 @@ func TestServerFlags(t *testing.T) {
 		{[]string{"server", "--state", state, "--token-file", tokenFile(t, "short")}, "at least 16"},
 		{[]string{"server", "--state", state, "--token-file", tokenFile(t, "0123456789abcdef"), "--api", "0.0.0.0:7600"}, "loopback"},
 		{[]string{"server", "--state", state, "--token-file", tokenFile(t, "0123456789abcdef"), "--listen", "frontdoor:8080"}, "--listen"},
+		{[]string{"server", "--state", state, "--token-file", tokenFile(t, "0123456789abcdef"), "--xds", "0.0.0.0:18000"}, "loopback"},
 	} {
 		code, _, errb := exec(tc.args...)
 		if code != 2 || !strings.Contains(errb, tc.want) {
@@ -207,5 +208,24 @@ func TestServerRefusesNonLoopbackAdmin(t *testing.T) {
 		"--envoy-admin", "http://10.0.0.5:9901"}
 	if code, _, errb := exec(args...); code != 2 || !strings.Contains(errb, "--envoy-admin") {
 		t.Fatalf("%d %q", code, errb)
+	}
+}
+
+func TestRouteApplyIsAllOrNothing(t *testing.T) {
+	noDial(t)
+	f := &fakeAPI{routes: []frontdoor.Route{{Owner: "shop", Service: "web", Host: "www.example.com", Prefix: "/", HealthPath: "/healthz",
+		Source: &frontdoor.Upstream{Address: "10.0.1.21", Port: 8080}, TargetWeight: 10}}}
+	p := routePlan(t, f.start(t))
+	b, _ := os.ReadFile(p)
+	b = append(b, []byte(`  - name: web
+    kind: external
+    route: {host: www.example.com, health_path: /healthz}
+    source: {endpoint: 10.0.1.21:8080}
+    target: {endpoint: 10.8.0.21:8080}
+`)...)
+	os.WriteFile(p, b, 0o600)
+	code, _, errb := exec("route", "apply", "--plan", p)
+	if code != 1 || !strings.Contains(errb, "in use by a migration") || len(f.puts) != 0 {
+		t.Fatalf("%d %q %+v", code, errb, f.puts)
 	}
 }

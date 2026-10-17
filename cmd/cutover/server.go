@@ -70,11 +70,13 @@ func serverCmd(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	xl, err := frontdoor.ListenXDS(*xdsAddr)
 	if err != nil {
+		x.Stop()
 		return err
 	}
 	al, err := frontdoor.ListenAPI(*apiAddr)
 	if err != nil {
 		xl.Close()
+		x.Stop()
 		return err
 	}
 	api := &frontdoor.API{XDS: x, Admin: &frontdoor.Admin{Base: strings.TrimSuffix(*admin, "/"), HTTP: &http.Client{Timeout: 10 * time.Second}}, Token: token}
@@ -89,11 +91,12 @@ func serverCmd(ctx context.Context, args []string, stderr io.Writer) error {
 	select {
 	case <-ctx.Done():
 	case err := <-errs:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			x.Stop()
-			_ = hs.Close()
-			return err
+		x.Stop()
+		_ = hs.Close()
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			err = errors.New("a server stopped before it was asked to")
 		}
+		return err
 	}
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -157,6 +160,9 @@ func routeCmd(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 		return nil
 	}
+	// Check every service before applying any, so a busy route leaves
+	// the front door untouched.
+	var wants []frontdoor.Route
 	for _, s := range p.RoutedServices() {
 		want, err := frontdoor.FromPlan(p, s, frontdoor.Desired{Source: true})
 		if err != nil {
@@ -167,6 +173,9 @@ func routeCmd(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 				return fmt.Errorf("route %s is in use by a migration; it changes only through the migration", r.Key())
 			}
 		}
+		wants = append(wants, want)
+	}
+	for _, want := range wants {
 		if err := c.Apply(ctx, want); err != nil {
 			return err
 		}

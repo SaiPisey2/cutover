@@ -115,13 +115,13 @@ The example plan reads its credentials from `CUTOVER_SOURCE_DSN`,
 from the files `/etc/cutover/source-repl-dsn` and `/etc/cutover/target-repl-dsn`
 (create them, one DSN each). Edit the plan to match your setup.
 
-Run the worker on the PgBouncer host (or wherever the routes file is
-shared with PgBouncer), since it rewrites that file at the switch; the CLI
-commands can run anywhere that reaches Temporal.
+Run the worker on the PgBouncer host, or anywhere that reaches it over SSH
+when `database.pgbouncer.host` is set, since it rewrites the routes file at
+the switch; the CLI commands can run anywhere that reaches Temporal.
 
 ```bash
 temporal server start-dev --ip 127.0.0.1 &
-go run ./cmd/cutover worker &   # on the host that shares routes_file with PgBouncer
+go run ./cmd/cutover worker &   # on the PgBouncer host, or one that reaches it over SSH
 go run ./cmd/cutover migrate --plan examples/plan.yaml
 go run ./cmd/cutover status shop
 go run ./cmd/cutover gate shop discover approve --as alice
