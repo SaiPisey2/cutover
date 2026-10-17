@@ -1,7 +1,6 @@
 package flow
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -267,7 +266,7 @@ func (r *runner) hold() (traffic.Verdict, error) {
 	}
 	var start []ops.ServiceCounters
 	if err := r.sample(&start); err != nil {
-		if errors.Is(err, errRollback) || r.ctx.Err() != nil {
+		if r.ctx.Err() != nil {
 			return traffic.Verdict{}, err
 		}
 		return blind(err), nil
@@ -321,6 +320,11 @@ func (r *runner) judge(ts []ServiceTraffic) ([]ServiceTraffic, traffic.Verdict) 
 			refP99 = max(refP99, base.Target.P99Ms)
 		}
 		v := traffic.Judge(refRate, refP99, t.Target, lim)
+		if v.Judged && !v.Tripped && refP99 == 0 && t.Target.P99Known {
+			// No reference to hold the target's latency against: passing
+			// on error rate alone is not a judgement.
+			v = traffic.Verdict{Reason: "no reference p99 (the source has no latency data), so the target's latency cannot be judged"}
+		}
 		v.Reason = t.Service + ": " + v.Reason
 		ts[i].Verdict = &v
 		if v.Tripped && !all.Tripped {

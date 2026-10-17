@@ -224,6 +224,9 @@ func TestShiftTripsAndRollsBack(t *testing.T) {
 		t.Fatalf("weight must return to 0 after the trip: %q", l)
 	}
 	tail := c.since("traffic:api:s0")
+	if len(tail) < 3 {
+		t.Fatalf("the unwind must route api back to the source, then undo both services: %q", l)
+	}
 	assertCalls(t, tail[:3], []string{"traffic:api:s0", "undo-svc:worker", "undo-svc:api"})
 	for _, e := range r.Events {
 		if e.Kind == "shift-tripped" && !strings.Contains(e.Message, "api: target error rate") {
@@ -370,5 +373,184 @@ func TestPrepareServiceFailureOpensRetryGate(t *testing.T) {
 	r := startServices(t, env, servicesPlan(), steps)
 	if r.State != StateFinished || c.count("prep:api") != 2 {
 		t.Fatalf("%s %q", r.State, c.list())
+	}
+}
+
+// latBuckets are the histogram bounds the latency tests use, in ms.
+var latBuckets = []float64{10, 20, 50, 100, 200}
+
+// lat returns cumulative histogram counters: for each (le, n) pair, n
+// requests that took at most le ms.
+func lat(pairs ...float64) *traffic.Counters {
+	c := &traffic.Counters{}
+	for _, le := range latBuckets {
+		c.Buckets = append(c.Buckets, traffic.Bucket{LE: le})
+	}
+	for i := 0; i < len(pairs); i += 2 {
+		le, n := pairs[i], uint64(pairs[i+1])
+		c.Requests += n
+		c.LatencyCount += n
+		for j := range c.Buckets {
+			if c.Buckets[j].LE >= le {
+				c.Buckets[j].Count += n
+			}
+		}
+	}
+	return c
+}
+
+// latencySampler: the source always answers within 20ms. During Rehearse
+// the target answers within 50ms; in Shift its requests take up to stepMs.
+func latencySampler(stepMs float64) sampler {
+	return phases(batch{20, 1000}, batch{20, 1000}, batch{50, 500}, batch{stepMs, 500})
+}
+
+// Ruling B8: the reference p99 includes the baseline target p99 when the
+// target served min_requests during Rehearse. The target's 50ms there
+// makes 100ms within 2x; against the source's 20ms alone it would trip.
+func TestShiftP99ReferenceIncludesBaselineTarget(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	s := latencySampler(60) // lands in the 100ms bucket
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	r := startServices(t, env, servicesPlan(), servicesHappy())
+	if r.State != StateFinished || slices.Contains(kinds(r.Events), "shift-tripped") || slices.Contains(kinds(r.Events), "shift-unjudged") {
+		t.Fatalf("%s %q", r.State, kinds(r.Events))
+	}
+}
+
+func TestShiftP99OverBaselineTargetTrips(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	s := latencySampler(120) // lands in the 200ms bucket: more than 2x 50ms
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	steps := []action{approve("discover", "alice"), approve("prepare", "alice"), approve("rehearse", "alice"),
+		approve("shift-10", "alice"), atGate("shift-tripped", "alice", Reject)}
+	r := startServices(t, env, servicesPlan(), steps)
+	if r.State != StateRolledBack {
+		t.Fatalf("%s %q", r.State, kinds(r.Events))
+	}
+	found := false
+	for _, e := range r.Events {
+		if e.Kind == "shift-tripped" && strings.Contains(e.Message, "api: target p99 200ms vs reference 50ms") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a p99 trip against the 50ms baseline target: %q", kinds(r.Events))
+	}
+}
+
+// With no reference p99 (the source reports no latency, in Rehearse or
+// now, and the target served too little in Rehearse to count), a target
+// with latency data is unjudged, so a preapproved ramp asks again rather
+// than advance on error rate alone.
+func TestShiftNoReferenceP99IsUnjudged(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	s := sampler(func(n uint64) []ops.ServiceCounters {
+		target := 10 * min(n, 2) // 10 requests in the Rehearse window
+		if n > 2 {
+			target += 500 * (n - 2)
+		}
+		return []ops.ServiceCounters{{Service: "api",
+			Source: &traffic.Counters{Requests: 1000 * n},
+			Target: ctr(target, 0, 20)}}
+	})
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	p := servicesPlan()
+	p.Thresholds.Shift.Preapprove = true
+	r := startServices(t, env, p, servicesHappy())
+	if r.State != StateFinished {
+		t.Fatalf("%s %q", r.State, kinds(r.Events))
+	}
+	found := false
+	for _, e := range r.Events {
+		if e.Kind == "shift-unjudged" && strings.Contains(e.Message, "api: no reference p99") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want shift-unjudged for a missing reference p99: %q", kinds(r.Events))
+	}
+	// servicesHappy approves shift-100: it only completes if that gate opened.
+}
+
+// phases builds a sampler from per-sample request batches: each side
+// gets n requests at most le ms per Rehearse sample (1-2), and another
+// batch per sample from the first Shift step's start (3) on.
+type batch struct {
+	le float64
+	n  uint64
+}
+
+func phases(srcRehearse, srcShift, tgtRehearse, tgtShift batch) sampler {
+	return func(n uint64) []ops.ServiceCounters {
+		rehearse, step := min(n, 2), uint64(0)
+		if n > 2 {
+			step = n - 2
+		}
+		side := func(r, s batch) *traffic.Counters {
+			return lat(r.le, float64(r.n*rehearse), s.le, float64(s.n*step))
+		}
+		return []ops.ServiceCounters{{Service: "api", Source: side(srcRehearse, srcShift), Target: side(tgtRehearse, tgtShift)}}
+	}
+}
+
+// preapprovedRamp runs a preapproved ramp that asks only at shift-10: it
+// finishes only if every step was judged and none tripped.
+func preapprovedRamp(t *testing.T, s sampler) Result {
+	t.Helper()
+	env := newEnv()
+	c := &calls{}
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	p := servicesPlan()
+	p.Thresholds.Shift.Preapprove = true
+	steps := []action{approve("discover", "alice"), approve("prepare", "alice"), approve("rehearse", "alice"),
+		approve("shift-10", "alice"), approve("switch", "alice"), approve("switch", "bob"), approve("finish", "alice")}
+	r := startServices(t, env, p, steps)
+	if r.State != StateFinished || slices.Contains(kinds(r.Events), "shift-tripped") || slices.Contains(kinds(r.Events), "shift-unjudged") {
+		t.Fatalf("%s %q", r.State, kinds(r.Events))
+	}
+	return r
+}
+
+// Ruling B8: when the source serves fewer than min_requests in the
+// window, the baseline source p99 (50ms) is the reference; the target
+// served too little in Rehearse to count. 100ms is within 2x.
+func TestShiftP99ReferenceFallsBackToBaselineSource(t *testing.T) {
+	preapprovedRamp(t, phases(batch{50, 1000}, batch{20, 10}, batch{20, 10}, batch{60, 500}))
+}
+
+// Ruling B8: this window's source p99 (50ms, over min_requests) counts
+// when it is above the baseline's (20ms). 100ms is within 2x of 50ms.
+func TestShiftP99ReferenceUsesWindowSource(t *testing.T) {
+	preapprovedRamp(t, phases(batch{20, 1000}, batch{50, 1000}, batch{20, 10}, batch{60, 500}))
+}
+
+// Ruling B8: a source that served fewer than min_requests in the window
+// does not set the reference, however slow its few requests were. The
+// target's 100ms trips against the baseline source's 20ms.
+func TestShiftP99IgnoresThinWindowSource(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	s := phases(batch{20, 1000}, batch{200, 10}, batch{20, 10}, batch{60, 500})
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	steps := []action{approve("discover", "alice"), approve("prepare", "alice"), approve("rehearse", "alice"),
+		approve("shift-10", "alice"), atGate("shift-tripped", "alice", Reject)}
+	r := startServices(t, env, servicesPlan(), steps)
+	found := false
+	for _, e := range r.Events {
+		if e.Kind == "shift-tripped" && strings.Contains(e.Message, "api: target p99 100ms vs reference 20ms") {
+			found = true
+		}
+	}
+	if r.State != StateRolledBack || !found {
+		t.Fatalf("%s %q", r.State, kinds(r.Events))
 	}
 }
