@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,7 +22,11 @@ type Client struct {
 
 // NewClient's timeout covers Apply's worst case: three ACK waits plus the drain.
 func NewClient(base, token string) *Client {
-	return &Client{Base: strings.TrimSuffix(base, "/"), Token: token, HTTP: &http.Client{Timeout: 3 * time.Minute}}
+	return &Client{Base: strings.TrimSuffix(base, "/"), Token: token, HTTP: &http.Client{
+		Timeout: 3 * time.Minute,
+		// never re-send the bearer token to a redirect target
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 type APIError struct {
@@ -40,7 +45,32 @@ func (e *APIError) Permanent() bool {
 	return false
 }
 
+// checkBase refuses to send the bearer token over plain http to a
+// non-loopback host.
+func checkBase(base string) error {
+	u, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("front door: bad base URL: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		h := u.Hostname()
+		if h == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return fmt.Errorf("front door: refusing to send the token to %q: use https, or http on a loopback address", base)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
+	if err := checkBase(c.Base); err != nil {
+		return err
+	}
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)

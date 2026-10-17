@@ -157,3 +157,35 @@ func TestListenAPIRefusesNonLoopback(t *testing.T) {
 		t.Fatal("refused")
 	}
 }
+
+func TestClientRefusesTokenOverRemoteHTTP(t *testing.T) {
+	_, err := NewClient("http://10.0.0.5:7600", "t").Routes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refusing to send the token") {
+		t.Fatalf("got %v", err)
+	}
+	for _, ok := range []string{"http://127.0.0.1:7600", "http://localhost", "http://[::1]:7600", "https://remote.example:7600"} {
+		if err := checkBase(ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://remote.example", "ftp://127.0.0.1", "127.0.0.1:7600"} {
+		if checkBase(bad) == nil {
+			t.Errorf("%s allowed", bad)
+		}
+	}
+}
+
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	hit := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit = true }))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	_, err := NewClient(srv.URL, "t").Routes(context.Background())
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != 307 || hit {
+		t.Fatalf("err %v hit %v", err, hit)
+	}
+}

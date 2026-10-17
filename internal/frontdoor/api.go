@@ -111,18 +111,22 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var h Health
-	for side, dst := range map[string]*string{SideSource: &h.Source, SideTarget: &h.Target} {
-		present := (side == SideSource && rt.Source != nil) || (side == SideTarget && rt.Target != nil)
-		if !present {
-			*dst = Absent
+	sides := []struct {
+		side string
+		has  bool
+		dst  *string
+	}{{SideSource, rt.Source != nil, &h.Source}, {SideTarget, rt.Target != nil, &h.Target}}
+	for _, s := range sides {
+		if !s.has {
+			*s.dst = Absent
 			continue
 		}
-		s, err := a.Admin.Health(r.Context(), ClusterName(rt.Owner, rt.Service, side))
+		st, err := a.Admin.Health(r.Context(), ClusterName(rt.Owner, rt.Service, s.side))
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		*dst = s
+		*s.dst = st
 	}
 	writeJSON(w, http.StatusOK, h)
 }
