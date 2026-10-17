@@ -177,3 +177,7 @@ make the two loop), or the forward link could not be restarted. Writes are
 on the source. A second switch is
 refused: the only way on is rollback. Approve the `replication-broken` gate
 (or reject it, or run `cutover rollback`); all three roll back.
+
+## License
+
+Apache 2.0
