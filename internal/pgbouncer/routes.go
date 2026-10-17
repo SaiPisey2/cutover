@@ -29,30 +29,36 @@ func HostOf(connstr string) string {
 	return kv["host"]
 }
 
-// WriteRoute atomically replaces the routes file pgbouncer.ini %includes.
-// cutover owns that file; it holds one [databases] entry on line 2, then a
-// comment padded so the file is exactly RoutesFileSize bytes. A route that
-// does not fit, or does not parse, is refused and the file is left alone.
-func WriteRoute(path, db, connstr string) error {
+// RouteWriter replaces the routes file at path with body: atomically,
+// durably, and nowhere else.
+type RouteWriter func(ctx context.Context, path, body string) error
+
+// RouteBody is the routes file for db: one [databases] entry on line 2,
+// then a comment padded so the file is exactly RoutesFileSize bytes. A
+// route that does not fit, or does not parse, is refused.
+func RouteBody(db, connstr string) (string, error) {
 	if err := checkName(db); err != nil {
-		return err
+		return "", err
 	}
 	if err := checkRoutePassword(connstr); err != nil {
-		return err
+		return "", err
 	}
 	if strings.ContainsAny(connstr, "\r\n") {
-		return fmt.Errorf("routes: newline in connection string")
+		return "", fmt.Errorf("routes: newline in connection string")
 	}
 	if _, err := route.Resolve(connstr, db); err != nil {
-		return fmt.Errorf("routes: %w", err)
+		return "", fmt.Errorf("routes: %w", err)
 	}
 	head := "[databases]\n" + db + " = " + connstr + "\n" + managedComment
 	pad := RoutesFileSize - len(head) - 1
 	if pad < 0 {
-		return fmt.Errorf("routes: route for %s is %d bytes too long for the %d-byte routes file", db, -pad, RoutesFileSize)
+		return "", fmt.Errorf("routes: route for %s is %d bytes too long for the %d-byte routes file", db, -pad, RoutesFileSize)
 	}
-	body := head + strings.Repeat(" ", pad) + "\n"
+	return head + strings.Repeat(" ", pad) + "\n", nil
+}
 
+// LocalWriter replaces path on this machine: temp file, fsync, rename.
+func LocalWriter(_ context.Context, path, body string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".routes-*")
 	if err != nil {
 		return fmt.Errorf("routes: %w", err)
@@ -79,6 +85,20 @@ func WriteRoute(path, db, connstr string) error {
 	return nil
 }
 
+// WriteRoute atomically replaces the local routes file pgbouncer.ini %includes.
+func WriteRoute(path, db, connstr string) error {
+	body, err := RouteBody(db, connstr)
+	if err != nil {
+		return err
+	}
+	return LocalWriter(context.Background(), path, body)
+}
+
+// Repoint is RepointWith the local writer.
+func Repoint(ctx context.Context, a *Admin, path, db, connstr string) error {
+	return RepointWith(ctx, a, LocalWriter, path, db, connstr)
+}
+
 // checkRoutePassword refuses a route with a password in it, as plan
 // validation does: the routes file is world-readable and PgBouncer
 // authenticates on its own.
@@ -98,7 +118,7 @@ func checkRoutePassword(connstr string) error {
 // RECONNECT is a safeguard: PgBouncer 1.24 already recycles server
 // connections when RELOAD changes a database's host, but versions or
 // changes where RELOAD does not would leave clients on the old database.
-func Repoint(ctx context.Context, a *Admin, path, db, connstr string) error {
+func RepointWith(ctx context.Context, a *Admin, w RouteWriter, path, db, connstr string) error {
 	if err := checkName(db); err != nil {
 		return err
 	}
@@ -109,7 +129,11 @@ func Repoint(ctx context.Context, a *Admin, path, db, connstr string) error {
 	if err != nil {
 		return fmt.Errorf("repoint %s: %w", db, err)
 	}
-	if err := WriteRoute(path, db, connstr); err != nil {
+	body, err := RouteBody(db, connstr)
+	if err != nil {
+		return err
+	}
+	if err := w(ctx, path, body); err != nil {
 		return err
 	}
 	if err := a.Reload(ctx); err != nil {

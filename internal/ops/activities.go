@@ -15,6 +15,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/readiness"
 	"github.com/SaiPisey2/cutover/internal/redact"
+	"github.com/SaiPisey2/cutover/internal/sshx"
 )
 
 // Activities has no fields: every call resolves what it needs from its input.
@@ -529,7 +530,16 @@ func (a *Activities) Repoint(ctx context.Context, in RepointIn) (err error) {
 		}
 		defer ad.Close(context.Background())
 		d := in.Plan.Database
-		return pgbouncer.Repoint(ctx, ad, d.PgBouncer.RoutesFile, d.Name, pgFor(in.Plan, in.To).Route)
+		w := pgbouncer.RouteWriter(pgbouncer.LocalWriter)
+		if h := d.PgBouncer.Host; h != nil {
+			c, err := sshx.Dial(ctx, *h)
+			if err != nil {
+				return fmt.Errorf("pgbouncer host: %w", err)
+			}
+			defer c.Close()
+			w = pgbouncer.SSHWriter(c)
+		}
+		return pgbouncer.RepointWith(ctx, ad, w, d.PgBouncer.RoutesFile, d.Name, pgFor(in.Plan, in.To).Route)
 	})
 }
 
