@@ -57,6 +57,9 @@ func TestServiceFindings(t *testing.T) {
 		{"busy", func(in *Input) {
 			in.Routes[0].Target, in.Routes[0].TargetWeight = &frontdoor.Upstream{Address: "10.8.0.20", Port: 8080}, 10
 		}, Blocker, "route-busy"},
+		{"finished route", func(in *Input) {
+			in.Routes[0].Source, in.Routes[0].Target, in.Routes[0].TargetWeight = nil, &frontdoor.Upstream{Address: "10.8.0.20", Port: 8080}, 100
+		}, Blocker, "route-not-registered"},
 		{"busy mirror", func(in *Input) { in.Routes[0].Mirror = true }, Blocker, "route-busy"},
 		{"mirror off", func(in *Input) { in.Plan.Services[0].MirrorMethods = []string{} }, Info, "mirror-off"},
 		{"dns error", func(in *Input) { in.DNS, in.DNSErr = nil, map[string]string{"shop.example.com": "no such host"} }, Blocker, "dns-lookup"},

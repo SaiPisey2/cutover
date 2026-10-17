@@ -107,7 +107,9 @@ type Status struct {
 	Weight int `json:"weight"`
 	// Traffic is the latest window: Rehearse's, or the current Shift step's.
 	Traffic []ServiceTraffic `json:"traffic,omitempty"`
-	Events  []Event          `json:"events"`
+	// ShiftVerdict is the last Shift window's verdict in one phrase, for the switch gate.
+	ShiftVerdict string  `json:"shift_verdict,omitempty"`
+	Events       []Event `json:"events"`
 }
 
 // ServiceTraffic is one routed service's traffic over a window: Rehearse's

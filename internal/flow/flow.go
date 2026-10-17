@@ -147,7 +147,7 @@ func (r *runner) run() error {
 		if err := r.step("schema-check", r.schemaCheck(tin)); err != nil {
 			return err
 		}
-		if err := r.gate("switch", "Switch the database to the target. Needs two different approvers. "+r.sessionCheck(), 2); err != nil {
+		if err := r.gate("switch", "Switch the database to the target. Needs two different approvers. "+r.sessionCheck()+r.shiftSummary(), 2); err != nil {
 			return err
 		}
 		ok, err := r.switchOver(ops.Source, ops.Target, fwd, rev, tables)
@@ -284,6 +284,15 @@ func (r *runner) sessionCheck() string {
 		return "Could not check sessions: " + message(err) + "."
 	}
 	return sc.Summary()
+}
+
+// shiftSummary is the last Shift window's verdict for the switch gate, or
+// nothing when Shift did not run.
+func (r *runner) shiftSummary() string {
+	if r.st.ShiftVerdict == "" {
+		return ""
+	}
+	return " Last shift window: " + r.st.ShiftVerdict + "."
 }
 
 func summarizeChecks(checks []pg.TableCheck) string {

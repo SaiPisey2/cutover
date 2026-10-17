@@ -122,7 +122,7 @@ type Shift struct {
 	Preapprove bool `yaml:"preapprove" json:"preapprove"`
 	// MaxErrorDelta is in percentage points of error rate.
 	MaxErrorDelta float64 `yaml:"max_error_delta" json:"max_error_delta"`
-	// MaxP99 is a factor of the reference p99 (see the plan's ruling B8).
+	// MaxP99 is a factor of the reference p99 (see judge in internal/flow).
 	MaxP99      float64  `yaml:"max_p99" json:"max_p99"`
 	MinRequests int      `yaml:"min_requests" json:"min_requests"`
 	SampleEvery Duration `yaml:"sample_every" json:"sample_every"`
@@ -265,6 +265,9 @@ func (p Plan) validateServices(bad func(string, ...any)) {
 				bad("%s: duplicate service name", at)
 			}
 			names[s.Name] = true
+			if s.Name == "systemd" {
+				bad("%s: the name \"systemd\" is reserved (systemd services keep their files under <plan>/systemd/)", at)
+			}
 		}
 		blocks := 0
 		for _, set := range []bool{s.Compose != nil, s.Systemd != nil, s.Deployment != nil} {

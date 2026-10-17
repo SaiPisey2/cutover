@@ -245,6 +245,31 @@ func TestApplyNackRestoresAndFails(t *testing.T) {
 	}
 }
 
+// A finished migration's route does not block another plan from taking
+// its host and prefix; an unfinished one still does.
+func TestApplyReplacesFinishedRouteOfAnotherOwner(t *testing.T) {
+	x, addr := startXDS(t, newStore(t), 0)
+	dialEnvoy(t, addr, nil)
+	ctx := context.Background()
+	old := base()
+	old.Owner = "older"
+	old.Source, old.Target, old.TargetWeight = nil, &Upstream{Address: "10.8.0.20", Port: 8080}, 100
+	if err := x.Apply(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Apply(ctx, base()); err != nil {
+		t.Fatalf("finished route should be replaced: %v", err)
+	}
+	if _, ok := x.Route("older/api"); ok {
+		t.Fatal("the finished route should be gone")
+	}
+	busy := base()
+	busy.Owner = "third"
+	if err := x.Apply(ctx, busy); !errorsIs(err, ErrConflict) {
+		t.Fatalf("an unfinished route still conflicts, got %v", err)
+	}
+}
+
 func TestApplyRefusesConflictAndInvalid(t *testing.T) {
 	x, addr := startXDS(t, newStore(t), 0)
 	dialEnvoy(t, addr, nil)

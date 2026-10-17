@@ -112,6 +112,7 @@ func TestServiceValidation(t *testing.T) {
 		{"two blocks", func(p *Plan) { p.Services[0].Systemd = &Systemd{Unit: "x.service"} }, `services[0] (api): kind compose takes only the compose block`},
 		{"missing block", func(p *Plan) { p.Services[0].Compose = nil }, `services[0] (api): kind compose needs a compose block`},
 		{"bad name", func(p *Plan) { p.Services[0].Name = "API_1" }, `services[0]: name must match`},
+		{"reserved name", func(p *Plan) { p.Services[1].Name = "systemd" }, `the name "systemd" is reserved`},
 		{"duplicate name", func(p *Plan) { p.Services[1].Name = "api" }, `services[1] (api): duplicate service name`},
 		{"host missing", func(p *Plan) { p.Services[0].Source.Host = "" }, `services[0] (api): source.host: required for kind compose`},
 		{"host unknown", func(p *Plan) { p.Services[0].Target.Host = "app9" }, `services[0] (api): target.host: "app9" is not in target.hosts`},

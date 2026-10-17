@@ -405,7 +405,7 @@ func latencySampler(stepMs float64) sampler {
 	return phases(batch{20, 1000}, batch{20, 1000}, batch{50, 500}, batch{stepMs, 500})
 }
 
-// Ruling B8: the reference p99 includes the baseline target p99 when the
+// the reference p99 includes the baseline target p99 when the
 // target served min_requests during Rehearse. The target's 50ms there
 // makes 100ms within 2x; against the source's 20ms alone it would trip.
 func TestShiftP99ReferenceIncludesBaselineTarget(t *testing.T) {
@@ -519,20 +519,20 @@ func preapprovedRamp(t *testing.T, s sampler) Result {
 	return r
 }
 
-// Ruling B8: when the source serves fewer than min_requests in the
+// when the source serves fewer than min_requests in the
 // window, the baseline source p99 (50ms) is the reference; the target
 // served too little in Rehearse to count. 100ms is within 2x.
 func TestShiftP99ReferenceFallsBackToBaselineSource(t *testing.T) {
 	preapprovedRamp(t, phases(batch{50, 1000}, batch{20, 10}, batch{20, 10}, batch{60, 500}))
 }
 
-// Ruling B8: this window's source p99 (50ms, over min_requests) counts
+// this window's source p99 (50ms, over min_requests) counts
 // when it is above the baseline's (20ms). 100ms is within 2x of 50ms.
 func TestShiftP99ReferenceUsesWindowSource(t *testing.T) {
 	preapprovedRamp(t, phases(batch{20, 1000}, batch{50, 1000}, batch{20, 10}, batch{60, 500}))
 }
 
-// Ruling B8: a source that served fewer than min_requests in the window
+// a source that served fewer than min_requests in the window
 // does not set the reference, however slow its few requests were. The
 // target's 100ms trips against the baseline source's 20ms.
 func TestShiftP99IgnoresThinWindowSource(t *testing.T) {
@@ -552,5 +552,32 @@ func TestShiftP99IgnoresThinWindowSource(t *testing.T) {
 	}
 	if r.State != StateRolledBack || !found {
 		t.Fatalf("%s %q", r.State, kinds(r.Events))
+	}
+}
+
+// The switch gate's summary carries the last shift window's verdict.
+func TestSwitchGateSummaryHasShiftVerdict(t *testing.T) {
+	env := newEnv()
+	c := &calls{}
+	s := sampler(healthy)
+	mockTraffic(env, c, nil, &s)
+	mockAll(env, c, nil, true)
+	var summary string
+	look := action{
+		when: func(st Status) bool {
+			if st.Gate != nil && st.Gate.Name == "switch" {
+				summary = st.Gate.Summary
+				return true
+			}
+			return false
+		},
+		do: func(env *testsuite.TestWorkflowEnvironment) {
+			env.SignalWorkflow(SignalGate, GateSignal{Gate: "switch", Decision: Reject, ApproverID: "alice"})
+		},
+	}
+	startServices(t, env, servicesPlan(), []action{approve("discover", "alice"), approve("prepare", "alice"), approve("rehearse", "alice"),
+		approve("shift-10", "alice"), approve("shift-100", "alice"), look})
+	if !strings.Contains(summary, "Last shift window: judged ok.") {
+		t.Fatalf("summary %q", summary)
 	}
 }

@@ -69,6 +69,13 @@ type Route struct {
 	MirrorMethods []string `json:"mirror_methods,omitempty"`
 }
 
+// Finished reports whether r is the shape Finish leaves: all traffic on
+// the target, no source, no mirroring. Nothing more changes such a route,
+// so a plan may take it over or re-register it.
+func (r Route) Finished() bool {
+	return r.Source == nil && r.Target != nil && r.TargetWeight == 100 && !r.Mirror
+}
+
 func (r Route) Key() string { return r.Owner + "/" + r.Service }
 
 // ClusterName is the Envoy cluster for one side of a service. Owner names

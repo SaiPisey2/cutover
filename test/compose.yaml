@@ -27,7 +27,7 @@ services:
   sshd:
     build: ./sshd
     ports: ["127.0.0.1:52222:22"]
-    # Shares PgBouncer's routes directory: Task 11 writes the routes file over SSH.
+    # Shares PgBouncer's routes directory: the routes file is written the routes file over SSH.
     volumes:
       - ./run/pgbouncer:/etc/pgbouncer/routes
     healthcheck: {test: ["CMD", "nc", "-z", "127.0.0.1", "22"], interval: 1s, timeout: 3s, retries: 30}

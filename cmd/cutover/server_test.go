@@ -211,6 +211,34 @@ func TestServerRefusesNonLoopbackAdmin(t *testing.T) {
 	}
 }
 
+func TestServerEnvoyAdminMustBeLoopbackURL(t *testing.T) {
+	noDial(t)
+	for _, admin := range []string{"127.0.0.1:9901", "ftp://127.0.0.1:9901", "http://127.0.0.1", "http://10.0.0.5:9901"} {
+		args := []string{"server", "--state", filepath.Join(t.TempDir(), "fd.json"), "--token-file", tokenFile(t, "0123456789abcdef"),
+			"--envoy-admin", admin}
+		if code, _, errb := exec(args...); code != 2 || !strings.Contains(errb, "--envoy-admin") {
+			t.Errorf("%s: %d %q", admin, code, errb)
+		}
+	}
+	if err := checkAdmin("http://127.0.0.1:9901"); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkAdmin("127.0.0.1:9901"); err == nil || !strings.Contains(err.Error(), "http://127.0.0.1:9901") {
+		t.Fatalf("a bare host:port needs a helpful error, got %v", err)
+	}
+}
+
+// After Finish the route is the target alone at 100%; apply re-registers it.
+func TestRouteApplyReplacesFinishedRoute(t *testing.T) {
+	noDial(t)
+	f := &fakeAPI{routes: []frontdoor.Route{{Owner: "shop", Service: "api", Host: "shop.example.com", Prefix: "/", HealthPath: "/healthz",
+		Target: &frontdoor.Upstream{Address: "10.8.0.20", Port: 8080}, TargetWeight: 100}}}
+	code, out, errb := exec("route", "apply", "--plan", routePlan(t, f.start(t)))
+	if code != 0 || len(f.puts) != 1 || f.puts[0].Target != nil || f.puts[0].Source == nil {
+		t.Fatalf("%d %q %q %+v", code, out, errb, f.puts)
+	}
+}
+
 func TestRouteApplyIsAllOrNothing(t *testing.T) {
 	noDial(t)
 	f := &fakeAPI{routes: []frontdoor.Route{{Owner: "shop", Service: "web", Host: "www.example.com", Prefix: "/", HealthPath: "/healthz",

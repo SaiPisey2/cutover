@@ -209,7 +209,9 @@ func (r *runner) stopMirror() error {
 	return r.step("stop-mirror", func() error { return r.setAll(m, frontdoor.Desired{Source: true, Target: true}) })
 }
 
-// shift runs the weighted ramp (see the plan's Task 14 notes).
+// shift runs the weighted ramp: each step moves traffic, holds it for
+// shift.hold, and either trips back to the source, asks again (too little
+// traffic to judge), or moves on.
 func (r *runner) shift() error {
 	p := r.in.Plan
 	if len(p.RoutedServices()) == 0 {
@@ -237,6 +239,12 @@ func (r *runner) shift() error {
 		v, err := r.hold()
 		if err != nil {
 			return err
+		}
+		switch {
+		case v.Judged && !v.Tripped:
+			r.st.ShiftVerdict = "judged ok"
+		case !v.Judged:
+			r.st.ShiftVerdict = "unjudged - " + v.Reason
 		}
 		switch {
 		case v.Tripped:
@@ -297,7 +305,11 @@ func (r *runner) hold() (traffic.Verdict, error) {
 	}
 }
 
-// judge applies the tripwire to every service in a window (rulings B8, B9).
+// judge applies the tripwire to every service in a window . The reference p99 is the highest of this window's source p99 (only if
+// the source served min_requests), the baseline source p99 and the baseline
+// target p99 (only if it served min_requests); a window whose reference
+// has no p99 cannot judge latency and is unjudged, as is any service with
+// fewer than min_requests.
 func (r *runner) judge(ts []ServiceTraffic) ([]ServiceTraffic, traffic.Verdict) {
 	sh := r.in.Plan.Thresholds.Shift
 	lim := traffic.Limits{MaxErrorDelta: sh.MaxErrorDelta, MaxP99: sh.MaxP99, MinRequests: uint64(sh.MinRequests)}

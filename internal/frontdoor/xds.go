@@ -133,7 +133,8 @@ func (x *XDS) Route(key string) (Route, bool) {
 	return Route{}, false
 }
 
-// Apply makes r the route for its key (see the plan's ruling B4): stages
+// Apply makes r the route for its key (replacing a finished migration's route
+// on the same host and prefix, see Route.Finished): stages
 // that add clusters before routing to them and unroute clusters before
 // removing them, each confirmed by every connected Envoy.
 func (x *XDS) Apply(ctx context.Context, r Route) error {
@@ -143,7 +144,11 @@ func (x *XDS) Apply(ctx context.Context, r Route) error {
 	x.applyM.Lock()
 	defer x.applyM.Unlock()
 	old := x.Routes()
-	others := slices.DeleteFunc(slices.Clone(old), func(e Route) bool { return e.Key() == r.Key() })
+	// A finished migration's route on the same host and prefix (even one
+	// owned by another plan) is replaced, not a conflict.
+	others := slices.DeleteFunc(slices.Clone(old), func(e Route) bool {
+		return e.Key() == r.Key() || (e.Finished() && e.Host == r.Host && trimPrefix(e.Prefix) == trimPrefix(r.Prefix))
+	})
 	if err := CheckConflicts(others, r); err != nil {
 		return fmt.Errorf("%w: %v", ErrConflict, err)
 	}

@@ -48,6 +48,10 @@ func assessServices(in Input, add addFunc) {
 				continue
 			}
 			r := in.Routes[i]
+			if r.Finished() {
+				add(Blocker, "route-not-registered", s.Name, "the front door's route for %s is a finished migration's (all traffic on a target); register the plan's route at 100%% source: cutover route apply --plan <file>", s.Name)
+				continue
+			}
 			want, err := frontdoor.ParseUpstream(s.Source.Endpoint)
 			switch {
 			case r.Host != s.Route.Host || prefixKey(r.Prefix) != prefixKey(s.Route.Prefix) || r.HealthPath != s.Route.HealthPath:

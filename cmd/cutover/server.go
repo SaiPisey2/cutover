@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -47,7 +48,7 @@ func serverCmd(ctx context.Context, args []string, stderr io.Writer) error {
 			return usagef("server: --xds: %v", err)
 		}
 	}
-	if err := frontdoor.RequireLoopback(strings.TrimPrefix(strings.TrimPrefix(*admin, "http://"), "https://")); err != nil {
+	if err := checkAdmin(*admin); err != nil {
 		return usagef("server: --envoy-admin: %v", err)
 	}
 	lh, lp, err := net.SplitHostPort(*listen)
@@ -169,7 +170,7 @@ func routeCmd(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return err
 		}
 		for _, r := range routes {
-			if r.Key() == want.Key() && (r.Target != nil || r.TargetWeight != 0 || r.Mirror) {
+			if r.Key() == want.Key() && !r.Finished() && (r.Target != nil || r.TargetWeight != 0 || r.Mirror) {
 				return fmt.Errorf("route %s is in use by a migration; it changes only through the migration", r.Key())
 			}
 		}
@@ -182,6 +183,18 @@ func routeCmd(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		fmt.Fprintf(stdout, "registered %s: %s%s -> %s\n", want.Key(), want.Host, want.Prefix, want.Source.String())
 	}
 	return nil
+}
+
+// checkAdmin requires an http(s) URL with an explicit loopback host:port.
+func checkAdmin(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%q must be a URL like http://127.0.0.1:9901", raw)
+	}
+	if u.Port() == "" {
+		return fmt.Errorf("%q needs an explicit port, like http://127.0.0.1:9901", raw)
+	}
+	return frontdoor.RequireLoopback(u.Host)
 }
 
 func upstream(u *frontdoor.Upstream) string {
