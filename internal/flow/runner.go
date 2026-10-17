@@ -36,6 +36,8 @@ type runner struct {
 	rbCh   workflow.ReceiveChannel
 	undo   []undoStep
 	closed string // non-empty once rollback is no longer possible: the reason
+	// baseline is Rehearse's traffic window, per service.
+	baseline map[string]ServiceTraffic
 }
 
 func newRunner(ctx workflow.Context, in Input) (*runner, error) {
@@ -89,6 +91,35 @@ func (r *runner) execWith(timeout, heartbeat time.Duration, fn, in, out any) err
 			MaximumInterval: 30 * time.Second, MaximumAttempts: 5},
 	})
 	return workflow.ExecuteActivity(ctx, fn, in).Get(r.ctx, out)
+}
+
+// sleep waits d of workflow time. A rollback signal ends it early with
+// errRollback (unless rollback is closed, when it is recorded and
+// ignored). A cancelled workflow cancels the timer, which is returned as
+// the error, never read as the wait ending.
+func (r *runner) sleep(d time.Duration) error {
+	tctx, cancel := workflow.WithCancel(r.ctx)
+	defer cancel()
+	timer := workflow.NewTimer(tctx, d)
+	for {
+		fired := false
+		var timerErr error
+		var rb *RollbackSignal
+		sel := workflow.NewSelector(r.ctx)
+		sel.AddFuture(timer, func(f workflow.Future) { fired, timerErr = true, f.Get(r.ctx, nil) })
+		sel.AddReceive(r.rbCh, func(c workflow.ReceiveChannel, _ bool) {
+			var s RollbackSignal
+			c.Receive(r.ctx, &s)
+			rb = &s
+		})
+		sel.Select(r.ctx)
+		if fired {
+			return timerErr
+		}
+		if err := r.takeRollback(*rb); err != nil {
+			return err
+		}
+	}
 }
 
 func message(err error) string {

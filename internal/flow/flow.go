@@ -63,7 +63,7 @@ func (r *runner) run() error {
 	for {
 		var rep readiness.Report
 		if err := r.step("discover", func() error {
-			return r.exec(2*time.Minute, acts.Discover, ops.DiscoverIn{Plan: p}, &rep)
+			return r.exec(5*time.Minute, acts.Discover, ops.DiscoverIn{Plan: p}, &rep)
 		}); err != nil {
 			return err
 		}
@@ -94,7 +94,10 @@ func (r *runner) run() error {
 	if err := r.step("prepare", func() error { return r.exec(time.Hour, acts.PrepareSchema, tin, nil) }); err != nil {
 		return err
 	}
-	if err := r.gate("prepare", "Target schema created. Approve to start replication.", 1); err != nil {
+	if err := r.prepareServices(); err != nil {
+		return err
+	}
+	if err := r.gate("prepare", r.prepareSummary(), 1); err != nil {
 		return err
 	}
 
@@ -120,12 +123,21 @@ func (r *runner) run() error {
 	}); err != nil {
 		return err
 	}
-	if err := r.gate("rehearse", summarizeChecks(r.st.Checks), 1); err != nil {
+	ts, err := r.rehearseTraffic()
+	if err != nil {
+		return err
+	}
+	if err := r.gate("rehearse", summarizeChecks(r.st.Checks)+ts, 1); err != nil {
+		return err
+	}
+	if err := r.stopMirror(); err != nil {
 		return err
 	}
 
 	r.enter(PhaseShift)
-	r.event("skipped", "", "no services in this plan; traffic shifting arrives with services")
+	if err := r.shift(); err != nil {
+		return err
+	}
 
 	r.enter(PhaseSwitch)
 	for {
@@ -171,12 +183,15 @@ func (r *runner) run() error {
 	}
 	r.closed = "the migration is past Finish"
 	r.undo = nil
-	return r.step("finish", func() error {
+	if err := r.step("finish", func() error {
 		if err := r.exec(2*time.Minute, acts.StopLink, revIn, nil); err != nil {
 			return err
 		}
 		return r.exec(2*time.Minute, acts.Cleanup, tin, nil)
-	})
+	}); err != nil {
+		return err
+	}
+	return r.step("frontdoor", r.finishRoutes)
 }
 
 // brokenGate stops at a gate after a switch left replication broken. A
@@ -319,33 +334,10 @@ func (r *runner) waitReplicated(link ops.Link, tables []string) error {
 	}
 }
 
-// watch keeps reverse replication on for d; a rollback ends it early. A
-// cancelled workflow cancels the timer, which is returned as the error,
-// never read as the watch period ending.
+// watch keeps reverse replication on for d; a rollback ends it early.
 func (r *runner) watch(d time.Duration) error {
 	r.event("watching", "", fmt.Sprintf("reverse replication stays on for %s; rollback is one signal away", d))
-	tctx, cancel := workflow.WithCancel(r.ctx)
-	defer cancel()
-	timer := workflow.NewTimer(tctx, d)
-	for {
-		fired := false
-		var timerErr error
-		var rb *RollbackSignal
-		sel := workflow.NewSelector(r.ctx)
-		sel.AddFuture(timer, func(f workflow.Future) { fired, timerErr = true, f.Get(r.ctx, nil) })
-		sel.AddReceive(r.rbCh, func(c workflow.ReceiveChannel, _ bool) {
-			var s RollbackSignal
-			c.Receive(r.ctx, &s)
-			rb = &s
-		})
-		sel.Select(r.ctx)
-		if fired {
-			return timerErr
-		}
-		if err := r.takeRollback(*rb); err != nil {
-			return err
-		}
-	}
+	return r.sleep(d)
 }
 
 // unwind runs every undo step in reverse. Rollback signals during it are

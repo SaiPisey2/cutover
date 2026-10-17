@@ -10,6 +10,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/pg"
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/readiness"
+	"github.com/SaiPisey2/cutover/internal/traffic"
 )
 
 const (
@@ -36,8 +37,9 @@ const (
 	StateFailed      = "failed"
 )
 
-// Phases, in order. Shift moves HTTP traffic and arrives with services in
-// Plan B; until then it is recorded as skipped so the timeline is complete.
+// Phases, in order. Shift moves HTTP traffic to the target whenever the
+// plan has routed services; otherwise it is recorded as skipped so the
+// timeline is complete.
 const (
 	PhaseDiscover  = "discover"
 	PhasePrepare   = "prepare"
@@ -101,7 +103,20 @@ type Status struct {
 	// PendingUndo lists, in the order they would run, the undo phases a
 	// stopped unwind left undone.
 	PendingUndo []string `json:"pending_undo,omitempty"`
-	Events      []Event  `json:"events"`
+	// Weight is the percentage of routed traffic the front door sends to the target.
+	Weight int `json:"weight"`
+	// Traffic is the latest window: Rehearse's, or the current Shift step's.
+	Traffic []ServiceTraffic `json:"traffic,omitempty"`
+	Events  []Event          `json:"events"`
+}
+
+// ServiceTraffic is one routed service's traffic over a window: Rehearse's
+// mirroring window, or the current Shift step so far.
+type ServiceTraffic struct {
+	Service string           `json:"service"`
+	Source  traffic.Summary  `json:"source"`
+	Target  traffic.Summary  `json:"target"`
+	Verdict *traffic.Verdict `json:"verdict,omitempty"`
 }
 
 type Result struct {

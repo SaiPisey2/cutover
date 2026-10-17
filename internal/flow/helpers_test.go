@@ -135,6 +135,11 @@ func mockAll(env *testsuite.TestWorkflowEnvironment, c *calls, f fails, drainVis
 		func(_ context.Context, in ops.SeqIn) ([]pg.SequenceSync, error) {
 			return []pg.SequenceSync{{Name: "public.orders_id_seq", Set: 1042, Changed: true}}, ret("seq:" + string(in.From) + ">" + string(in.To))
 		})
+	env.OnActivity(a.PrepareService, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(a.UndoService, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(a.CheckHealth, mock.Anything, mock.Anything).Return(ops.Health{Healthy: true}, nil)
+	env.OnActivity(a.SetTraffic, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(a.SampleTraffic, mock.Anything, mock.Anything).Return([]ops.ServiceCounters{}, nil)
 }
 
 func newEnv() *testsuite.TestWorkflowEnvironment {
