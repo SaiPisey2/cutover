@@ -216,6 +216,9 @@ func replRole(ctx context.Context, c *pgx.Conn, ref secret.Ref, f *pg.Facts) err
 // heartbeat keeps a heartbeat going while fn runs, so a dead worker is
 // noticed within the activity's HeartbeatTimeout rather than at StartToClose.
 func heartbeat(ctx context.Context, fn func() error) error {
+	if !sdkactivity.IsActivity(ctx) {
+		return fn()
+	}
 	done := make(chan struct{})
 	defer close(done)
 	go func() {

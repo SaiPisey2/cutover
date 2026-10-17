@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"time"
@@ -16,12 +17,31 @@ import (
 	"github.com/SaiPisey2/cutover/internal/readiness"
 	"github.com/SaiPisey2/cutover/internal/redact"
 	"github.com/SaiPisey2/cutover/internal/sshx"
+	"github.com/SaiPisey2/cutover/internal/svc"
 )
 
-// Activities has no fields: every call resolves what it needs from its input.
-type Activities struct{}
+// Activities resolves what it needs from each call's input. The two
+// fields are test seams; nil means the real thing.
+type Activities struct {
+	driver     func(plan.Plan, plan.Service) (svc.Driver, error)
+	lookupHost func(ctx context.Context, host string) ([]string, error)
+}
 
 func New() *Activities { return &Activities{} }
+
+func (a *Activities) driverFor(p plan.Plan, s plan.Service) (svc.Driver, error) {
+	if a.driver != nil {
+		return a.driver(p, s)
+	}
+	return svc.For(p, s)
+}
+
+func (a *Activities) lookup(ctx context.Context, host string) ([]string, error) {
+	if a.lookupHost != nil {
+		return a.lookupHost(ctx, host)
+	}
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
 
 func both(ctx context.Context, in TablesIn) (src, tgt *pgx.Conn, closeAll func(), err error) {
 	if src, err = connect(ctx, in.Plan.Source.Postgres.DSN); err != nil {
@@ -61,6 +81,9 @@ func (a *Activities) Discover(ctx context.Context, in DiscoverIn) (_ readiness.R
 		if ri.Pool, err = ad.Database(ctx, in.Plan.Database.Name); err != nil {
 			ri.PoolErr = redact.DSN(err.Error())
 		}
+	}
+	if len(in.Plan.Services) > 0 {
+		a.servicesInput(ctx, in.Plan, &ri)
 	}
 	return readiness.Assess(ri), nil
 }
