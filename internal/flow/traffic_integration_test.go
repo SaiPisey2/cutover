@@ -202,11 +202,18 @@ func newTrafficRig(t *testing.T) *rig {
 // httpLoad drives the front door until stopped.
 type httpLoad struct {
 	stop   chan struct{}
+	once   sync.Once
 	wg     sync.WaitGroup
 	mu     sync.Mutex
 	ok     int
-	failed []string
+	failed []failure
 	ids    []int64
+}
+
+// failure is one failed request and when it was sent.
+type failure struct {
+	started time.Time
+	what    string
 }
 
 func (r *rig) do(method string) (int, string, string, error) {
@@ -221,8 +228,10 @@ func (r *rig) do(method string) (int, string, string, error) {
 	return resp.StatusCode, strings.TrimSpace(string(b)), resp.Header.Get("X-Side"), nil
 }
 
-func (r *rig) startLoad(workers int) *httpLoad {
+// startLoad starts the load; it stops at l.Stop or when the test ends.
+func (r *rig) startLoad(t *testing.T, workers int) *httpLoad {
 	l := &httpLoad{stop: make(chan struct{})}
+	t.Cleanup(l.Stop)
 	for i := 0; i < workers; i++ {
 		l.wg.Add(1)
 		go func(i int) {
@@ -237,16 +246,20 @@ func (r *rig) startLoad(workers int) *httpLoad {
 				if (n+i)%2 == 0 {
 					m = "POST"
 				}
+				started := time.Now()
 				code, body, _, err := r.do(m)
+				var id int64
+				if err == nil && code == 200 && m == "POST" {
+					// An acknowledged write must answer its id.
+					id, err = strconv.ParseInt(body, 10, 64)
+				}
 				l.mu.Lock()
 				if err != nil || code != 200 {
-					l.failed = append(l.failed, fmt.Sprintf("%s %d %v %s", m, code, err, body))
+					l.failed = append(l.failed, failure{started, fmt.Sprintf("%s %d %v %s", m, code, err, body)})
 				} else {
 					l.ok++
 					if m == "POST" {
-						if id, err := strconv.ParseInt(body, 10, 64); err == nil {
-							l.ids = append(l.ids, id)
-						}
+						l.ids = append(l.ids, id)
 					}
 				}
 				l.mu.Unlock()
@@ -257,8 +270,9 @@ func (r *rig) startLoad(workers int) *httpLoad {
 	return l
 }
 
+// Stop stops the load and waits for it; calling it again is a no-op.
 func (l *httpLoad) Stop() {
-	close(l.stop)
+	l.once.Do(func() { close(l.stop) })
 	l.wg.Wait()
 }
 
@@ -286,7 +300,7 @@ func requireLatency(t *testing.T, window string, st flow.Status, withSource bool
 
 func TestTrafficAndDatabaseCutoverUnderLoad(t *testing.T) {
 	r := newTrafficRig(t)
-	load := r.startLoad(6)
+	load := r.startLoad(t, 6)
 	run := r.start(t, "traffic")
 	id := flow.WorkflowID("traffic")
 	for _, g := range []string{"discover", "prepare"} {
@@ -322,8 +336,14 @@ func TestTrafficAndDatabaseCutoverUnderLoad(t *testing.T) {
 	if res.State != flow.StateFinished {
 		t.Fatalf("state %s", res.State)
 	}
+	// Every Shift step was judged: none passed for want of evidence.
+	for _, e := range res.Events {
+		if e.Kind == "shift-unjudged" {
+			t.Fatalf("a Shift step went unjudged: %s", e.Message)
+		}
+	}
 	if len(load.failed) > 0 {
-		t.Fatalf("%d of %d requests failed; first: %s", len(load.failed), load.ok+len(load.failed), load.failed[0])
+		t.Fatalf("%d of %d requests failed; first: %s", len(load.failed), load.ok+len(load.failed), load.failed[0].what)
 	}
 	// After Finish the front door knows only the target.
 	for i := 0; i < 20; i++ {
@@ -361,7 +381,7 @@ func TestTrafficAndDatabaseCutoverUnderLoad(t *testing.T) {
 
 func TestTrafficTripwireRollsBack(t *testing.T) {
 	r := newTrafficRig(t)
-	load := r.startLoad(6)
+	load := r.startLoad(t, 6)
 	run := r.start(t, "tripwire")
 	id := flow.WorkflowID("tripwire")
 	for _, g := range []string{"discover", "prepare", "rehearse"} {
@@ -372,17 +392,18 @@ func TestTrafficTripwireRollsBack(t *testing.T) {
 	decide(t, r.tc, id, "shift-10", "alice", flow.Approve)
 	began := time.Now()
 	st := waitFor(t, r.tc, id, "shift-tripped", time.Minute, func(s flow.Status) bool { return s.Gate != nil && s.Gate.Name == "shift-tripped" })
-	took := time.Since(began)
-	if took > 4*time.Second+10*time.Second {
-		t.Fatalf("the tripwire took %s; it must fire within one hold (4s) plus the time to apply weights", took)
+	tripped := time.Now()
+	took := tripped.Sub(began)
+	if took > 4*time.Second+2*time.Second {
+		t.Fatalf("the tripwire took %s; it must fire within one hold (4s) plus 2s to apply weights", took)
 	}
 	if st.Weight != 0 {
 		t.Fatalf("weight %d after the trip, want 0", st.Weight)
 	}
 	// Traffic is back on the source while the gate waits.
 	for i := 0; i < 20; i++ {
-		if code, _, side, _ := r.do("GET"); code != 200 || side != "source" {
-			t.Fatalf("after the trip: %d from %q", code, side)
+		if code, _, side, err := r.do("GET"); err != nil || code != 200 || side != "source" {
+			t.Fatalf("after the trip: %d from %q %v", code, side, err)
 		}
 	}
 	decide(t, r.tc, id, "shift-tripped", "alice", flow.Reject)
@@ -398,10 +419,15 @@ func TestTrafficTripwireRollsBack(t *testing.T) {
 	if err != nil || len(routes) != 1 || routes[0].Target != nil || routes[0].Source == nil {
 		t.Fatalf("after rollback the route is source only: %+v %v", routes, err)
 	}
-	// Every failure came from the broken target, during the trip window.
+	// Every failure came from the broken target, and from a request sent
+	// before the trip was reported: once the gate is open the weights are
+	// back on the source (requests in flight then may still fail).
 	for _, f := range load.failed {
-		if !strings.Contains(f, "injected fault") {
-			t.Fatalf("a failure not caused by the injected fault: %s", f)
+		if !strings.Contains(f.what, "injected fault") {
+			t.Fatalf("a failure not caused by the injected fault: %s", f.what)
+		}
+		if f.started.After(tripped) {
+			t.Fatalf("a request sent %s after the trip was reported still reached the broken target: %s", f.started.Sub(tripped), f.what)
 		}
 	}
 	t.Logf("tripped %s after the shift was approved; %d requests, %d failed (all injected)", took, load.ok+len(load.failed), len(load.failed))
