@@ -31,6 +31,9 @@ commands:
   status ID [--json]                       show phase, gate and recent events
   gate ID GATE approve|reject --as NAME [--note TEXT]
   rollback ID --as NAME --reason TEXT      roll back (any time before Finish)
+  server --state FILE --token-file FILE    run the front door's control plane (xDS + API)
+  envoy-bootstrap                          print the Envoy bootstrap for the front door
+  route apply|list --plan FILE             register the plan's routes at 100% source, or list routes
 
 positional arguments come before flags (ID, GATE and the decision are positional).
 
@@ -118,6 +121,14 @@ func positional(args []string, n int, what string) ([]string, []string, error) {
 }
 
 func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) error {
+	switch cmd {
+	case "server":
+		return serverCmd(ctx, args, stderr)
+	case "envoy-bootstrap":
+		return bootstrapCmd(args, stdout, stderr)
+	case "route":
+		return routeCmd(ctx, args, stdout, stderr)
+	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	def := os.Getenv("CUTOVER_TEMPORAL")
@@ -297,6 +308,12 @@ func printStatus(w io.Writer, st flow.Status) {
 			fmt.Fprintf(w, ": %s", strings.Join(g.Approvals, ", "))
 		}
 		fmt.Fprintf(w, "): %s\n", g.Summary)
+	}
+	if st.Weight > 0 || len(st.Traffic) > 0 {
+		fmt.Fprintf(w, "traffic: %d%% on the target\n", st.Weight)
+		for _, t := range st.Traffic {
+			fmt.Fprintf(w, "  %s: source %s; target %s\n", t.Service, flow.Describe(t.Source), flow.Describe(t.Target))
+		}
 	}
 	if st.ReplicationBroken {
 		fmt.Fprintln(w, "REPLICATION BROKEN: replication is unsafe in both directions; the only way on is rollback")

@@ -1,15 +1,20 @@
 # cutover
 
-Move a Postgres database to another cloud while your users keep working.
+Move an application to another cloud while your users keep working: its
+Postgres database and its stateless services.
 
-cutover replicates with native logical replication and checks the copy. It
-then switches writes during a pause it bounds (default 10 s): PgBouncer holds
-queries, nothing fails. Two different people approve the switch. Reverse
-replication keeps the old database current until you finish, so rolling
-back is one command.
+cutover replicates the database with native logical replication and
+checks the copy. It copies each service to the target (Docker Compose or
+systemd over SSH, a Kubernetes Deployment, or a copy you run yourself),
+mirrors safe requests to it, then moves HTTP traffic in steps through an
+Envoy front door it controls. If the target does worse than the source,
+traffic goes back by itself. Writes switch to the new database during a
+pause cutover bounds (default 10 s): PgBouncer holds queries, nothing
+fails. Two different people approve that switch. Reverse replication keeps
+the old database current until you finish, so rolling back is one command.
 
-Status: release 1 in progress. This part covers the database. HTTP traffic
-shifting, the web console and the end-to-end demo are next.
+Status: release 1 in progress. The database and traffic parts are done;
+the web console and the end-to-end demo are next.
 
 ## Requirements
 
@@ -18,10 +23,9 @@ shifting, the web console and the end-to-end demo are next.
 - PgBouncer 1.21+ in transaction pooling mode, used by every app, with
   `%include <routes_file>` at the end of `pgbouncer.ini`
 - `pg_dump` and `psql` version 17 or later on the worker host
-- the worker runs where PgBouncer reads its routes file: on the PgBouncer
-  host, or with the routes directory on a volume both share. The worker
-  writes `routes_file` on its own filesystem; this release has no other way
-  to hand PgBouncer a new route
+- the worker either runs where PgBouncer reads its routes file, or reaches
+  PgBouncer's host over SSH (`database.pgbouncer.host`); the SSH handshake
+  happens during the switch, so it spends part of `switch.max_pause`
 - each side's `dsn` reaches Postgres directly, never through PgBouncer: the
   sentinel writes and the sequence sync run while PgBouncer holds writes
 - the source `dsn` role is a superuser or a member of `pg_read_all_stats`, or
@@ -35,6 +39,74 @@ shifting, the web console and the end-to-end demo are next.
   that a rollback cannot sync it back (readiness warns
   `sequence-target-only`)
 - a Temporal server (`temporal server start-dev` is enough to try it)
+- for services: Envoy 1.39 or later next to `cutover server`, and DNS for
+  every route host pointing at that Envoy before the migration starts
+- SSH hosts (compose, systemd) listed in a known_hosts file; cutover always
+  checks host keys. The SSH user needs root or passwordless sudo
+  (`sudo: true`). Compose hosts need Docker Compose 2.20 or later
+- Kubernetes (deployment): a kubeconfig file and context per side, named in
+  the plan. cutover reads only that file, never `KUBECONFIG` or
+  `~/.kube/config`
+
+## The front door
+
+`cutover server` drives Envoy over xDS and keeps the routes in a state
+file, so a restart picks up where it left off; Envoy keeps serving while
+the server is down. Every change waits until Envoy confirms it.
+
+```sh
+head -c 32 /dev/urandom | base64 > /etc/cutover/frontdoor-token
+cutover server --state /var/lib/cutover/frontdoor.json \
+  --token-file /etc/cutover/frontdoor-token --listen 0.0.0.0:80
+cutover envoy-bootstrap > /etc/envoy/cutover.yaml
+envoy -c /etc/envoy/cutover.yaml
+```
+
+xDS and the API listen on 127.0.0.1 only, so run Envoy, the server and the
+worker on one host, or reach the API through an SSH tunnel. Then register
+the plan's routes (100% to the source) and point DNS at the front door:
+
+```sh
+cutover route apply --plan plan.yaml
+cutover route list --plan plan.yaml
+```
+
+Discover blocks until every route is registered and every route host
+resolves only to `frontdoor.addresses`.
+
+## Services
+
+Each service in the plan has a kind:
+
+- `compose`: one service of a Compose project on an SSH host. cutover
+  copies its resolved definition (image, environment, ports) to the target
+  host as project `cutover-<plan>-<service>` and starts it. Builds, bind
+  mounts and named volumes block: that state lives on the source host.
+- `systemd`: a unit on an SSH host, plus the files listed in
+  `systemd.files` (its binary, environment files, config). cutover never
+  overwrites a file or unit it did not create, and marks what it creates
+  so rollback removes exactly that.
+- `deployment`: a Kubernetes Deployment with the ConfigMaps, Secrets,
+  ServiceAccount and Services it uses. Persistent volume claims and host
+  paths block.
+- `external`: you run both copies; cutover only moves the traffic.
+
+A service with a `route` is reached through the front door. One without
+(a background worker) is copied too, and both copies run from Prepare
+until you stop the source one.
+
+Rehearse mirrors GET and HEAD requests (set `mirror_methods`; only GET,
+HEAD and OPTIONS are allowed, because a mirrored write would run twice
+against the shared database) and shows both sides' error rates and p99.
+Shift then moves traffic in steps (default 1, 10, 50, 100%), holding each
+for `shift.hold`. If the target's error rate is more than
+`shift.max_error_delta` points above the source's, or its p99 more than
+`shift.max_p99` times the reference, every service goes back to 0% and a
+gate asks what to do. The reference p99 is the larger of the source's and
+the target's p99 you approved in Rehearse: until the database switches,
+the target copies reach it across clouds, and that cost is already in the
+number you approved. A step with fewer than `shift.min_requests` target
+requests is not judged, and never advances on its own.
 
 ## Try it
 
@@ -68,8 +140,11 @@ carry DDL, and cutover stops at a gate if the schemas drift.
 
 ## Gates
 
-`discover`, `prepare`, `rehearse`, `switch` (two different approvers),
-`finish`. A failed step stops at `retry-<step>`; approve to try again. During
+`discover`, `prepare`, `rehearse`, `shift-<weight>`
+(one per step: approve to move to that weight, or to restart the ramp;
+reject rolls back), `shift-tripped` (the target did worse than the source
+and traffic is back at 0%; approve to restart the ramp, reject rolls back),
+`switch` (two different approvers), `finish`. A failed step stops at `retry-<step>`; approve to try again. During
 a rollback, `retry-switch-back` and `retry-undo-<phase>` do the same for the
 unwind. `replication-broken` is described in the runbook below.
 
@@ -108,8 +183,8 @@ unwind. `replication-broken` is described in the runbook below.
   1s switch will often abort cleanly. Once the repoint has succeeded the
   switch never rolls back; resume retries until it succeeds, so a pause can
   exceed `max_pause` if PgBouncer is unreachable.
-- **Kubernetes.** Nothing here touches Kubernetes. Never point a test run at
-  a production kubeconfig.
+- **Kubernetes.** cutover only touches the clusters named by the plan's
+  kubeconfig files. Never point a test run at a production kubeconfig.
 
 ## Runbook
 
