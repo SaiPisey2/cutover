@@ -55,6 +55,15 @@ jobs:
           sudo mv temporal /usr/local/bin/temporal
           rm temporal.tgz
           temporal --version
+      # The front door's tests run Envoy natively (Docker cannot reach
+      # services on the host's loopback). Pinned and checksummed.
+      - name: Install Envoy 1.40.0
+        run: |
+          curl -fsSLo envoy https://github.com/envoyproxy/envoy/releases/download/v1.40.0/envoy-1.40.0-linux-x86_64
+          echo "8aa137a7d00994ce43f613556f5a120709229f63bedb86eedde5ccbc402c2b80  envoy" | sha256sum -c -
+          chmod +x envoy
+          sudo mv envoy /usr/local/bin/envoy
+          envoy --version
       - run: make itest-up
       - run: make itest
       - name: Container logs

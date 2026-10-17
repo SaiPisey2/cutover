@@ -89,9 +89,13 @@ func TestJudgeP99(t *testing.T) {
 
 const promText = `# TYPE envoy_cluster_upstream_rq_total counter
 envoy_cluster_upstream_rq_total{envoy_cluster_name="c_shop_api_source"} 120
+envoy_cluster_upstream_rq_completed{envoy_cluster_name="c_shop_api_source"} 120
 envoy_cluster_upstream_rq_total{envoy_cluster_name="c_shop_api_target"} 30
+envoy_cluster_upstream_rq_completed{envoy_cluster_name="c_shop_api_target"} 34
+envoy_cluster_upstream_cx_connect_fail{envoy_cluster_name="c_shop_api_target"} 12
+envoy_cluster_upstream_rq_retry{envoy_cluster_name="c_shop_api_target"} 8
 envoy_cluster_upstream_rq_xx{envoy_response_code_class="2",envoy_cluster_name="c_shop_api_target"} 26
-envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="c_shop_api_target"} 4
+envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="c_shop_api_target"} 8
 envoy_cluster_upstream_rq_timeout{envoy_cluster_name="c_shop_api_target"} 1
 envoy_cluster_upstream_rq_time_bucket{envoy_cluster_name="c_shop_api_target",le="5"} 10
 envoy_cluster_upstream_rq_time_bucket{envoy_cluster_name="c_shop_api_target",le="10"} 25
@@ -108,7 +112,11 @@ func TestParsePrometheus(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := got["c_shop_api_target"]
-	if tg.Requests != 30 || tg.Errors != 4 || tg.LatencyCount != 30 || len(tg.Buckets) != 2 || tg.Buckets[1] != (Bucket{LE: 10, Count: 25}) {
+	// 34 completed: 26 answered 2xx, 4 answered 5xx, 4 never connected
+	// (12 attempts, 8 of them retries). Those 4 are missing from
+	// upstream_rq_total, which counts only requests that reached a
+	// connection; Envoy's own 503 for them is in the 5xx class once each.
+	if tg.Requests != 34 || tg.Errors != 8 || tg.LatencyCount != 30 || len(tg.Buckets) != 2 || tg.Buckets[1] != (Bucket{LE: 10, Count: 25}) {
 		t.Fatalf("target %+v", tg)
 	}
 	if got["c_shop_api_source"].Requests != 120 {

@@ -36,7 +36,7 @@ func fakeAdmin(t *testing.T) *Admin {
 	return &Admin{Base: srv.URL, HTTP: srv.Client()}
 }
 
-const promText = `envoy_cluster_upstream_rq_total{envoy_cluster_name="c_shop_api_source"} 120
+const promText = `envoy_cluster_upstream_rq_completed{envoy_cluster_name="c_shop_api_source"} 120
 envoy_cluster_upstream_rq_xx{envoy_response_code_class="5",envoy_cluster_name="c_shop_api_source"} 3
 `
 

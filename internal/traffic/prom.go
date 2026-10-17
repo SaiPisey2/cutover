@@ -13,16 +13,23 @@ import (
 // ParsePrometheus reads Envoy's /stats/prometheus output and returns the
 // counters of every cluster it mentions, keyed by cluster name.
 //
-// Requests is upstream_rq_total. Errors counts each failed client-visible
-// request once: 5xx responses, which include Envoy's own 503 for a failed
-// connection and 504 for an upstream timeout. upstream_rq_timeout is not
-// added on top, as that would count a timeout twice.
-// Task 6's TestStatsCountEachFailureOnce pins this against a real Envoy;
-// if Envoy disagrees, change this formula, not that test.
+// Requests is upstream_rq_completed: every request Envoy finished for the
+// cluster, once each however many attempts it took. upstream_rq_total is
+// not used, as it leaves out requests that never got a connection: on
+// Envoy 1.39 a target refusing every connection moved it by zero, which
+// would leave a dead target unjudged.
+// Errors counts each failed client-visible request once: 5xx responses,
+// which include Envoy's own 503 for a failed connection (once per
+// request, not per attempt) and 504 for an upstream timeout.
+// upstream_rq_timeout is not added on top, as that would count a timeout
+// twice.
+// TestStatsCountEachFailureOnce (internal/frontdoor, integration) pins
+// this against a real Envoy; if Envoy disagrees, change this formula,
+// not that test.
 func ParsePrometheus(r io.Reader) (map[string]Counters, error) {
 	type acc struct {
-		total, xx5, count float64
-		buckets           []Bucket
+		completed, xx5, count float64
+		buckets               []Bucket
 	}
 	all := map[string]*acc{}
 	get := func(c string) *acc {
@@ -48,8 +55,8 @@ func ParsePrometheus(r io.Reader) (map[string]Counters, error) {
 		}
 		a := get(cluster)
 		switch name {
-		case "envoy_cluster_upstream_rq_total":
-			a.total = value
+		case "envoy_cluster_upstream_rq_completed":
+			a.completed = value
 		case "envoy_cluster_upstream_rq_xx":
 			if labels["envoy_response_code_class"] == "5" {
 				a.xx5 = value
@@ -82,7 +89,7 @@ func ParsePrometheus(r io.Reader) (map[string]Counters, error) {
 			}
 			return 0
 		})
-		out[c] = Counters{Requests: uint64(a.total), Errors: uint64(a.xx5), LatencyCount: uint64(a.count), Buckets: a.buckets}
+		out[c] = Counters{Requests: uint64(a.completed), Errors: uint64(a.xx5), LatencyCount: uint64(a.count), Buckets: a.buckets}
 	}
 	return out, nil
 }
