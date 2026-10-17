@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -69,6 +70,18 @@ func (d compose) foreign(ctx context.Context, r Runner, checkProject bool) (stri
 	return "", nil
 }
 
+// runErr describes a failed docker command without its stderr: compose
+// quotes environment values in interpolation errors and warnings, and an
+// error ends up in workflow history. Non-exit errors (connection, context)
+// carry no command output and keep their cause.
+func runErr(what string, err error) error {
+	var ee *sshx.ExitError
+	if errors.As(err, &ee) {
+		return fmt.Errorf("%s failed (exit %d)", what, ee.Code)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
 type lsEntry struct {
 	Name        string `json:"Name"`
 	ConfigFiles string `json:"ConfigFiles"`
@@ -77,7 +90,7 @@ type lsEntry struct {
 func composeLs(ctx context.Context, r Runner) ([]lsEntry, error) {
 	out, err := r.Run(ctx, r.Root("docker compose ls --all --format json"), nil)
 	if err != nil {
-		return nil, err
+		return nil, runErr("docker compose ls", err)
 	}
 	var ls []lsEntry
 	if err := json.Unmarshal(bytes.TrimSpace(out), &ls); err != nil {
@@ -104,6 +117,9 @@ func (d compose) definition(ctx context.Context, src Side) (map[string]any, []Fi
 		return nil, []Finding{{Blocker: true, Code: "compose-missing", Subject: subj,
 			Message: fmt.Sprintf("compose project %s is not on source host %s", d.svc.Compose.Project, d.svc.Source.Host)}}, nil
 	}
+	if strings.TrimSpace(ls[i].ConfigFiles) == "" {
+		return nil, nil, fmt.Errorf("docker compose ls lists no config files for project %s on %s", d.svc.Compose.Project, d.svc.Source.Host)
+	}
 	files := strings.Split(ls[i].ConfigFiles, ",")
 	cmd := "docker compose -p " + sshx.Quote(d.svc.Compose.Project) + " --project-directory " + sshx.Quote(path.Dir(files[0]))
 	for _, f := range files {
@@ -111,7 +127,7 @@ func (d compose) definition(ctx context.Context, src Side) (map[string]any, []Fi
 	}
 	out, err := r.Run(ctx, r.Root(cmd+" config --format json"), nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, runErr("docker compose config for "+d.svc.Compose.Project, err)
 	}
 	var doc struct {
 		Services map[string]map[string]any `json:"services"`
@@ -169,7 +185,8 @@ func (d compose) Inspect(ctx context.Context, src, tgt Side) (Facts, error) {
 	if def != nil {
 		facts.Image, _ = def["image"].(string)
 		if facts.Ports, err = d.ports(ctx, src); err != nil {
-			return facts, fmt.Errorf("source: %w", err)
+			facts.Findings = append(facts.Findings, Finding{Code: "compose-ports-unknown", Subject: d.svc.Compose.Project + "/" + d.svc.Compose.Service,
+				Message: fmt.Sprintf("could not list the published ports on source host %s: %v", d.svc.Source.Host, err)})
 		}
 	}
 	r, err := tgt.Host(ctx, d.svc.Target.Host)
@@ -177,15 +194,16 @@ func (d compose) Inspect(ctx context.Context, src, tgt Side) (Facts, error) {
 		return facts, fmt.Errorf("target: %w", err)
 	}
 	out, err := r.Run(ctx, r.Root("docker compose version --short"), nil)
+	dockerOK := err == nil
 	if err != nil {
 		facts.Findings = append(facts.Findings, Finding{Blocker: true, Code: "compose-target", Subject: d.svc.Target.Host,
-			Message: fmt.Sprintf("Docker Compose v2 does not run on target host %s: %v", d.svc.Target.Host, err)})
+			Message: fmt.Sprintf("Docker Compose v2 does not run on target host %s: %v", d.svc.Target.Host, runErr("docker compose version", err))})
 	} else if !atLeast(strings.TrimSpace(string(out)), 2, 20) {
 		facts.Findings = append(facts.Findings, Finding{Blocker: true, Code: "compose-target", Subject: d.svc.Target.Host,
 			Message: fmt.Sprintf("target host %s has Docker Compose %s; cutover needs 2.20 or later (up --wait)", d.svc.Target.Host, strings.TrimSpace(string(out)))})
 	}
 	// docker answers only when it runs; the directory check needs no docker.
-	what, err := d.foreign(ctx, r, err == nil)
+	what, err := d.foreign(ctx, r, dockerOK)
 	if err != nil {
 		return facts, fmt.Errorf("target: %w", err)
 	}
@@ -255,7 +273,7 @@ func (d compose) Prepare(ctx context.Context, src, tgt Side) error {
 	_, err = r.Run(ctx, r.Root("docker compose -p "+sshx.Quote(d.project())+" -f "+sshx.Quote(d.file())+
 		" up -d --wait --wait-timeout 300 --quiet-pull"), nil)
 	if err != nil {
-		return fmt.Errorf("target: compose up: %w", err)
+		return fmt.Errorf("target: %w", runErr("compose up", err))
 	}
 	return nil
 }
@@ -303,7 +321,7 @@ func (d compose) ports(ctx context.Context, src Side) ([]string, error) {
 	}
 	out, err := r.Run(ctx, r.Root("docker compose -p "+sshx.Quote(d.svc.Compose.Project)+" ps --format json"), nil)
 	if err != nil {
-		return nil, err
+		return nil, runErr("docker compose ps", err)
 	}
 	ps, err := parsePs(out)
 	if err != nil {
@@ -337,7 +355,7 @@ func (d compose) Healthy(ctx context.Context, tgt Side) (bool, string, error) {
 	}
 	out, err := r.Run(ctx, r.Root("docker compose -p "+sshx.Quote(d.project())+" ps --all --format json"), nil)
 	if err != nil {
-		return false, "", err
+		return false, "", runErr("docker compose ps", err)
 	}
 	ps, err := parsePs(out)
 	if err != nil {
@@ -376,10 +394,10 @@ func (d compose) Undo(ctx context.Context, tgt Side) error {
 		return err
 	} else if has {
 		if _, err := r.Run(ctx, r.Root("docker compose -p "+sshx.Quote(d.project())+" -f "+sshx.Quote(d.file())+" down --remove-orphans"), nil); err != nil {
-			return fmt.Errorf("compose down: %w", err)
+			return runErr("compose down", err)
 		}
 	} else if _, err := r.Run(ctx, r.Root("docker compose -p "+sshx.Quote(d.project())+" down --remove-orphans"), nil); err != nil {
-		return fmt.Errorf("compose down: %w", err)
+		return runErr("compose down", err)
 	}
 	_, err = r.Run(ctx, r.Root("rm -rf "+sshx.Quote(d.dir())), nil)
 	return err

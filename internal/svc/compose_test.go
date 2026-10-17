@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/SaiPisey2/cutover/internal/plan"
+	"github.com/SaiPisey2/cutover/internal/sshx"
 )
 
 func composePlan() (plan.Plan, plan.Service) {
@@ -402,5 +403,85 @@ func TestExternalDoesNothing(t *testing.T) {
 	}
 	if err := d.Undo(ctx, none); err != nil {
 		t.Fatal(err)
+	}
+}
+
+const leak = "S3CRET-FROM-STDERR"
+
+func leaky() error {
+	return &sshx.ExitError{Command: "ssh h: docker compose", Code: 1, Stderr: "invalid interpolation: DATABASE_URL=" + leak}
+}
+
+func TestComposeErrorsCarryNoStderr(t *testing.T) {
+	p, s := composePlan()
+	d, _ := For(p, s)
+	ctx := context.Background()
+	check := func(name string, err error) {
+		t.Helper()
+		if err == nil || strings.Contains(err.Error(), leak) {
+			t.Errorf("%s: want an error without the stderr, got %v", name, err)
+		}
+	}
+	src := newFake(t)
+	src.on(lsCmd, lsJSON, nil)
+	src.on(configCmd, "", leaky())
+	_, err := d.Inspect(ctx, sideOf(src), sideOf(cleanTarget(t)))
+	check("inspect config", err)
+	if err != nil && !strings.Contains(err.Error(), "exit 1") {
+		t.Errorf("the exit code should survive: %v", err)
+	}
+	check("prepare config", d.Prepare(ctx, sideOf(src), sideOf(cleanTarget(t))))
+
+	tgt := newFake(t)
+	tgt.on(lsCmd, `[]`, nil)
+	tgt.on(upCmd, "", leaky())
+	check("prepare up", d.Prepare(ctx, sideOf(cleanSource(t)), sideOf(tgt)))
+
+	tgt = newFake(t)
+	tgt.on(versionCmd, "", leaky())
+	facts, err := d.Inspect(ctx, sideOf(cleanSource(t)), sideOf(tgt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(facts)
+	if strings.Contains(string(b), leak) {
+		t.Errorf("findings carry stderr: %s", b)
+	}
+
+	tgt = newFake(t)
+	tgt.on(psCmd, "", leaky())
+	_, _, err = d.Healthy(ctx, sideOf(tgt))
+	check("healthy", err)
+}
+
+func TestComposeInspectPortsUnknown(t *testing.T) {
+	p, s := composePlan()
+	d, _ := For(p, s)
+	src := newFake(t)
+	src.on(lsCmd, lsJSON, nil)
+	src.on(configCmd, configJSON, nil)
+	src.on(srcPsCmd, "", leaky())
+	facts, err := d.Inspect(context.Background(), sideOf(src), sideOf(cleanTarget(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, f := range facts.Findings {
+		if f.Code == "compose-ports-unknown" {
+			found = !f.Blocker
+		}
+	}
+	if !found || len(facts.Ports) != 0 {
+		t.Fatalf("%+v", facts)
+	}
+}
+
+func TestComposeNoConfigFiles(t *testing.T) {
+	p, s := composePlan()
+	d, _ := For(p, s)
+	src := newFake(t)
+	src.on(lsCmd, `[{"Name":"shop","Status":"running(1)","ConfigFiles":""}]`, nil)
+	if _, err := d.Inspect(context.Background(), sideOf(src), sideOf(cleanTarget(t))); err == nil || !strings.Contains(err.Error(), "no config files") {
+		t.Fatalf("%v", err)
 	}
 }
