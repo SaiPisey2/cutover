@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -59,22 +60,55 @@ func (d systemd) show(ctx context.Context, r Runner) (unitInfo, error) {
 		case "FragmentPath":
 			u.fragment = v
 		case "DropInPaths":
-			u.dropIns = strings.Fields(v)
+			for _, dp := range strings.Fields(v) {
+				if path.Base(dp) != SystemdMarker { // never let a source drop-in take the marker's place
+					u.dropIns = append(u.dropIns, dp)
+				}
+			}
 		case "ExecStart":
-			// Only path= is kept; argv[] may hold inline secrets.
-			for _, part := range strings.Split(v, ";") {
-				if p, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "{")), "path="); ok {
-					u.needs = append(u.needs, strings.TrimSpace(p))
+			// Only systemd's own leading path= field is kept; argv[] may
+			// hold inline secrets, and a value that is not a clean
+			// absolute path is dropped without being echoed.
+			if rest, ok := strings.CutPrefix(strings.TrimSpace(v), "{"); ok {
+				if p, ok := strings.CutPrefix(strings.TrimSpace(rest), "path="); ok {
+					p, _, _ = strings.Cut(p, " ;")
+					if p = strings.TrimSpace(p); cleanAbs(p) {
+						u.needs = append(u.needs, p)
+					}
 				}
 			}
 		case "EnvironmentFiles":
 			f := strings.Fields(v)
 			if len(f) > 0 && !strings.Contains(v, "ignore_errors=yes") {
-				u.needs = append(u.needs, f[0])
+				if cleanAbs(f[0]) {
+					u.needs = append(u.needs, f[0])
+				}
 			}
 		}
 	}
 	return u, nil
+}
+
+func cleanAbs(p string) bool { return strings.HasPrefix(p, "/") && filepath.Clean(p) == p }
+
+// manifestPaths returns what an earlier Prepare recorded as created by
+// cutover. An unreadable manifest is an error, not an empty one.
+func (d systemd) manifestPaths(ctx context.Context, r Runner) ([]string, error) {
+	has, err := r.Exists(ctx, d.manifestPath())
+	if err != nil || !has {
+		return nil, err
+	}
+	b, err := r.ReadFile(ctx, d.manifestPath())
+	if err != nil {
+		return nil, fmt.Errorf("read manifest: %w", runErr("read "+d.manifestPath(), err))
+	}
+	var out []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out, nil
 }
 
 func sha(ctx context.Context, r Runner, p string) (string, error) {
@@ -148,6 +182,30 @@ func (d systemd) inspect(ctx context.Context, src, tgt Side) ([]Finding, unitInf
 			add(true, "systemd-target-unit", unit, "target host %s already has unit %s (LoadState=%s); cutover never replaces a unit it did not create", d.svc.Target.Host, unit, state)
 		}
 	}
+	mine, err := d.manifestPaths(ctx, tr)
+	if err != nil {
+		return nil, u, nil, fmt.Errorf("target: %w", err)
+	}
+	seen := map[string]bool{}
+	targets := []string{d.unitPath(), d.markerPath()}
+	for _, dp := range u.dropIns {
+		to := d.dropDir() + "/" + path.Base(dp)
+		if seen[to] {
+			add(true, "systemd-dropin-duplicate", to, "unit %s has two drop-ins named %s on source host %s; cutover cannot copy both to one path", unit, path.Base(dp), d.svc.Source.Host)
+			continue
+		}
+		seen[to] = true
+		targets = append(targets, to)
+	}
+	for _, to := range targets {
+		there, err := tr.Exists(ctx, to)
+		if err != nil {
+			return nil, u, nil, fmt.Errorf("target: %w", err)
+		}
+		if there && !slices.Contains(mine, to) {
+			add(true, "systemd-target-file", to, "%s already exists on target host %s and cutover did not create it; cutover never overwrites such a file", to, d.svc.Target.Host)
+		}
+	}
 	var toCopy []string
 	for _, f := range d.svc.Systemd.Files {
 		ok, err := sr.Exists(ctx, f)
@@ -162,7 +220,7 @@ func (d systemd) inspect(ctx context.Context, src, tgt Side) ([]Finding, unitInf
 		if err != nil {
 			return nil, u, nil, fmt.Errorf("target: %w", err)
 		}
-		if !there {
+		if !there || slices.Contains(mine, f) { // cutover's own copy is refreshed, not compared
 			toCopy = append(toCopy, f)
 			continue
 		}
@@ -216,32 +274,20 @@ func (d systemd) Prepare(ctx context.Context, src, tgt Side) error {
 		return fmt.Errorf("target: %w", err)
 	}
 
-	// Never let a source drop-in take the marker's place.
-	var dropIns []string
-	for _, dp := range u.dropIns {
-		if path.Base(dp) != SystemdMarker {
-			dropIns = append(dropIns, dp)
-		}
-	}
+	dropIns := u.dropIns
 
 	created := slices.Clone(toCopy)
 	created = append(created, d.unitPath(), d.markerPath())
 	for _, dp := range dropIns {
 		created = append(created, d.dropDir()+"/"+path.Base(dp))
 	}
-	has, err := tr.Exists(ctx, d.manifestPath())
+	old, err := d.manifestPaths(ctx, tr)
 	if err != nil {
 		return fmt.Errorf("target: %w", err)
 	}
-	if has {
-		old, err := tr.ReadFile(ctx, d.manifestPath())
-		if err != nil {
-			return fmt.Errorf("target: read manifest: %w", runErr("read "+d.manifestPath(), err))
-		}
-		for _, l := range strings.Split(string(old), "\n") {
-			if l != "" && !slices.Contains(created, l) {
-				created = append(created, l)
-			}
+	for _, l := range old {
+		if !slices.Contains(created, l) {
+			created = append(created, l)
 		}
 	}
 	if err := tr.WriteFile(ctx, d.manifestPath(), 0o600, []byte(strings.Join(created, "\n")+"\n")); err != nil {

@@ -163,6 +163,9 @@ func TestSystemdPrepare(t *testing.T) {
 			break
 		}
 	}
+	if first < 0 {
+		t.Fatal("Prepare wrote nothing")
+	}
 	if tgt.calls[first] != "WRITE "+manifest {
 		t.Fatalf("first write was %s, want the manifest", tgt.calls[first])
 	}
@@ -370,5 +373,149 @@ func TestSystemdFactsCarryNoSecrets(t *testing.T) {
 	b, _ := json.Marshal(facts)
 	if strings.Contains(string(b), "sk_live") {
 		t.Fatalf("facts leak: %s", b)
+	}
+}
+
+func TestSystemdRefusesPreexistingTargetFiles(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	ctx := context.Background()
+	for _, existing := range []string{
+		"/etc/systemd/system/billing.service.d/override.conf",
+		"/etc/systemd/system/billing.service",
+		marker, // another plan's marker
+	} {
+		tgt := systemdTarget(t)
+		tgt.files[existing] = []byte("not ours")
+		facts, err := d.Inspect(ctx, sideOf(systemdSource(t)), sideOf(tgt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found bool
+		for _, f := range facts.Findings {
+			if f.Code == "systemd-target-file" && f.Subject == existing && f.Blocker {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s: %+v", existing, facts.Findings)
+		}
+		if err := d.Prepare(ctx, sideOf(systemdSource(t)), sideOf(tgt)); !errors.Is(err, ErrBlocked) {
+			t.Fatalf("%s: %v", existing, err)
+		}
+		if tgt.ran("WRITE") || string(tgt.files[existing]) != "not ours" {
+			t.Fatalf("%s: touched: %v", existing, tgt.calls)
+		}
+	}
+}
+
+// Retry after the source binary changed: cutover's own copy is refreshed.
+func TestSystemdRetryRecopiesOwnFile(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	src, tgt := systemdSource(t), systemdTarget(t)
+	tgt.on(tgtShowCmd, "LoadState=loaded\n", nil)
+	tgt.files[marker] = []byte("[Unit]\nX-Cutover-Owner=shop\n")
+	tgt.files[manifest] = []byte("/usr/local/bin/billing\n/etc/systemd/system/billing.service\n" + marker + "\n/etc/systemd/system/billing.service.d/override.conf\n")
+	tgt.files["/usr/local/bin/billing"] = []byte("old build")
+	tgt.files["/etc/systemd/system/billing.service"] = []byte("old unit")
+	tgt.files["/etc/systemd/system/billing.service.d/override.conf"] = []byte("old")
+	tgt.on(enableCmd, "", nil)
+	if err := d.Prepare(context.Background(), sideOf(src), sideOf(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if string(tgt.files["/usr/local/bin/billing"]) != "\x7fELF binary" {
+		t.Fatal("binary not re-copied")
+	}
+	if !strings.Contains(string(tgt.files[manifest]), "/usr/local/bin/billing\n") {
+		t.Fatal("manifest lost the binary")
+	}
+}
+
+func TestSystemdExecStartTakesOnlyOwnPath(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	src := systemdSource(t)
+	evil := "ExecStart={ path=/usr/local/bin/billing ; argv[]=/bin/sh -c x; path=/opt/tok_SECRET ; ignore_errors=no }\n" +
+		"ExecStart={ path=/opt/../tok_SECRET2 ; argv[]=x }\n" +
+		"EnvironmentFiles=tok_SECRET3 (ignore_errors=no)\n" +
+		"FragmentPath=/etc/systemd/system/billing.service\nLoadState=loaded\n"
+	src.on(showCmd, evil, nil)
+	facts, err := d.Inspect(context.Background(), sideOf(src), sideOf(systemdTarget(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(facts)
+	if strings.Contains(string(b), "SECRET") {
+		t.Fatalf("facts leak: %s", b)
+	}
+	if codes(facts.Findings)["systemd-file-missing"] {
+		t.Fatalf("a dropped value became a need: %+v", facts.Findings)
+	}
+}
+
+func TestSystemdDuplicateDropIns(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	src := systemdSource(t)
+	src.on(showCmd, strings.Replace(showOut, "override.conf\n", "override.conf /run/systemd/system/billing.service.d/override.conf\n", 1), nil)
+	facts, _ := d.Inspect(context.Background(), sideOf(src), sideOf(systemdTarget(t)))
+	if !codes(facts.Findings)["systemd-dropin-duplicate"] {
+		t.Fatalf("%+v", facts.Findings)
+	}
+}
+
+func TestSystemdSkipsSourceMarkerDropIn(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	src, tgt := systemdSource(t), systemdTarget(t)
+	src.on(showCmd, strings.Replace(showOut, "override.conf\n", "override.conf /etc/systemd/system/billing.service.d/zz-cutover.conf\n", 1), nil)
+	src.files["/etc/systemd/system/billing.service.d/zz-cutover.conf"] = []byte("[Unit]\nX-Cutover-Owner=other\n")
+	tgt.on(enableCmd, "", nil)
+	if err := d.Prepare(context.Background(), sideOf(src), sideOf(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tgt.files[marker]), "X-Cutover-Owner=shop") {
+		t.Fatalf("marker replaced: %s", tgt.files[marker])
+	}
+}
+
+func TestSystemdUndoIgnoresRelativeLinesAndSkipsDisableWithoutMarker(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	tgt := newFake(t)
+	tgt.files[manifest] = []byte("../../etc/passwd\nrelative\n/etc/billing/env\n")
+	undo := "ROOT(rm -f '/etc/billing/env'; rmdir '/etc/systemd/system/billing.service.d' 2>/dev/null || true; systemctl daemon-reload; rm -f '" + manifest + "')"
+	tgt.on(undo, "", nil)
+	if err := d.Undo(context.Background(), sideOf(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	if !tgt.ran(undo) {
+		t.Fatalf("undo ran %v", tgt.calls)
+	}
+}
+
+type existsFails struct {
+	*fakeRunner
+	path string
+}
+
+func (r existsFails) Exists(ctx context.Context, p string) (bool, error) {
+	if p == r.path {
+		return false, errors.New("ssh dropped")
+	}
+	return r.fakeRunner.Exists(ctx, p)
+}
+
+func TestSystemdManifestExistsErrorStopsPrepare(t *testing.T) {
+	p, s := systemdPlan()
+	d, _ := For(p, s)
+	tgt := systemdTarget(t)
+	err := d.Prepare(context.Background(), sideOf(systemdSource(t)), sideOf(existsFails{tgt, manifest}))
+	if err == nil || !strings.Contains(err.Error(), "ssh dropped") {
+		t.Fatalf("got %v", err)
+	}
+	if tgt.ran("WRITE") {
+		t.Fatal("wrote after an Exists error")
 	}
 }
