@@ -17,6 +17,7 @@ func TestBootstrap(t *testing.T) {
 		"port_value: 18000",
 		"http2_protocol_options: {}",
 		"suffix: upstream_rq_time",
+		"\nstats_flush_interval: 1s\n",
 	} {
 		if !strings.Contains(y, want) {
 			t.Errorf("bootstrap lacks %q:\n%s", want, y)

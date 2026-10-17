@@ -272,6 +272,18 @@ func (r *rig) start(t *testing.T, id string) client.WorkflowRun {
 	return run
 }
 
+// requireLatency fails unless the window st reports timed requests on
+// the target, and on the source too when withSource is set (the source
+// is the p99 reference; at 100% it carries no traffic, so it has none).
+// Without them latency is never judged.
+func requireLatency(t *testing.T, window string, st flow.Status, withSource bool) {
+	t.Helper()
+	if len(st.Traffic) != 1 || !st.Traffic[0].Target.P99Known || (withSource && !st.Traffic[0].Source.P99Known) {
+		t.Fatalf("the %s window has no latency data: %+v", window, st.Traffic)
+	}
+	t.Logf("%s window: source %s; target %s", window, flow.Describe(st.Traffic[0].Source), flow.Describe(st.Traffic[0].Target))
+}
+
 func TestTrafficAndDatabaseCutoverUnderLoad(t *testing.T) {
 	r := newTrafficRig(t)
 	load := r.startLoad(6)
@@ -288,8 +300,18 @@ func TestTrafficAndDatabaseCutoverUnderLoad(t *testing.T) {
 	if gets == 0 || posts != 0 {
 		t.Fatalf("in Rehearse the target got %d GETs and %d POSTs; want mirrored GETs only", gets, posts)
 	}
-	for _, step := range []struct{ gate, who string }{{"rehearse", "alice"}, {"shift-10", "alice"}, {"shift-100", "alice"},
-		{"switch", "alice"}, {"switch", "bob"}, {"finish", "alice"}} {
+	requireLatency(t, "rehearse", st, true)
+	for _, g := range []string{"rehearse", "shift-10"} {
+		decide(t, r.tc, id, g, "alice", flow.Approve)
+	}
+	// The gate after each Shift step shows that step's window: the
+	// target's latency must have been measured, or the p99 rule never ran.
+	st = waitFor(t, r.tc, id, "shift-100", 2*time.Minute, func(s flow.Status) bool { return s.Gate != nil && s.Gate.Name == "shift-100" })
+	requireLatency(t, "shift-10", st, true)
+	decide(t, r.tc, id, "shift-100", "alice", flow.Approve)
+	st = waitFor(t, r.tc, id, "switch", 2*time.Minute, func(s flow.Status) bool { return s.Gate != nil && s.Gate.Name == "switch" })
+	requireLatency(t, "shift-100", st, false)
+	for _, step := range []struct{ gate, who string }{{"switch", "alice"}, {"switch", "bob"}, {"finish", "alice"}} {
 		decide(t, r.tc, id, step.gate, step.who, flow.Approve)
 	}
 	var res flow.Result
