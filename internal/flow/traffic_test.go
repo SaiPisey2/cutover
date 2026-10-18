@@ -405,7 +405,7 @@ func latencySampler(stepMs float64) sampler {
 	return phases(batch{20, 1000}, batch{20, 1000}, batch{50, 500}, batch{stepMs, 500})
 }
 
-// the reference p99 includes the baseline target p99 when the
+// The reference p99 includes the baseline target p99 when the
 // target served min_requests during Rehearse. The target's 50ms there
 // makes 100ms within 2x; against the source's 20ms alone it would trip.
 func TestShiftP99ReferenceIncludesBaselineTarget(t *testing.T) {
@@ -519,20 +519,20 @@ func preapprovedRamp(t *testing.T, s sampler) Result {
 	return r
 }
 
-// when the source serves fewer than min_requests in the
+// When the source serves fewer than min_requests in the
 // window, the baseline source p99 (50ms) is the reference; the target
 // served too little in Rehearse to count. 100ms is within 2x.
 func TestShiftP99ReferenceFallsBackToBaselineSource(t *testing.T) {
 	preapprovedRamp(t, phases(batch{50, 1000}, batch{20, 10}, batch{20, 10}, batch{60, 500}))
 }
 
-// this window's source p99 (50ms, over min_requests) counts
+// This window's source p99 (50ms, over min_requests) counts
 // when it is above the baseline's (20ms). 100ms is within 2x of 50ms.
 func TestShiftP99ReferenceUsesWindowSource(t *testing.T) {
 	preapprovedRamp(t, phases(batch{20, 1000}, batch{50, 1000}, batch{20, 10}, batch{60, 500}))
 }
 
-// a source that served fewer than min_requests in the window
+// A source that served fewer than min_requests in the window
 // does not set the reference, however slow its few requests were. The
 // target's 100ms trips against the baseline source's 20ms.
 func TestShiftP99IgnoresThinWindowSource(t *testing.T) {

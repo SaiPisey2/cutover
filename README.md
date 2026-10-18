@@ -71,11 +71,11 @@ cutover route apply --plan plan.yaml
 cutover route list --plan plan.yaml
 ```
 
-A finished migration leaves its route on the target alone; `route apply`
-replaces that route with the plan's 100% source route (even one another
-plan name owns, when it is in that finished shape), so the host can be
-registered again. Discover blocks until every route is registered and every route host
-resolves only to `frontdoor.addresses`.
+A finished migration leaves its route pointing only at the target. Running
+`route apply` again replaces it with the plan's 100% source route, even if
+another plan name owns it, so the same host can be migrated again. Discover
+blocks until every route is registered and every route host resolves only
+to `frontdoor.addresses`.
 
 ## Services
 

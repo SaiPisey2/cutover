@@ -305,8 +305,9 @@ func (r *runner) hold() (traffic.Verdict, error) {
 	}
 }
 
-// judge applies the tripwire to every service in a window . The reference p99 is the highest of this window's source p99 (only if
-// the source served min_requests), the baseline source p99 and the baseline
+// judge applies the tripwire to every service in a window. The reference
+// p99 is the highest of this window's source p99 (only if the source served
+// min_requests), the baseline source p99 and the baseline
 // target p99 (only if it served min_requests); a window whose reference
 // has no p99 cannot judge latency and is unjudged, as is any service with
 // fewer than min_requests.
