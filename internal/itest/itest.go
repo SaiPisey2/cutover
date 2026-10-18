@@ -7,11 +7,13 @@ package itest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,6 +189,39 @@ func Reset(t testing.TB) {
 			t.Fatalf("pgbouncer %s: %v", cmd, err)
 		}
 	}
+	a, err := pgbouncer.Dial(ctx, AdminDSN)
+	if err != nil {
+		t.Fatalf("pgbouncer admin: %v (run: make itest-up)", err)
+	}
+	defer a.Close(ctx)
+	mountOnce.Do(func() { mountErr = checkRoutesMount(ctx, a, RoutesFile(t)) })
+	if mountErr != nil {
+		t.Fatal(mountErr)
+	}
+	if d, err := a.Database(ctx, "app"); err != nil || d.Host != "pg-source" {
+		t.Fatalf("after reset pgbouncer routes app to %+v (%v), want pg-source", d, err)
+	}
+}
+
+var (
+	mountOnce sync.Once
+	mountErr  error
+)
+
+// checkRoutesMount proves PgBouncer reads the routes file this checkout
+// writes, by routing to the target and back. The compose project name is
+// fixed, so containers started from another checkout (a git worktree)
+// keep serving that checkout's routes file: every write here then lands
+// in a file PgBouncer never reads, and a Repoint fails only much later.
+func checkRoutesMount(ctx context.Context, a *pgbouncer.Admin, path string) error {
+	for _, r := range []string{TargetRoute, SourceRoute} {
+		if err := pgbouncer.Repoint(ctx, a, path, "app", r); err != nil {
+			_ = pgbouncer.WriteRoute(path, "app", SourceRoute)
+			return fmt.Errorf("pgbouncer does not read %s: %v; the harness was probably started from another checkout "+
+				"(see the routes mount in docker inspect cutover-it-pgbouncer-1); run make itest-down && make itest-up here", path, err)
+		}
+	}
+	return nil
 }
 
 func mustExec(t testing.TB, c *pgx.Conn, sql string) {
