@@ -31,9 +31,12 @@ type fakeTemporal struct {
 	err       error // returned by every call when set
 	// meet, when set, makes Status wait (up to a second) until that many
 	// Status calls are in flight, so a race that is possible is certain.
-	meet      int
-	arrived   int
-	gateErr   error
+	meet    int
+	arrived int
+	gateErr error
+	// action, when set, runs inside Start, Gate and Rollback with their
+	// context; its error is the call's.
+	action    func(ctx context.Context) error
 	gates     []flow.GateSignal
 	rollbacks []flow.RollbackSignal
 	starts    []string
@@ -98,11 +101,16 @@ func (f *fakeTemporal) Replicate(_ context.Context, wid string) (flow.ReplicateS
 	return r, nil
 }
 
-func (f *fakeTemporal) Start(_ context.Context, id string, _ plan.Plan) error {
+func (f *fakeTemporal) Start(ctx context.Context, id string, _ plan.Plan) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
+	}
+	if f.action != nil {
+		if err := f.action(ctx); err != nil {
+			return err
+		}
 	}
 	if _, ok := f.statuses[id]; ok {
 		return ErrExists
@@ -112,11 +120,16 @@ func (f *fakeTemporal) Start(_ context.Context, id string, _ plan.Plan) error {
 	return nil
 }
 
-func (f *fakeTemporal) Gate(_ context.Context, id string, s flow.GateSignal) error {
+func (f *fakeTemporal) Gate(ctx context.Context, id string, s flow.GateSignal) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
+	}
+	if f.action != nil {
+		if err := f.action(ctx); err != nil {
+			return err
+		}
 	}
 	if f.gateErr != nil {
 		return f.gateErr
@@ -129,11 +142,16 @@ func (f *fakeTemporal) Gate(_ context.Context, id string, s flow.GateSignal) err
 	return nil
 }
 
-func (f *fakeTemporal) Rollback(_ context.Context, _ string, s flow.RollbackSignal) error {
+func (f *fakeTemporal) Rollback(ctx context.Context, _ string, s flow.RollbackSignal) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
+	}
+	if f.action != nil {
+		if err := f.action(ctx); err != nil {
+			return err
+		}
 	}
 	f.rollbacks = append(f.rollbacks, s)
 	return nil
@@ -203,7 +221,12 @@ func (e *apiEnv) session(approverID string) user { return e.sessionAged(approver
 
 func (e *apiEnv) do(u *user, method, path, body string) *httptest.ResponseRecorder {
 	e.t.Helper()
-	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	return e.doCtx(context.Background(), u, method, path, body)
+}
+
+func (e *apiEnv) doCtx(ctx context.Context, u *user, method, path, body string) *httptest.ResponseRecorder {
+	e.t.Helper()
+	r := httptest.NewRequestWithContext(ctx, method, path, strings.NewReader(body))
 	if body != "" {
 		r.Header.Set("Content-Type", "application/json")
 	}
@@ -306,7 +329,7 @@ func TestSwitchNeedsADifferentPerson(t *testing.T) {
 	// The same account in a second session.
 	w := e.decide(e.session("a1"), "m1", "switch", "approve")
 	require.Equal(t, 409, w.Code)
-	require.Equal(t, "the second approval must come from a different person", errBody(t, w))
+	require.Equal(t, "you already approved this gate", errBody(t, w))
 
 	// A new account that reuses the name: names are lowercase only, so the
 	// case-insensitive rule is met by disabling alice and creating alice again.
@@ -328,6 +351,7 @@ func TestSwitchNameRuleIsCaseInsensitive(t *testing.T) {
 	e.fake.statuses["m1"].Gate.Approvals = []string{"ALICE#cli"}
 	w := e.decide(e.session("a1"), "m1", "switch", "approve")
 	require.Equal(t, 409, w.Code)
+	require.Equal(t, "the second approval must come from a different person", errBody(t, w))
 	require.Empty(t, e.fake.gateCalls())
 }
 
@@ -337,7 +361,7 @@ func TestAnyGateRefusesARepeatedAccount(t *testing.T) {
 	e.fake.statuses["m1"].Gate.Approvals = []string{"alice#a1"}
 	w := e.decide(e.session("a1"), "m1", "rehearse", "reject")
 	require.Equal(t, 409, w.Code)
-	require.Equal(t, "the second approval must come from a different person", errBody(t, w))
+	require.Equal(t, "you already approved this gate", errBody(t, w))
 	require.Empty(t, e.fake.gateCalls())
 }
 
@@ -751,4 +775,83 @@ func TestUnknownAPIPathNeedsLogin(t *testing.T) {
 	require.Equal(t, 200, rec.Code)
 	require.Equal(t, 200, e.do(&alice, "GET", "/api/me", "").Code)
 	require.Equal(t, 204, e.do(&alice, "POST", "/api/logout", "").Code)
+}
+
+func TestActionsNeedTheCSRFHeader(t *testing.T) {
+	e := newAPIEnv(t)
+	e.fake.open("m1", "prepare", 1)
+	alice := e.session("a1")
+	noCSRF := user{cookie: alice.cookie}
+	for _, c := range []struct{ path, body string }{
+		{"/api/migrations/m1/gates/prepare", decision("approve", "", e.digest(alice, "m1"))},
+		{"/api/migrations/m1/rollback", `{"reason":"r"}`},
+		{"/api/migrations", startJSON("m9", examplePlan(t))},
+	} {
+		for _, u := range []user{noCSRF, {cookie: alice.cookie, csrf: "wrong"}} {
+			w := e.do(&u, "POST", c.path, c.body)
+			require.Equal(t, 403, w.Code, c.path)
+		}
+	}
+	require.Empty(t, e.fake.gateCalls())
+	require.Empty(t, e.fake.rollbacks)
+	require.Empty(t, e.fake.starts)
+	rows, err := e.st.AuditPage(context.Background(), "", 0, 100)
+	require.NoError(t, err)
+	require.Empty(t, rows)
+}
+
+// TestDisconnectDoesNotStrandTheAuditRow: once the action's row is
+// written, a client that goes away cancels neither the signal nor the row
+// that records it failed.
+func TestDisconnectDoesNotStrandTheAuditRow(t *testing.T) {
+	cases := []struct {
+		name, path, kind, failed string
+		body                     func(e *apiEnv, u user) string
+	}{
+		{"decide", "/api/migrations/m1/gates/prepare", "gate-decision", "gate-decision-failed",
+			func(e *apiEnv, u user) string { return decision("approve", "ok", e.digest(u, "m1")) }},
+		{"rollback", "/api/migrations/m1/rollback", "rollback", "rollback-failed",
+			func(*apiEnv, user) string { return `{"reason":"r"}` }},
+		{"start", "/api/migrations", "migration-started", "migration-start-failed",
+			func(_ *apiEnv, _ user) string { return startJSON("m2", examplePlan(t)) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name+"/signal-succeeds", func(t *testing.T) {
+			e := newAPIEnv(t)
+			e.fake.open("m1", "prepare", 1)
+			alice := e.session("a1")
+			body := c.body(e, alice)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var seen error
+			e.fake.action = func(actx context.Context) error {
+				cancel() // the client goes away mid-call
+				seen = actx.Err()
+				return seen
+			}
+			w := e.doCtx(ctx, &alice, "POST", c.path, body)
+			require.NoError(t, seen)
+			require.Contains(t, []int{201, 202}, w.Code, w.Body.String())
+			require.Len(t, e.audit(c.kind), 1)
+			require.Empty(t, e.audit(c.failed))
+		})
+		t.Run(c.name+"/signal-fails", func(t *testing.T) {
+			e := newAPIEnv(t)
+			e.fake.open("m1", "prepare", 1)
+			alice := e.session("a1")
+			body := c.body(e, alice)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			e.fake.action = func(context.Context) error {
+				cancel()
+				return fmt.Errorf("%w: deadline exceeded", ErrTemporal)
+			}
+			w := e.doCtx(ctx, &alice, "POST", c.path, body)
+			require.Equal(t, 503, w.Code)
+			require.Len(t, e.audit(c.kind), 1)
+			failed := e.audit(c.failed)
+			require.Len(t, failed, 1)
+			require.True(t, strings.HasPrefix(failed[0].Note, "not confirmed"), failed[0].Note)
+		})
+	}
 }

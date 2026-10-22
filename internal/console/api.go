@@ -56,8 +56,10 @@ type Deps struct {
 
 const (
 	apiBodyLimit = 64 << 10
-	// temporalTimeout bounds each Temporal call a request makes.
+	// temporalTimeout bounds each Temporal query a request makes.
 	temporalTimeout = 10 * time.Second
+	// actionTimeout bounds a signal or start, on its own clock.
+	actionTimeout = 10 * time.Second
 	// switchFreshness is how old a session may be to approve the switch.
 	switchFreshness = 15 * time.Minute
 	gateSwitch      = "switch"
@@ -81,6 +83,7 @@ const (
 	errStaleEvidence  = `{"error":"evidence changed; review the gate again"}`
 	errSignInAgain    = `{"error":"sign in again to decide the switch"}`
 	errDifferentHuman = `{"error":"the second approval must come from a different person"}`
+	errAlreadyDecided = `{"error":"you already approved this gate"}`
 	errNotYAML        = "plan is not valid YAML"
 )
 
@@ -151,6 +154,14 @@ func (h *api) temporalFailed(w http.ResponseWriter, what string, err error) {
 
 func tctx(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), temporalTimeout)
+}
+
+// actionCtx is the context for what follows an action's audit row: the
+// signal or start, and the row that records it failed. Once the row is
+// written the action must be carried through or marked failed, so a
+// client that disconnects cannot cancel it half way.
+func actionCtx(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), actionTimeout)
 }
 
 // readBody decodes exactly one JSON object into v: application/json only,
@@ -362,10 +373,10 @@ func (h *api) start(w http.ResponseWriter, r *http.Request, s store.Session) {
 		h.internal(w, "audit migration-started", err)
 		return
 	}
-	ctx, cancel := tctx(r)
+	ctx, cancel := actionCtx(r)
 	defer cancel()
 	if err := h.d.Temporal.Start(ctx, id, p); err != nil {
-		h.auditFailed(r.Context(), row, "migration-start-failed")
+		h.auditFailed(ctx, row, "migration-start-failed")
 		h.temporalFailed(w, "start", err)
 		return
 	}
@@ -373,13 +384,23 @@ func (h *api) start(w http.ResponseWriter, r *http.Request, s store.Session) {
 	reply(w, http.StatusCreated, map[string]string{"id": id})
 }
 
-// auditFailed records that the action row's signal did not go through.
+// auditFailed follows an action's row with one saying it was not
+// confirmed. A "*-failed" kind means exactly that, not "did not happen": a
+// signal that timed out may still have reached the workflow, whose own
+// history is the final word.
 func (h *api) auditFailed(ctx context.Context, row store.AuditRow, kind string) {
 	row.Kind, row.At = kind, h.auth.Now()
+	if row.Note == "" {
+		row.Note = notConfirmed
+	} else {
+		row.Note = notConfirmed + "; note: " + row.Note
+	}
 	if _, err := h.d.Store.AppendAudit(ctx, row); err != nil {
 		h.log.Error("console api: audit "+kind, "migration", row.Migration, "err", err)
 	}
 }
+
+const notConfirmed = "not confirmed (it may still have reached the workflow)"
 
 var yamlLine = regexp.MustCompile(`line (\d+)`)
 
@@ -468,7 +489,11 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 	// An account decides a gate once. On a two-person gate the second
 	// approver must also be another person by name: a disabled account's
 	// name, reused, is still the same person.
-	if slices.Contains(g.Approvals, me) || (twoPerson && body.Decision == flow.Approve && sameName(g.Approvals, s.ApproverName)) {
+	if slices.Contains(g.Approvals, me) {
+		writeJSON(w, http.StatusConflict, errAlreadyDecided)
+		return
+	}
+	if twoPerson && body.Decision == flow.Approve && sameName(g.Approvals, s.ApproverName) {
 		writeJSON(w, http.StatusConflict, errDifferentHuman)
 		return
 	}
@@ -480,8 +505,10 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		return
 	}
 	sig := flow.GateSignal{Gate: gate, Decision: body.Decision, ApproverID: me, Note: body.Note}
-	if err := h.d.Temporal.Gate(ctx, id, sig); err != nil {
-		h.auditFailed(r.Context(), row, "gate-decision-failed")
+	actx, acancel := actionCtx(r)
+	defer acancel()
+	if err := h.d.Temporal.Gate(actx, id, sig); err != nil {
+		h.auditFailed(actx, row, "gate-decision-failed")
 		h.temporalFailed(w, "gate signal", err)
 		return
 	}
@@ -536,8 +563,10 @@ func (h *api) rollback(w http.ResponseWriter, r *http.Request, s store.Session) 
 		h.internal(w, "audit rollback", err)
 		return
 	}
-	if err := h.d.Temporal.Rollback(ctx, id, flow.RollbackSignal{ApproverID: me, Reason: body.Reason}); err != nil {
-		h.auditFailed(r.Context(), row, "rollback-failed")
+	actx, acancel := actionCtx(r)
+	defer acancel()
+	if err := h.d.Temporal.Rollback(actx, id, flow.RollbackSignal{ApproverID: me, Reason: body.Reason}); err != nil {
+		h.auditFailed(actx, row, "rollback-failed")
 		h.temporalFailed(w, "rollback signal", err)
 		return
 	}
