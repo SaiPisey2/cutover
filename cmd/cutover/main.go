@@ -323,7 +323,16 @@ func consoleCmd(ctx context.Context, cmd string, args []string, stdout, stderr i
 	if u, err := url.Parse(*server); err != nil || u.Scheme != "https" || u.Host == "" {
 		return usagef("%s: --server %q must be an https URL like https://127.0.0.1:7700", cmd, *server)
 	}
-	caPEM, err := readCA(*caPath)
+	// Named in a read error, so the operator knows which setting to fix.
+	var caSource string
+	switch {
+	case *caPath == "":
+	case explicit(fs, "ca"):
+		caSource = "--ca " + *caPath
+	default:
+		caSource = "CUTOVER_CA=" + *caPath
+	}
+	caPEM, err := readCA(*caPath, caSource)
 	if err != nil {
 		return err
 	}
@@ -335,15 +344,30 @@ func consoleCmd(ctx context.Context, cmd string, args []string, stdout, stderr i
 	if err != nil {
 		return err
 	}
-	if err := c.Login(ctx, *as, pw); err != nil {
-		return err
+	err = c.Login(ctx, *as, pw)
+	if err == nil {
+		err = act(ctx, c)
 	}
-	return act(ctx, c)
+	var ae *console.APIError
+	if err != nil && !errors.As(err, &ae) {
+		// The console never answered: say what to check.
+		return fmt.Errorf("%w\nis \"cutover server --data DIR\" running at %s, and does --ca point at DIR/ca.crt?", err, *server)
+	}
+	return err
+}
+
+// explicit reports whether the flag was given on the command line.
+func explicit(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) { found = found || f.Name == name })
+	return found
 }
 
 // readCA reads the CA certificate the CLI trusts: path, else
-// ~/.cutover/ca.crt if it exists. Neither is a usage error.
-func readCA(path string) ([]byte, error) {
+// ~/.cutover/ca.crt if it exists. No CA at all is a usage error; one that
+// cannot be read is not. source names
+// where path came from, for a read error.
+func readCA(path, source string) ([]byte, error) {
 	if path == "" {
 		home, err := os.UserHomeDir()
 		if err == nil {
@@ -356,7 +380,11 @@ func readCA(path string) ([]byte, error) {
 	if path == "" {
 		return nil, usagef("no CA certificate: pass --ca FILE or set CUTOVER_CA (the server writes DATA/ca.crt), or copy it to ~/.cutover/ca.crt")
 	}
-	return os.ReadFile(path)
+	b, err := os.ReadFile(path)
+	if err != nil && source != "" {
+		return nil, fmt.Errorf("%s: %w", source, err)
+	}
+	return b, err
 }
 
 // loginPassword reads the account's password: once from the terminal

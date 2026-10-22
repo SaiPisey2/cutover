@@ -286,6 +286,9 @@ func TestServerConsoleFlags(t *testing.T) {
 		{[]string{"--data", data, "--tls-hosts", "-a.example.com"}, "--tls-hosts"},
 		{[]string{"--data", data, "--tls-hosts", "a_b.example.com"}, "--tls-hosts"},
 		{[]string{"--data", data, "--tls-hosts", strings.Repeat("a", 64) + ".com"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "1.2.3"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "999.1.1.1"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "localhost,10"}, "--tls-hosts"},
 	} {
 		code, _, errb := exec(append(append([]string{}, base...), tc.args...)...)
 		if code != 2 || !strings.Contains(errb, tc.want) {
@@ -295,7 +298,7 @@ func TestServerConsoleFlags(t *testing.T) {
 	if _, err := os.Stat(data); !os.IsNotExist(err) {
 		t.Fatalf("a refused start must not create the data directory: %v", err)
 	}
-	for _, h := range []string{"127.0.0.1", "::1", "localhost", "console.example.com", "a-1.b2"} {
+	for _, h := range []string{"127.0.0.1", "::1", "localhost", "console.example.com", "a-1.b2", "1.2.3.example"} {
 		if err := checkTLSHost(h); err != nil {
 			t.Errorf("%s: %v", h, err)
 		}
@@ -386,7 +389,7 @@ func TestServerServesConsole(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 	// A cookie for a raw stream request; the client keeps its own.
-	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool(t, ca)}}}
+	hc := &http.Client{Transport: &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: pool(t, ca)}}}
 	resp, err := hc.Post("https://"+consoleAddr+"/api/login", "application/json",
 		strings.NewReader(`{"name":"alice","password":"`+goodPassword+`"}`))
 	if err != nil || resp.StatusCode != 200 {
@@ -402,6 +405,11 @@ func TestServerServesConsole(t *testing.T) {
 		t.Fatalf("stream: %v %+v", err, sresp)
 	}
 	defer sresp.Body.Close()
+	// Over HTTP/2 a write deadline is a timer on the whole stream: the
+	// shutdown check below must hold for the protocol browsers use.
+	if sresp.Proto != "HTTP/2.0" {
+		t.Fatalf("stream over %s, want HTTP/2.0", sresp.Proto)
+	}
 
 	// Temporal is down: the API says so with its fixed text.
 	_, err = c.Status(ctx, "shop")

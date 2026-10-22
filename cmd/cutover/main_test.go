@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -388,5 +389,35 @@ func TestCADefaultsToHomeFile(t *testing.T) {
 	}
 	if code, _, errb := execIn(goodPassword+"\n", "gate", "m1", "prepare", "approve", "--as", "alice", "--password-stdin"); code != 0 {
 		t.Fatalf("code %d err %q", code, errb)
+	}
+}
+
+func TestUnreadableCANamesItsSource(t *testing.T) {
+	noServer(t)
+	missing := filepath.Join(t.TempDir(), "nope.crt")
+	code, _, errb := execIn(goodPassword+"\n", "gate", "m1", "prepare", "approve", "--as", "alice", "--password-stdin", "--ca", missing)
+	if code != 1 || !strings.Contains(errb, "--ca "+missing+": ") {
+		t.Fatalf("flag: code %d err %q", code, errb)
+	}
+	t.Setenv("CUTOVER_CA", missing)
+	code, _, errb = execIn(goodPassword+"\n", "gate", "m1", "prepare", "approve", "--as", "alice", "--password-stdin")
+	if code != 1 || !strings.Contains(errb, "CUTOVER_CA="+missing+": ") {
+		t.Fatalf("env: code %d err %q", code, errb)
+	}
+}
+
+func TestUnreachableServerGetsAHint(t *testing.T) {
+	e := newConsoleEnv(t)
+	e.fake.open("m1", "prepare", 1)
+	dead := "https://127.0.0.1:" + strconv.Itoa(freePort(t))
+	code, _, errb := execIn(goodPassword+"\n", "gate", "m1", "prepare", "approve", "--as", "alice", "--password-stdin", "--server", dead)
+	want := `is "cutover server --data DIR" running at ` + dead + ", and does --ca point at DIR/ca.crt?"
+	if code != 1 || !strings.Contains(errb, want) {
+		t.Fatalf("code %d err %q", code, errb)
+	}
+	// A refusal from a console that answered gets no hint.
+	code, _, errb = execIn("not the password\n", "gate", "m1", "prepare", "approve", "--as", "alice", "--password-stdin")
+	if code != 1 || strings.Contains(errb, "is \"cutover server") {
+		t.Fatalf("api refusal: code %d err %q", code, errb)
 	}
 }

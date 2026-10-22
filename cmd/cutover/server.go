@@ -197,7 +197,12 @@ func checkTLSHost(h string) error {
 	if h == "" || len(h) > 253 {
 		return fmt.Errorf("%q is not an IP address or DNS name", h)
 	}
-	for _, label := range strings.Split(h, ".") {
+	labels := strings.Split(h, ".")
+	// An all-digit last label is a mistyped IP address (1.2.3), not a name.
+	if last := labels[len(labels)-1]; strings.Trim(last, "0123456789") == "" {
+		return fmt.Errorf("%q is not an IP address or DNS name", h)
+	}
+	for _, label := range labels {
 		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 			return fmt.Errorf("%q is not an IP address or DNS name", h)
 		}
