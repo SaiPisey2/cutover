@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
@@ -116,9 +118,21 @@ func (g *temporalGateway) Rollback(ctx context.Context, id string, s flow.Rollba
 	return mapErr(g.c.SignalWorkflow(ctx, flow.WorkflowID(id), "", flow.SignalRollback, s))
 }
 
-// List returns the newest 100 migrations. Every one is asked for its
-// status; a closed one whose query fails (no worker, history too old) shows
-// a state derived from how it closed, never a raw close status.
+// StateUnavailable is the state shown for a running migration whose status
+// could not be read in time.
+const StateUnavailable = "unavailable"
+
+// rowTimeout bounds each per-row status query in List; a var so tests can
+// shrink it.
+var rowTimeout = 3 * time.Second
+
+const listConcurrency = 8
+
+// List returns the newest 100 migrations, in Temporal's order. Every one is
+// asked for its status, a few at a time, each under its own timeout. A row
+// whose query fails still appears: a closed one shows a state derived from
+// how it closed, a running one shows StateUnavailable. If ctx itself ends,
+// List fails with ErrTemporal instead of degrading the rest.
 func (g *temporalGateway) List(ctx context.Context) ([]MigrationSummary, error) {
 	resp, err := g.c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
 		Query: listQuery, PageSize: listPageSize,
@@ -126,28 +140,46 @@ func (g *temporalGateway) List(ctx context.Context) ([]MigrationSummary, error) 
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	out := make([]MigrationSummary, 0, len(resp.GetExecutions()))
-	for _, ex := range resp.GetExecutions() {
-		wid, rid := ex.GetExecution().GetWorkflowId(), ex.GetExecution().GetRunId()
-		sum := MigrationSummary{ID: strings.TrimPrefix(wid, flow.WorkflowID("")), Started: ex.GetStartTime().AsTime()}
-		st, err := g.status(ctx, wid, rid)
-		switch {
-		case err == nil:
-			if st.MigrationID != "" {
-				sum.ID = st.MigrationID
-			}
-			sum.Phase, sum.State = st.Phase, st.State
-			if st.Gate != nil {
-				sum.Gate = st.Gate.Name
-			}
-		case ex.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING:
-			return nil, err
-		case ex.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED:
-			sum.State = flow.StateFinished
-		default:
-			sum.State = flow.StateFailed
-		}
-		out = append(out, sum)
+	execs := resp.GetExecutions()
+	out := make([]MigrationSummary, len(execs))
+	sem := make(chan struct{}, listConcurrency)
+	var wg sync.WaitGroup
+	for i, ex := range execs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			out[i] = g.row(ctx, ex)
+		}()
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrTemporal, err)
 	}
 	return out, nil
+}
+
+func (g *temporalGateway) row(ctx context.Context, ex *workflowpb.WorkflowExecutionInfo) MigrationSummary {
+	wid, rid := ex.GetExecution().GetWorkflowId(), ex.GetExecution().GetRunId()
+	sum := MigrationSummary{ID: strings.TrimPrefix(wid, flow.WorkflowID("")), Started: ex.GetStartTime().AsTime()}
+	qctx, cancel := context.WithTimeout(ctx, rowTimeout)
+	defer cancel()
+	st, err := g.status(qctx, wid, rid)
+	switch {
+	case err == nil:
+		if st.MigrationID != "" {
+			sum.ID = st.MigrationID
+		}
+		sum.Phase, sum.State = st.Phase, st.State
+		if st.Gate != nil {
+			sum.Gate = st.Gate.Name
+		}
+	case ex.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING:
+		sum.State = StateUnavailable
+	case ex.GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED:
+		sum.State = flow.StateFinished
+	default:
+		sum.State = flow.StateFailed
+	}
+	return sum
 }

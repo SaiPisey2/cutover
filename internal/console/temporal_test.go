@@ -157,12 +157,65 @@ func TestTemporalList(t *testing.T) {
 	}
 }
 
+func listOf(ids ...string) *workflowservice.ListWorkflowExecutionsResponse {
+	r := &workflowservice.ListWorkflowExecutionsResponse{}
+	for _, id := range ids {
+		r.Executions = append(r.Executions, exec(id, enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, time.Now()))
+	}
+	return r
+}
+
 func TestTemporalListRunningQueryFailure(t *testing.T) {
 	c := &mocks.Client{}
-	c.On("ListWorkflow", mock.Anything, mock.Anything).Return(&workflowservice.ListWorkflowExecutionsResponse{
-		Executions: []*workflowpb.WorkflowExecutionInfo{exec("migration-a", enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, time.Now())}}, nil)
-	c.On("QueryWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, serviceerror.NewUnavailable("x"))
-	if _, err := NewTemporal(c).List(context.Background()); !errors.Is(err, ErrTemporal) {
+	c.On("ListWorkflow", mock.Anything, mock.Anything).Return(listOf("migration-a", "migration-b"), nil)
+	c.On("QueryWorkflow", mock.Anything, "migration-a", mock.Anything, mock.Anything).
+		Return(encoded(t, flow.Status{MigrationID: "a", Phase: flow.PhasePrepare, State: flow.StateRunning}), nil)
+	c.On("QueryWorkflow", mock.Anything, "migration-b", mock.Anything, mock.Anything).
+		Return(nil, serviceerror.NewUnavailable("x"))
+	got, err := NewTemporal(c).List(context.Background())
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+	if got[0].ID != "a" || got[0].State != flow.StateRunning || got[1].ID != "b" || got[1].State != StateUnavailable {
+		t.Fatalf("rows %+v", got)
+	}
+}
+
+func TestTemporalListRowTimeout(t *testing.T) {
+	old := rowTimeout
+	rowTimeout = 50 * time.Millisecond
+	defer func() { rowTimeout = old }()
+	c := &mocks.Client{}
+	c.On("ListWorkflow", mock.Anything, mock.Anything).Return(listOf("migration-a", "migration-slow", "migration-c"), nil)
+	c.On("QueryWorkflow", mock.Anything, "migration-slow", mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, _, _, _ string, _ ...any) converter.EncodedValue {
+			<-ctx.Done()
+			return nil
+		}, func(ctx context.Context, _, _, _ string, _ ...any) error { <-ctx.Done(); return ctx.Err() })
+	for _, id := range []string{"migration-a", "migration-c"} {
+		c.On("QueryWorkflow", mock.Anything, id, mock.Anything, mock.Anything).
+			Return(encoded(t, flow.Status{MigrationID: id[10:], State: flow.StateRunning}), nil)
+	}
+	start := time.Now()
+	got, err := NewTemporal(c).List(context.Background())
+	if err != nil || len(got) != 3 {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("took %v", time.Since(start))
+	}
+	if got[0].State != flow.StateRunning || got[1].State != StateUnavailable || got[2].State != flow.StateRunning {
+		t.Fatalf("rows %+v", got)
+	}
+}
+
+func TestTemporalListParentCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &mocks.Client{}
+	c.On("ListWorkflow", mock.Anything, mock.Anything).Return(listOf("migration-a", "migration-b"), nil)
+	c.On("QueryWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { cancel() }).Return(nil, context.Canceled)
+	if _, err := NewTemporal(c).List(ctx); !errors.Is(err, ErrTemporal) {
 		t.Fatalf("err %v", err)
 	}
 }
