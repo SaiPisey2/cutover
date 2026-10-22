@@ -45,13 +45,18 @@ type countingTemporal struct {
 	lists    int
 	// onStatus, when set, runs before the n-th Status call (1-based).
 	onStatus func(n int)
+	// running and maxRunning count Status calls in flight.
+	running, maxRunning int
 }
 
 func (c *countingTemporal) Status(ctx context.Context, id string) (flow.Status, error) {
 	c.cmu.Lock()
 	c.statuses++
+	c.running++
+	c.maxRunning = max(c.maxRunning, c.running)
 	n, hook := c.statuses, c.onStatus
 	c.cmu.Unlock()
+	defer func() { c.cmu.Lock(); c.running--; c.cmu.Unlock() }()
 	if hook != nil {
 		hook(n)
 	}
@@ -501,4 +506,50 @@ func TestHubStopsOnShutdown(t *testing.T) {
 	e.requireHubStopped(t)
 	resp, _, _ := e.open(t, alice, "/api/stream")
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// A failing replicate query keeps the last progress in the status (no
+// flapping field, so no event) and is logged once, not every poll.
+func TestStreamKeepsReplicateWhileItsQueryFails(t *testing.T) {
+	fastStream(t, 20*time.Millisecond, time.Hour)
+	e := newStreamEnv(t, false, false, 0)
+	e.fake.open("m1", "prepare", 1)
+	e.fake.mu.Lock()
+	e.fake.statuses["m1"].ReplicateWorkflowID = "r1"
+	e.fake.replicate["r1"] = flow.ReplicateStatus{CopyDone: true, Samples: 7}
+	e.fake.mu.Unlock()
+	_, ch, closeFn := e.open(t, e.session("a1"), "/api/stream?migration=m1")
+	require.Equal(t, "hello", next(t, ch, 2*time.Second).name)
+	evs, _ := collect(ch, 150*time.Millisecond)
+	statuses := named(evs, "status")
+	require.Len(t, statuses, 1)
+	require.Contains(t, statuses[0].data, `"samples":7`)
+
+	e.fake.mu.Lock()
+	delete(e.fake.replicate, "r1") // Replicate now fails
+	e.fake.mu.Unlock()
+	n0, _ := e.temporal.counts()
+	evs, _ = collect(ch, 300*time.Millisecond)
+	n1, _ := e.temporal.counts()
+	require.GreaterOrEqual(t, n1-n0, 5, "status polls while replicate failed")
+	require.Empty(t, evs, "replicate flapped")
+
+	closeFn()
+	e.requireHubStopped(t) // no writer left on the log
+	require.Equal(t, 1, strings.Count(e.logs.String(), "console stream: replicate status"), e.logs.String())
+}
+
+// A status poll still running when the next tick comes is not started
+// again, so an older answer never lands after a newer one.
+func TestStatusPollsForOneMigrationDoNotOverlap(t *testing.T) {
+	fastStream(t, 10*time.Millisecond, time.Hour)
+	e := newStreamEnv(t, false, false, 0)
+	e.fake.open("m1", "prepare", 1)
+	e.temporal.onStatus = func(int) { time.Sleep(60 * time.Millisecond) }
+	_, ch, _ := e.open(t, e.session("a1"), "/api/stream?migration=m1")
+	require.Equal(t, "hello", next(t, ch, 2*time.Second).name)
+	waitFor(t, "4 status polls", func() bool { n, _ := e.temporal.counts(); return n >= 4 })
+	e.temporal.cmu.Lock()
+	defer e.temporal.cmu.Unlock()
+	require.Equal(t, 1, e.temporal.maxRunning, "status polls overlapped")
 }

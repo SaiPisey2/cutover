@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SaiPisey2/cutover/internal/flow"
 	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/store"
 )
@@ -97,6 +98,12 @@ func (s *streamSlots) release(key string) {
 type snapshot struct {
 	data []byte // the last good answer as JSON; nil before the first
 	down bool   // the last poll failed
+	// A status keeps the last replicate progress it got, and from which
+	// child, so a failing replicate query neither drops the field (the UI
+	// would see it flap) nor is logged every poll.
+	rep     *flow.ReplicateStatus
+	repID   string
+	repDown bool
 }
 
 // hub is the one poller behind every stream. It runs only while someone
@@ -118,6 +125,10 @@ type hub struct {
 	stop    context.CancelFunc
 	list    snapshot
 	status  map[string]snapshot
+	// inflight holds, per migration, the generation of the status poll
+	// running for it: a tick skips a migration whose last poll has not
+	// finished, so an older answer never lands after a newer one.
+	inflight map[string]uint64
 	// changed is closed, and replaced, whenever a snapshot changes.
 	changed chan struct{}
 }
@@ -127,7 +138,7 @@ func newHub(ctx context.Context, a *api, log *slog.Logger) *hub {
 		ctx = context.Background()
 	}
 	return &hub{ctx: ctx, api: a, log: log, watch: map[string]int{},
-		status: map[string]snapshot{}, changed: make(chan struct{})}
+		status: map[string]snapshot{}, inflight: map[string]uint64{}, changed: make(chan struct{})}
 }
 
 // subscribe registers a stream, watching migration id unless id is "".
@@ -242,28 +253,54 @@ func (b *hub) pollList(ctx context.Context, gen uint64) {
 	if ctx.Err() != nil {
 		return // stopped: neither an answer nor an outage
 	}
-	var data []byte
-	if err == nil {
-		data, err = json.Marshal(migrationRows(list))
-	}
-	b.set(gen, "", data, err)
+	b.set(gen, "", err, func(*snapshot) ([]byte, error) { return json.Marshal(migrationRows(list)) })
 }
 
 func (b *hub) pollStatus(ctx context.Context, gen uint64, id string) {
-	out, err := b.api.statusReply(ctx, id)
+	b.mu.Lock()
+	if b.inflight[id] == gen {
+		b.mu.Unlock()
+		return
+	}
+	b.inflight[id] = gen
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		if b.inflight[id] == gen {
+			delete(b.inflight, id)
+		}
+		b.mu.Unlock()
+	}()
+
+	out, repErr, err := b.api.statusParts(ctx, id)
 	if ctx.Err() != nil {
 		return
 	}
-	var data []byte
-	if err == nil {
-		data, err = json.Marshal(out)
-	}
-	b.set(gen, id, data, err)
+	b.set(gen, id, err, func(next *snapshot) ([]byte, error) {
+		wid := out.Status.ReplicateWorkflowID
+		switch {
+		case wid == "":
+			next.rep, next.repID, next.repDown = nil, "", false
+		case repErr == nil:
+			next.rep, next.repID, next.repDown = out.Replicate, wid, false
+		default:
+			if !next.repDown {
+				b.log.Warn("console stream: replicate status", "migration", id, "err", repErr)
+			}
+			next.repDown = true
+			if next.repID == wid {
+				out.Replicate = next.rep
+			}
+		}
+		return json.Marshal(out)
+	})
 }
 
-// set records one poll's answer and wakes the streams if it changed. A
-// missing migration is not an outage; it leaves the last answer as it was.
-func (b *hub) set(gen uint64, id string, data []byte, err error) {
+// set records one poll's answer and wakes the streams if it changed. When
+// err is nil, build fills in the new snapshot (it may update its fields)
+// and returns the answer's JSON. A missing migration is not an outage; it
+// leaves the last answer as it was.
+func (b *hub) set(gen uint64, id string, err error, build func(next *snapshot) ([]byte, error)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if gen != b.gen || (id != "" && b.watch[id] == 0) {
@@ -274,9 +311,14 @@ func (b *hub) set(gen uint64, id string, data []byte, err error) {
 		cur = b.status[id]
 	}
 	next := cur
+	if err == nil {
+		var data []byte
+		if data, err = build(&next); err == nil {
+			next.down, next.data = false, data
+		}
+	}
 	switch {
 	case err == nil:
-		next.down, next.data = false, data
 	case errors.Is(err, ErrNoMigration):
 		next.down = false
 	default:
@@ -290,13 +332,13 @@ func (b *hub) set(gen uint64, id string, data []byte, err error) {
 		}
 		next.down = true
 	}
-	if next.down == cur.down && bytes.Equal(next.data, cur.data) {
-		return
-	}
 	if id == "" {
 		b.list = next
 	} else {
 		b.status[id] = next
+	}
+	if next.down == cur.down && bytes.Equal(next.data, cur.data) {
+		return
 	}
 	close(b.changed)
 	b.changed = make(chan struct{})

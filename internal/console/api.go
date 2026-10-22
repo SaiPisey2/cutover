@@ -307,28 +307,38 @@ func (h *api) status(w http.ResponseWriter, r *http.Request, _ store.Session) {
 // statusReply builds the status answer. Its errors are Temporal's mapped
 // errors, or a store error, which temporalFailed answers as a 500.
 func (h *api) statusReply(ctx context.Context, id string) (StatusReply, error) {
+	out, repErr, err := h.statusParts(ctx, id)
+	if repErr != nil {
+		h.log.Warn("console api: replicate status", "migration", id, "err", repErr)
+	}
+	return out, err
+}
+
+// statusParts is statusReply with the replicate query's failure apart:
+// the child's progress is extra detail, so without it the status is still
+// true and Replicate is left nil; repErr says why, for the caller to log
+// (the stream's hub logs it once per outage, not once per poll).
+func (h *api) statusParts(ctx context.Context, id string) (out StatusReply, repErr, err error) {
 	tc, cancel := context.WithTimeout(ctx, temporalTimeout)
 	defer cancel()
 	st, err := h.d.Temporal.Status(tc, id)
 	if err != nil {
-		return StatusReply{}, err
+		return StatusReply{}, nil, err
 	}
-	out := StatusReply{Status: st, EvidenceDigest: flow.EvidenceDigest(st)}
+	out = StatusReply{Status: st, EvidenceDigest: flow.EvidenceDigest(st)}
 	if st.ReplicateWorkflowID != "" {
-		// The child's progress is extra detail: without it the status is
-		// still true, so a failed query leaves it out.
 		rs, err := h.d.Temporal.Replicate(tc, st.ReplicateWorkflowID)
 		if err == nil {
 			out.Replicate = &rs
 		} else {
-			h.log.Warn("console api: replicate status", "migration", id, "err", err)
+			repErr = err
 		}
 	}
-	out.Names, err = h.names(ctx, st)
+	out.Names, err = h.names(tc, st)
 	if err != nil {
-		return StatusReply{}, fmt.Errorf("names: %w", err)
+		return StatusReply{}, nil, fmt.Errorf("names: %w", err)
 	}
-	return out, nil
+	return out, repErr, nil
 }
 
 func (h *api) names(ctx context.Context, st flow.Status) (map[string]string, error) {
