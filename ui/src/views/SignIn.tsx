@@ -21,7 +21,10 @@ export default function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void })
     // in the page no longer than it takes to send. It is never written to
     // any storage; the server answers with its own HttpOnly session cookie.
     setPassword('');
-    if (!n || !p) return;
+    if (!n || !p) {
+      setError('Enter your name and password.');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -31,6 +34,7 @@ export default function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void })
       // a login error must not say whether the name exists.
       if (err instanceof ApiError && err.status === 429) setError('Too many attempts. Wait a minute.');
       else if (err instanceof ApiError && err.status === 401) setError('Wrong name or password.');
+      else if (err instanceof ApiError) setError('The console refused the sign-in. Try again.');
       else setError('Could not reach cutover. Try again.');
     } finally {
       setBusy(false);

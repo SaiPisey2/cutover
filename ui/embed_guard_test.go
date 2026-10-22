@@ -50,6 +50,9 @@ var (
 // one of our files asks for it.
 var sourceForbidden = []string{
 	`.cssText`,
+	// A JSX style prop becomes an inline style attribute.
+	`style={`,
+	`style=`,
 	`createElement('style')`,
 	`createElement("style")`,
 	"createElement(`style`)",

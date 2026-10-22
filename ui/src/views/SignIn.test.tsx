@@ -56,4 +56,22 @@ describe('SignIn', () => {
     await submit('ana', 'pw');
     expect((await screen.findByRole('alert')).textContent).toBe('Could not reach cutover. Try again.');
   });
+
+  it('asks for both fields instead of silently clearing, and sends nothing', async () => {
+    const calls = mockFetch({});
+    render(<SignIn onSignedIn={() => {}} />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Name'), '   ');
+    await user.type(screen.getByLabelText('Password'), 'pw');
+    await user.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('Enter your name and password.');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('says the console refused on other server errors', async () => {
+    mockFetch({ 'POST /api/login': { status: 500, body: { error: 'x' } } });
+    render(<SignIn onSignedIn={() => {}} />);
+    await submit('ana', 'pw');
+    expect((await screen.findByRole('alert')).textContent).toBe('The console refused the sign-in. Try again.');
+  });
 });

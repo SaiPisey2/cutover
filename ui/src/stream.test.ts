@@ -36,6 +36,11 @@ class FakeES {
   }
 }
 
+const unsubs: (() => void)[] = [];
+const watchSignedOut = (fn: () => void) => {
+  unsubs.push(onSignedOut(fn));
+};
+
 const me = { name: 'ana', id: 'a1', csrf: 'c', session_created: 'x' };
 
 beforeEach(() => {
@@ -45,6 +50,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  unsubs.splice(0).forEach((u) => u());
+  // Drop the module's status between tests: closing is what resets it.
+  openStream()();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   setCSRF('');
@@ -95,7 +103,7 @@ describe('openStream', () => {
 
   it('signs out on expired and does not reconnect', async () => {
     const off = vi.fn();
-    onSignedOut(off);
+    watchSignedOut(off);
     const close = openStream();
     FakeES.all[0].open();
     FakeES.all[0].send('expired', '{}');
@@ -135,7 +143,7 @@ describe('openStream', () => {
   it('signs out instead of retrying when the session is gone', async () => {
     mockFetch({ 'GET /api/me': { status: 401, body: { error: 'x' } } });
     const off = vi.fn();
-    onSignedOut(off);
+    watchSignedOut(off);
     const close = openStream();
     FakeES.all[0].refuse();
     await vi.advanceTimersByTimeAsync(0);
