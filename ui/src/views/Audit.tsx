@@ -19,6 +19,16 @@ export function kindLabel(kind: string): string {
   return k.endsWith('-failed') ? `${k} (not confirmed)` : k;
 }
 
+// The account behind a row: the server records actor_id as name#id for
+// approvers, so two accounts with one name stay apart. Anything else (cli)
+// is shown as it is.
+export function actorAccount(actorId: string, actorName: string): string {
+  const id = clean(actorId);
+  if (id === '') return '';
+  const name = clean(actorName);
+  return name !== '' && id.startsWith(name + '#') ? id.slice(name.length) : id;
+}
+
 export default function Audit() {
   const [rows, setRows] = useState<AuditEntry[] | undefined>(undefined);
   const [more, setMore] = useState(false);
@@ -128,7 +138,15 @@ export default function Audit() {
               {rows.map((r) => (
                 <tr key={r.id}>
                   <td>{stamp(r.at)}</td>
-                  <td>{clean(r.actor_name)}</td>
+                  <td>
+                    {clean(r.actor_name)}
+                    {actorAccount(r.actor_id, r.actor_name) !== '' && (
+                      <>
+                        {' '}
+                        <span className="muted">{actorAccount(r.actor_id, r.actor_name)}</span>
+                      </>
+                    )}
+                  </td>
                   <td className="mono">{clean(r.migration)}</td>
                   <td>{kindLabel(r.kind)}</td>
                   <td>{clean(r.gate)}</td>

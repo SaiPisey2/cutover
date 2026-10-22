@@ -529,9 +529,7 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		writeJSON(w, http.StatusForbidden, errSignInAgain)
 		return
 	}
-	// An account decides a gate once. On a two-person gate the second
-	// approver must also be another person by name: a disabled account's
-	// name, reused, is still the same person.
+	// An account decides a gate once.
 	if slices.Contains(g.Approvals, me) {
 		writeJSON(w, http.StatusConflict, errAlreadyDecided)
 		return
@@ -542,6 +540,8 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		writeJSON(w, http.StatusConflict, errAlreadySent)
 		return
 	}
+	// On a two-person gate the second approver must also be another person
+	// by name: a disabled account's name, reused, is still the same person.
 	// The approvals this server sent count too: the status may not show
 	// them yet.
 	approvals := append(slices.Clone(g.Approvals), h.decided.approvals(id, gk)...)

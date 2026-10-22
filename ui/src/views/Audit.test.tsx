@@ -21,6 +21,18 @@ describe('Audit', () => {
     expect(screen.queryByText('abcdef0123456')).toBeNull();
   });
 
+  it('shows the account beside the name so same-named accounts differ', async () => {
+    mockFetch({
+      'GET /api/audit': {
+        body: [row(3, { actor_id: 'alice#n2', actor_name: 'alice' }), row(2, { actor_id: 'alice#o1', actor_name: 'alice' }), row(1, { actor_id: 'cli', actor_name: 'cli' })],
+      },
+    });
+    render(<Audit />);
+    expect(await screen.findByText('#n2')).toBeTruthy();
+    expect(screen.getByText('#o1')).toBeTruthy();
+    expect(screen.getByText('cli', { selector: 'span' })).toBeTruthy();
+  });
+
   it('pages with before=<last id>', async () => {
     const page1 = Array.from({ length: 50 }, (_, i) => row(100 - i));
     const calls = mockFetch({

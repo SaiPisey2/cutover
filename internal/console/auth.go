@@ -183,6 +183,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	ok := a.check(phc, body.password)
 	if !found || !ok {
+		a.limiter.fail(host, a.Now())
 		a.failed(r.Context(), host, body.name)
 		writeJSON(w, http.StatusUnauthorized, errUnauthenticated)
 		return
@@ -196,6 +197,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	a.limiter.clear(host)
 	id, csrf := randomString(), randomString()
 	now := a.Now()
 	s := store.Session{ApproverID: ap.ID, ApproverName: ap.Name, CSRF: csrf, Created: now, Expires: now.Add(a.SessionTTL)}
@@ -321,9 +323,10 @@ func (a *Auth) Session(w http.ResponseWriter, r *http.Request) (store.Session, b
 	return s, true
 }
 
-// limiter is a fixed window per host: at most loginAttempts per
-// loginWindow from the host's first attempt in the window. Every attempt
-// counts, a success included.
+// limiter is a fixed window per host: at most loginAttempts failed logins
+// per loginWindow from the host's first failure in the window. Only
+// failures count, and a success clears the host: the console is
+// loopback-only, so every browser and CLI command shares one address.
 type limiter struct {
 	mu    sync.Mutex
 	hosts map[string]*window
@@ -336,27 +339,47 @@ type window struct {
 
 func newLimiter() *limiter { return &limiter{hosts: map[string]*window{}} }
 
-func (l *limiter) allow(host string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+func (l *limiter) expire(now time.Time) {
 	for h, w := range l.hosts {
 		if !now.Before(w.start.Add(loginWindow)) {
 			delete(l.hosts, h)
 		}
 	}
+}
+
+// allow reports whether host may attempt a login. It records nothing.
+func (l *limiter) allow(host string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.expire(now)
+	w, ok := l.hosts[host]
+	if !ok {
+		return len(l.hosts) < limiterHosts
+	}
+	return w.n < loginAttempts
+}
+
+// fail records a failed login from host.
+func (l *limiter) fail(host string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.expire(now)
 	w, ok := l.hosts[host]
 	if !ok {
 		if len(l.hosts) >= limiterHosts {
-			return false
+			return
 		}
 		w = &window{start: now}
 		l.hosts[host] = w
 	}
-	if w.n >= loginAttempts {
-		return false
-	}
 	w.n++
-	return true
+}
+
+// clear forgets host's failures after a successful login.
+func (l *limiter) clear(host string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.hosts, host)
 }
 
 func (l *limiter) size() int {

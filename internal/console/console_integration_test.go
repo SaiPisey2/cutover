@@ -108,20 +108,19 @@ func (r *itRig) login(name string) *Client {
 }
 
 // decideWith posts a decision with the digest given, not a fresh one, and
-// returns the status code and error text.
-func decideWith(t *testing.T, c *Client, id, gate string, d flow.Decision, digest string) (int, string) {
-	t.Helper()
+// returns the status code and error text. It never fails the test itself,
+// so it is safe from goroutines.
+func decideWith(c *Client, id, gate string, d flow.Decision, digest string) (int, string, error) {
 	err := c.do(context.Background(), http.MethodPost, "/api/migrations/"+id+"/gates/"+gate,
 		decideBody{Decision: d, Note: "it", EvidenceDigest: digest}, nil, http.StatusAccepted)
 	var ae *APIError
 	switch {
 	case err == nil:
-		return http.StatusAccepted, ""
+		return http.StatusAccepted, "", nil
 	case errors.As(err, &ae):
-		return ae.Status, ae.Message
+		return ae.Status, ae.Message, nil
 	default:
-		t.Fatal(err)
-		return 0, ""
+		return 0, "", err
 	}
 }
 
@@ -275,21 +274,33 @@ func TestApprovalsThroughTheServer(t *testing.T) {
 	// Two of alice's sessions at once: exactly one is accepted.
 	var wg sync.WaitGroup
 	codes := make([]int, 2)
+	errs := make([]error, 2)
 	for i, c := range []*Client{alice, alice2} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			codes[i], _ = decideWith(t, c, id, "switch", flow.Approve, d0)
+			codes[i], _, errs[i] = decideWith(c, id, "switch", flow.Approve, d0)
 		}()
 	}
 	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	slices.Sort(codes)
 	if codes[0] != http.StatusAccepted || codes[1] != http.StatusConflict {
 		t.Fatalf("two of alice's sessions at once: %v, want one 202 and one 409", codes)
 	}
 	accepted++
-	// Alice again.
-	if code, msg := decideWith(t, alice, id, "switch", flow.Approve, d0); code != http.StatusConflict {
+	// Once the status shows alice's approval, the digest she saw is stale.
+	// Alice again, with the current digest, is refused for deciding twice.
+	d1 := stream.gateOpen("switch", 1).EvidenceDigest
+	code, msg, derr := decideWith(alice, id, "switch", flow.Approve, d1)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if code != http.StatusConflict || msg != "you already approved this gate" {
 		t.Fatalf("alice again: %d %s", code, msg)
 	}
 	// Another account with alice's name, at once: the same person.
@@ -302,9 +313,11 @@ func TestApprovalsThroughTheServer(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Status != http.StatusConflict || ae.Message != "the second approval must come from a different person" {
 		t.Fatalf("new alice on the switch: %v", err)
 	}
-	// Once the status shows alice's approval, the digest she saw is stale.
-	stream.gateOpen("switch", 1)
-	if code, msg := decideWith(t, bob, id, "switch", flow.Approve, d0); code != http.StatusConflict || msg != "evidence changed; review the gate again" {
+	code, msg, derr = decideWith(bob, id, "switch", flow.Approve, d0)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	if code != http.StatusConflict || msg != "evidence changed; review the gate again" {
 		t.Fatalf("bob with the old digest: %d %s", code, msg)
 	}
 	approve(bob, "switch")

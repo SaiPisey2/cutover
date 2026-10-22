@@ -179,7 +179,7 @@ names to the certificate with `--tls-hosts` if you reach the console by
 another name.
 
 `migrate`, `gate` and `rollback` sign in to the console like the browser
-does: `--server` (default `https://127.0.0.1:7700`), `--ca`, `--as NAME`,
+does: `--server` or `CUTOVER_SERVER` (default `https://127.0.0.1:7700`), `--ca`, `--as NAME`,
 and the password from the terminal or, with `--password-stdin`, from
 standard input. The server is the only thing that signals workflows, so
 every decision passes the same checks wherever it comes from:
@@ -197,7 +197,9 @@ every decision passes the same checks wherever it comes from:
 - **Everything is logged.** Every sign-in, migration start, gate decision
   and rollback goes to an audit log with the account, the time, the
   decision, the note and the evidence digest. The log is append-only; the
-  database refuses updates and deletes.
+  database refuses updates and deletes. A `*-failed` row (for example
+  `gate-decision-failed`) means "not confirmed": the action may or may not
+  have reached the workflow.
 
 With `--data`, the server also asks Envoy to log failed requests to
 `access.log` beside the `--state` file (or `--access-log PATH`), and the

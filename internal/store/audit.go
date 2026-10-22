@@ -7,7 +7,9 @@ import (
 
 // AuditRow is one line of the append-only audit log. Kind is one of
 // login, login-failed, logout, migration-started, gate-decision, rollback,
-// approver-created, approver-disabled. Every field is stored, never
+// approver-created, approver-disabled, and the *-failed rows
+// gate-decision-failed, migration-start-failed, rollback-failed (the
+// action's outcome was not confirmed). Every field is stored, never
 // derived, so the log reads the same after the code that wrote it changes.
 type AuditRow struct {
 	// ID is the rowid, set on read; AppendAudit returns it.

@@ -198,6 +198,26 @@ func TestLoginIsRateLimitedPerIP(t *testing.T) {
 	require.Equal(t, 401, e.login(bad, "10.0.0.1").Code)
 }
 
+func TestLoginLimiterCountsFailuresOnly(t *testing.T) {
+	e := newEnv(t)
+	bad := `{"name":"nobody","password":"x"}`
+	for i := 0; i < 10; i++ {
+		require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
+	}
+	for i := 0; i < 4; i++ {
+		require.Equal(t, 401, e.login(bad, "10.0.0.1").Code)
+	}
+	// a success clears the window
+	require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
+	for i := 0; i < 5; i++ {
+		require.Equal(t, 401, e.login(bad, "10.0.0.1").Code)
+	}
+	// over the limit: refused even with the right password
+	require.Equal(t, 429, e.login(goodBody(), "10.0.0.1").Code)
+	e.advance(time.Minute)
+	require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
+}
+
 func TestLimiterIgnoresForwardedHeaderAndBoundsMemory(t *testing.T) {
 	e := newEnv(t)
 	for i := 0; i < 6; i++ {
@@ -214,7 +234,7 @@ func TestLimiterIgnoresForwardedHeaderAndBoundsMemory(t *testing.T) {
 	l := newLimiter()
 	now := time.Now()
 	for i := 0; i < limiterHosts+10; i++ {
-		l.allow("h"+string(rune(i+0x100)), now)
+		l.fail("h"+string(rune(i+0x100)), now)
 	}
 	require.Equal(t, limiterHosts, l.size())
 	require.False(t, l.allow("brand-new-host", now))
