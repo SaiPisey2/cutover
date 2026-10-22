@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SaiPisey2/cutover/internal/console"
 	"github.com/SaiPisey2/cutover/internal/flow"
 	"github.com/SaiPisey2/cutover/internal/frontdoor"
 	"github.com/SaiPisey2/cutover/internal/traffic"
@@ -255,5 +259,209 @@ func TestRouteApplyIsAllOrNothing(t *testing.T) {
 	code, _, errb := exec("route", "apply", "--plan", p)
 	if code != 1 || !strings.Contains(errb, "in use by a migration") || len(f.puts) != 0 {
 		t.Fatalf("%d %q %+v", code, errb, f.puts)
+	}
+}
+
+func TestServerConsoleFlags(t *testing.T) {
+	noDial(t)
+	state := filepath.Join(t.TempDir(), "fd.json")
+	tok := tokenFile(t, "0123456789abcdef")
+	data := filepath.Join(t.TempDir(), "data")
+	base := []string{"server", "--state", state, "--token-file", tok}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--console", "127.0.0.1:7701"}, "--console needs --data"},
+		{[]string{"--tls-hosts", "localhost"}, "--tls-hosts needs --data"},
+		{[]string{"--access-log", "/tmp/a.log"}, "--access-log needs --data"},
+		{[]string{"--data", data, "--console", "0.0.0.0:7700"}, "loopback"},
+		{[]string{"--data", data, "--console", "10.0.0.5:7700"}, "loopback"},
+		{[]string{"--data", data, "--console", "[::]:7700"}, "loopback"},
+		{[]string{"--data", data, "--console", "127.0.0.1"}, "--console"},
+		{[]string{"--data", data, "--tls-hosts", "bad host"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", ""}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "127.0.0.1,"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "a..b"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "-a.example.com"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", "a_b.example.com"}, "--tls-hosts"},
+		{[]string{"--data", data, "--tls-hosts", strings.Repeat("a", 64) + ".com"}, "--tls-hosts"},
+	} {
+		code, _, errb := exec(append(append([]string{}, base...), tc.args...)...)
+		if code != 2 || !strings.Contains(errb, tc.want) {
+			t.Errorf("%v: %d %q", tc.args, code, errb)
+		}
+	}
+	if _, err := os.Stat(data); !os.IsNotExist(err) {
+		t.Fatalf("a refused start must not create the data directory: %v", err)
+	}
+	for _, h := range []string{"127.0.0.1", "::1", "localhost", "console.example.com", "a-1.b2"} {
+		if err := checkTLSHost(h); err != nil {
+			t.Errorf("%s: %v", h, err)
+		}
+	}
+}
+
+// startServer runs `cutover server` with args until the returned stop is
+// called, which returns the exit code and log.
+func startServer(t *testing.T, args ...string) (stop func() (int, string)) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var code int
+	var errb syncBuffer
+	wg.Add(1)
+	go func() { defer wg.Done(); code = run(ctx, append([]string{"server"}, args...), io.Discard, &errb) }()
+	var once sync.Once
+	stop = func() (int, string) {
+		once.Do(func() { cancel(); wg.Wait() })
+		return code, errb.String()
+	}
+	t.Cleanup(func() { stop() })
+	return stop
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestServerServesConsole(t *testing.T) {
+	noDial(t)
+	isolate(t)
+	data := filepath.Join(t.TempDir(), "data")
+	// An approver made the way an operator would.
+	if code, _, errb := runApprover(t, goodPassword+"\n", "new", "--data", data, "--name", "alice", "--password-stdin"); code != 0 {
+		t.Fatalf("approver: %d %q", code, errb)
+	}
+	stateDir := t.TempDir()
+	consoleAddr := "127.0.0.1:" + strconv.Itoa(freePort(t))
+	stop := startServer(t, "--state", filepath.Join(stateDir, "fd.json"), "--token-file", tokenFile(t, "0123456789abcdef"),
+		"--api", "127.0.0.1:"+strconv.Itoa(freePort(t)), "--xds", "127.0.0.1:"+strconv.Itoa(freePort(t)),
+		"--listen", "127.0.0.1:"+strconv.Itoa(freePort(t)),
+		"--data", data, "--console", consoleAddr,
+		// Nothing listens here: the console must start anyway.
+		"--temporal", "127.0.0.1:"+strconv.Itoa(freePort(t)))
+
+	caPath := filepath.Join(data, "ca.crt")
+	var ca []byte
+	for i := 0; i < 100; i++ {
+		if b, err := os.ReadFile(caPath); err == nil {
+			ca = b
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if ca == nil {
+		code, log := stop()
+		t.Fatalf("no ca.crt; exit %d log %q", code, log)
+	}
+	if fi, err := os.Stat(caPath); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("ca.crt mode: %v %v", fi, err)
+	}
+	c, err := console.NewClient("https://"+consoleAddr, ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if err = c.Login(ctx, "alice", goodPassword); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	// A cookie for a raw stream request; the client keeps its own.
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool(t, ca)}}}
+	resp, err := hc.Post("https://"+consoleAddr+"/api/login", "application/json",
+		strings.NewReader(`{"name":"alice","password":"`+goodPassword+`"}`))
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("raw login: %v %+v", err, resp)
+	}
+	resp.Body.Close()
+	req, _ := http.NewRequest("GET", "https://"+consoleAddr+"/api/stream", nil)
+	for _, ck := range resp.Cookies() {
+		req.AddCookie(ck)
+	}
+	sresp, err := hc.Do(req)
+	if err != nil || sresp.StatusCode != 200 {
+		t.Fatalf("stream: %v %+v", err, sresp)
+	}
+	defer sresp.Body.Close()
+
+	// Temporal is down: the API says so with its fixed text.
+	_, err = c.Status(ctx, "shop")
+	var ae *console.APIError
+	if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || ae.Message != "temporal unavailable" {
+		t.Fatalf("status with temporal down: %v", err)
+	}
+
+	// An open stream must not hold shutdown to its 10s limit.
+	began := time.Now()
+	code, log := stop()
+	if took := time.Since(began); took > 5*time.Second {
+		t.Fatalf("shutdown took %v with a stream open", took)
+	}
+	if code != 0 {
+		t.Fatalf("exit %d log %q", code, log)
+	}
+	if want := "console: https://" + consoleAddr + " (CA " + caPath + ")"; !strings.Contains(log, want) {
+		t.Fatalf("log lacks %q:\n%s", want, log)
+	}
+	if strings.Contains(log, goodPassword) || strings.Contains(log, "0123456789abcdef") {
+		t.Fatalf("log holds a secret:\n%s", log)
+	}
+}
+
+func pool(t *testing.T, pemBytes []byte) *x509.CertPool {
+	p := x509.NewCertPool()
+	if !p.AppendCertsFromPEM(pemBytes) {
+		t.Fatal("bad CA")
+	}
+	return p
+}
+
+func TestKeepRunningRestartsAfterAnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	runs, logged := 0, 0
+	done := make(chan struct{})
+	go func() {
+		keepRunning(ctx, func(ctx context.Context) error {
+			mu.Lock()
+			runs++
+			n := runs
+			mu.Unlock()
+			if n == 3 {
+				cancel()
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return errors.New("permission denied")
+		}, time.Millisecond, func(error) { mu.Lock(); logged++; mu.Unlock() })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("keepRunning did not stop with its context")
+	}
+	if runs != 3 || logged != 2 {
+		t.Fatalf("runs %d logged %d", runs, logged)
 	}
 }

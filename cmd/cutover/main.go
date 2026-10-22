@@ -12,13 +12,16 @@ import (
 	"io"
 	fs2 "io/fs"
 	"log/slog"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
 
+	"github.com/SaiPisey2/cutover/internal/console"
 	"github.com/SaiPisey2/cutover/internal/flow"
 	"github.com/SaiPisey2/cutover/internal/plan"
 )
@@ -27,20 +30,27 @@ const usage = `usage: cutover <command> [arguments] [flags]
 
 commands:
   worker                                   run the Temporal worker
-  migrate --plan FILE [--id ID]            validate a plan and start a migration
+  migrate --plan FILE [--id ID] --as NAME  validate a plan and start a migration
   status ID [--json]                       show phase, gate and recent events
   gate ID GATE approve|reject --as NAME [--note TEXT]
   rollback ID --as NAME --reason TEXT      roll back (any time before Finish)
-  server --state FILE --token-file FILE    run the front door's control plane (xDS + API)
+  server --state FILE --token-file FILE    run the front door's control plane (xDS + API),
+         [--data DIR]                      and with --data the console
   envoy-bootstrap                          print the Envoy bootstrap for the front door
   route apply|list --plan FILE             register the plan's routes at 100% source, or list routes
   approver new|list|disable --data DIR     manage console approver accounts
 
 positional arguments come before flags (ID, GATE and the decision are positional).
 
-flags for every command:
+flags for worker and status:
   --temporal HOST:PORT   Temporal frontend (default $CUTOVER_TEMPORAL or 127.0.0.1:7233)
   --namespace NS         Temporal namespace (default "default")
+
+flags for migrate, gate and rollback, which go through the console:
+  --server URL           console (default $CUTOVER_SERVER or https://127.0.0.1:7700)
+  --ca FILE              CA certificate to trust (default $CUTOVER_CA, or ~/.cutover/ca.crt if it exists)
+  --as NAME              your approver account
+  --password-stdin       read the password from stdin instead of the terminal
 `
 
 var dial = func(hostPort, namespace string, stderr io.Writer) (client.Client, error) {
@@ -132,13 +142,13 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 	case "approver":
 		return approverCmd(ctx, args, stdout, stderr)
 	}
+	switch cmd {
+	case "migrate", "gate", "rollback":
+		return consoleCmd(ctx, cmd, args, stdout, stderr)
+	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	def := os.Getenv("CUTOVER_TEMPORAL")
-	if def == "" {
-		def = "127.0.0.1:7233"
-	}
-	hostPort := fs.String("temporal", def, "Temporal frontend")
+	hostPort := fs.String("temporal", envOr("CUTOVER_TEMPORAL", "127.0.0.1:7233"), "Temporal frontend")
 	ns := fs.String("namespace", "default", "Temporal namespace")
 	connect := func() (client.Client, error) { return dial(*hostPort, *ns, stderr) }
 
@@ -155,42 +165,6 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		w := worker.New(c, flow.TaskQueue, flow.WorkerOptions())
 		flow.Register(w)
 		return w.Run(worker.InterruptCh())
-
-	case "migrate":
-		planPath := fs.String("plan", "", "plan file")
-		id := fs.String("id", "", "migration ID (default: the plan's name)")
-		if err := parse(fs, args); err != nil {
-			return err
-		}
-		if *planPath == "" {
-			return usagef("migrate: --plan is required")
-		}
-		p, err := plan.Load(*planPath)
-		if err != nil {
-			if isPathError(err) {
-				return err
-			}
-			return usagef("%v", err)
-		}
-		mid := p.Name
-		if *id != "" {
-			mid = *id
-		}
-		if !plan.NamePattern.MatchString(mid) {
-			return usagef("migrate: --id must match %s", plan.NamePattern)
-		}
-		c, err := connect()
-		if err != nil {
-			return err
-		}
-		defer c.Close()
-		wr, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: flow.WorkflowID(mid), TaskQueue: flow.TaskQueue},
-			flow.Migration, flow.Input{MigrationID: mid, Plan: p})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "started migration %s (workflow %s, run %s)\n", mid, wr.GetID(), wr.GetRunID())
-		return nil
 
 	case "status":
 		asJSON := fs.Bool("json", false, "print the full status as JSON")
@@ -220,9 +194,72 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		}
 		printStatus(stdout, st)
 		return nil
+	}
+	return usagef("unknown command %q\n\n%s", cmd, usage)
+}
+
+// envOr is the environment variable's value, or def when it is unset or
+// empty.
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// consoleCmd runs migrate, gate and rollback through the console. Every
+// local check -- the plan, the IDs, the decision, the flags, the server
+// URL and the CA -- comes before the password prompt and any request.
+func consoleCmd(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	server := fs.String("server", envOr("CUTOVER_SERVER", "https://127.0.0.1:7700"), "console URL")
+	caPath := fs.String("ca", os.Getenv("CUTOVER_CA"), "CA certificate to trust (default ~/.cutover/ca.crt if it exists)")
+	pwStdin := fs.Bool("password-stdin", false, "read the password from stdin instead of the terminal")
+
+	var act func(context.Context, *console.Client) error
+	var as *string
+	switch cmd {
+	case "migrate":
+		planPath := fs.String("plan", "", "plan file")
+		id := fs.String("id", "", "migration ID (default: the plan's name)")
+		as = fs.String("as", "", "your approver account")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		if *planPath == "" {
+			return usagef("migrate: --plan is required")
+		}
+		// Read once: the plan checked here is the plan sent.
+		raw, err := os.ReadFile(*planPath)
+		if err != nil {
+			return err
+		}
+		p, err := plan.Parse(raw)
+		if err != nil {
+			return usagef("%v", err)
+		}
+		mid := p.Name
+		if *id != "" {
+			mid = *id
+		}
+		if !plan.NamePattern.MatchString(mid) {
+			return usagef("migrate: --id must match %s", plan.NamePattern)
+		}
+		if *as == "" {
+			return usagef("migrate: --as is required")
+		}
+		act = func(ctx context.Context, c *console.Client) error {
+			got, err := c.Start(ctx, mid, raw)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "started migration %s\n", got)
+			return nil
+		}
 
 	case "gate":
-		as := fs.String("as", "", "approver name")
+		as = fs.String("as", "", "your approver account")
 		note := fs.String("note", "", "note recorded with the decision")
 		if wantsHelp(args) {
 			return parse(fs, []string{"-h"})
@@ -241,28 +278,19 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		if *as == "" {
 			return usagef("gate: --as is required")
 		}
-		c, err := connect()
-		if err != nil {
-			return err
+		if !plan.NamePattern.MatchString(pos[0]) {
+			return usagef("gate: migration ID must match %s", plan.NamePattern)
 		}
-		defer c.Close()
-		st, err := queryStatus(ctx, c, pos[0])
-		if err != nil {
-			return err
-		}
-		if st.Gate == nil || st.Gate.Name != pos[1] {
-			open := "none"
-			if st.Gate != nil {
-				open = st.Gate.Name
+		act = func(ctx context.Context, c *console.Client) error {
+			if err := c.Decide(ctx, pos[0], pos[1], d, *note); err != nil {
+				return err
 			}
-			return fmt.Errorf("gate %s is not open (open: %s)", pos[1], open)
+			fmt.Fprintf(stdout, "%s recorded at gate %s of %s\n", d, pos[1], pos[0])
+			return nil
 		}
-		fmt.Fprintln(stderr, notAuthenticated)
-		return c.SignalWorkflow(ctx, flow.WorkflowID(pos[0]), "", flow.SignalGate,
-			flow.GateSignal{Gate: pos[1], Decision: d, ApproverID: *as, Note: *note})
 
 	case "rollback":
-		as := fs.String("as", "", "who is rolling back")
+		as = fs.String("as", "", "your approver account")
 		reason := fs.String("reason", "", "why")
 		if wantsHelp(args) {
 			return parse(fs, []string{"-h"})
@@ -280,19 +308,78 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		if *reason == "" {
 			return usagef("rollback: --reason is required")
 		}
-		c, err := connect()
-		if err != nil {
-			return err
+		if !plan.NamePattern.MatchString(pos[0]) {
+			return usagef("rollback: migration ID must match %s", plan.NamePattern)
 		}
-		defer c.Close()
-		fmt.Fprintln(stderr, notAuthenticated)
-		return c.SignalWorkflow(ctx, flow.WorkflowID(pos[0]), "", flow.SignalRollback,
-			flow.RollbackSignal{ApproverID: *as, Reason: *reason})
+		act = func(ctx context.Context, c *console.Client) error {
+			if err := c.Rollback(ctx, pos[0], *reason); err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "rollback of %s requested\n", pos[0])
+			return nil
+		}
 	}
-	return usagef("unknown command %q\n\n%s", cmd, usage)
+
+	if u, err := url.Parse(*server); err != nil || u.Scheme != "https" || u.Host == "" {
+		return usagef("%s: --server %q must be an https URL like https://127.0.0.1:7700", cmd, *server)
+	}
+	caPEM, err := readCA(*caPath)
+	if err != nil {
+		return err
+	}
+	c, err := console.NewClient(*server, caPEM)
+	if err != nil {
+		return usagef("%s: %v", cmd, err)
+	}
+	pw, err := loginPassword(*pwStdin, *as, cmd, stderr)
+	if err != nil {
+		return err
+	}
+	if err := c.Login(ctx, *as, pw); err != nil {
+		return err
+	}
+	return act(ctx, c)
 }
 
-const notAuthenticated = "note: --as is not authenticated in this release; anyone with Temporal access can approve"
+// readCA reads the CA certificate the CLI trusts: path, else
+// ~/.cutover/ca.crt if it exists. Neither is a usage error.
+func readCA(path string) ([]byte, error) {
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			def := filepath.Join(home, ".cutover", "ca.crt")
+			if _, err := os.Stat(def); err == nil {
+				path = def
+			}
+		}
+	}
+	if path == "" {
+		return nil, usagef("no CA certificate: pass --ca FILE or set CUTOVER_CA (the server writes DATA/ca.crt), or copy it to ~/.cutover/ca.crt")
+	}
+	return os.ReadFile(path)
+}
+
+// loginPassword reads the account's password: once from the terminal
+// without echo, or one line from stdin with --password-stdin.
+func loginPassword(fromStdin bool, name, cmd string, stderr io.Writer) (string, error) {
+	if fromStdin {
+		pw, ok := stdinLine()
+		if !ok || pw == "" {
+			return "", usagef("%s: no password on stdin", cmd)
+		}
+		return pw, nil
+	}
+	if !isTerminal() {
+		return "", usagef("no terminal; use --password-stdin")
+	}
+	fmt.Fprintf(stderr, "password for %s: ", name)
+	b, err := readPassword()
+	fmt.Fprintln(stderr)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
 
 func queryStatus(ctx context.Context, c client.Client, id string) (flow.Status, error) {
 	var st flow.Status

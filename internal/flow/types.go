@@ -55,8 +55,8 @@ type Input struct {
 	Plan        plan.Plan `json:"plan"`
 }
 
-// GateSignal is one decision at a gate. ApproverID is trusted as given in
-// Plan A; Plan C's server authenticates it before signalling.
+// GateSignal is one decision at a gate. The server sets ApproverID from
+// an authenticated account ("name#id").
 type GateSignal struct {
 	Gate       string   `json:"gate"`
 	Decision   Decision `json:"decision"`

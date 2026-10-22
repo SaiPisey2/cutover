@@ -122,11 +122,11 @@ func approverCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 // without echo, or one line from stdin with --password-stdin.
 func newPassword(fromStdin bool, stderr io.Writer) (string, error) {
 	if fromStdin {
-		line, err := bufio.NewReaderSize(io.LimitReader(stdin, 1024), 1024).ReadString('\n')
-		if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		pw, ok := stdinLine()
+		if !ok {
 			return "", usagef("approver new: no password on stdin")
 		}
-		return strings.TrimRight(line, "\r\n"), nil
+		return pw, nil
 	}
 	if !isTerminal() {
 		return "", usagef("no terminal; use --password-stdin")
@@ -147,6 +147,16 @@ func newPassword(fromStdin bool, stderr io.Writer) (string, error) {
 		return "", usagef("approver new: the passwords differ")
 	}
 	return string(a), nil
+}
+
+// stdinLine reads one line of at most 1KiB from stdin, without its line
+// ending. It is false when stdin held nothing.
+func stdinLine() (string, bool) {
+	line, err := bufio.NewReaderSize(io.LimitReader(stdin, 1024), 1024).ReadString('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		return "", false
+	}
+	return strings.TrimRight(line, "\r\n"), true
 }
 
 func approverNew(ctx context.Context, dir, name, pw string, stdout io.Writer) error {
