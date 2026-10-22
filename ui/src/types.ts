@@ -41,3 +41,18 @@ export function asStatusReply(data: unknown): StatusReply | undefined {
   if (!d.status || typeof d.status !== 'object' || typeof d.evidence_digest !== 'string') return undefined;
   return d as StatusReply;
 }
+
+export type Failure = { at: string; method: string; path: string; status: number; flags: string; duration_ms: number; cluster: string; request_id: string };
+
+export type AuditEntry = {
+  id: number;
+  at: string;
+  actor_id: string;
+  actor_name: string;
+  migration: string;
+  kind: string;
+  gate: string;
+  decision: string;
+  note: string;
+  evidence: string;
+};

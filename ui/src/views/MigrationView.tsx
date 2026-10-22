@@ -8,7 +8,7 @@ import LagPanel from '../components/LagPanel';
 import ReadinessReport from '../components/ReadinessReport';
 import RollbackDialog from '../components/RollbackDialog';
 import ServicesTable from '../components/ServicesTable';
-import Timeline from '../components/Timeline';
+import Timeline, { PHASES } from '../components/Timeline';
 import TrafficBar from '../components/TrafficBar';
 
 function useStreamStatus() {
@@ -41,6 +41,14 @@ function EventList({ events, names }: { events: Event[]; names: Record<string, s
     </section>
   );
 }
+
+function openedAt(events: Event[]): string {
+  const e = [...events].reverse().find((x) => x.kind === 'gate-opened');
+  return e ? e.at : '';
+}
+
+// The rehearsal view has something to show from the rehearse phase on.
+const REHEARSAL_FROM = PHASES.indexOf('rehearse');
 
 // Rolling back stays possible with no gate open, except once it is under way or done.
 const NO_ROLLBACK = ['rolled_back', 'rolling_back', 'finished', 'failed'];
@@ -132,6 +140,7 @@ export default function MigrationView({ id, me }: { id: string; me: Me }) {
             me={me}
             names={names}
             paused={paused}
+            openedAt={openedAt(events)}
             onDecided={load}
           />
           {!st.gate && !NO_ROLLBACK.includes(st.state) && (
@@ -143,6 +152,11 @@ export default function MigrationView({ id, me }: { id: string; me: Me }) {
             </section>
           )}
           <LagPanel replicate={reply.replicate} />
+          {PHASES.indexOf(st.phase as (typeof PHASES)[number]) >= REHEARSAL_FROM && (
+            <p className="panel-line">
+              <a href={`#/m/${encodeURIComponent(id)}/rehearsal`}>Rehearsal diff and sampled failures</a>
+            </p>
+          )}
           <TrafficBar weight={st.weight} />
           {st.shift_verdict ? <p className="panel-line">{clean(st.shift_verdict)}</p> : null}
           <ServicesTable traffic={st.traffic ?? []} />

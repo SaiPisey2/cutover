@@ -118,3 +118,15 @@ describe('GateCard', () => {
     expect(JSON.parse(calls[0].body!)).toEqual({ reason: 'bad lag' });
   });
 });
+
+describe('GateCard reopened gate', () => {
+  it('re-enables Approve when a same-name gate opens again', async () => {
+    mockFetch({ [POST + 'prepare']: { status: 202, body: { accepted: true } } });
+    const { rerender } = render(<GateCard {...base} gate={gate()} digest="aaaa" openedAt="2026-10-22T10:00:00Z" />);
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await screen.findByText('Approval sent.');
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(true);
+    rerender(<GateCard {...base} gate={gate()} digest="aaaa" openedAt="2026-10-22T11:00:00Z" />);
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});

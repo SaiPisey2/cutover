@@ -6,6 +6,8 @@ import Shell from './components/Shell';
 import SignIn from './views/SignIn';
 import Migrations from './views/Migrations';
 import MigrationView from './views/MigrationView';
+import Rehearsal from './views/Rehearsal';
+import Audit from './views/Audit';
 
 export default function App() {
   const hash = useHash();
@@ -42,8 +44,7 @@ export default function App() {
   );
 }
 
-// Screen maps a route to its page. The migration pages arrive with the
-// views that fill them; until then each says so plainly.
+// Screen maps a route to its page.
 function Screen({ route, me }: { route: Route; me: Me }) {
   switch (route.name) {
     case 'login':
@@ -54,9 +55,9 @@ function Screen({ route, me }: { route: Route; me: Me }) {
     case 'migration':
       return <MigrationView key={route.id} id={route.id} me={me} />;
     case 'rehearsal':
-      return <Page title={`${route.id}: rehearsal`} />;
+      return <Rehearsal key={route.id} id={route.id} />;
     case 'audit':
-      return <Page title="Audit" />;
+      return <Audit />;
     case 'notfound':
       return (
         <div className="page">
@@ -67,15 +68,4 @@ function Screen({ route, me }: { route: Route; me: Me }) {
         </div>
       );
   }
-}
-
-function Page({ title }: { title: string }) {
-  return (
-    <div className="page">
-      <div className="page-head">
-        <h1 className="page-title">{title}</h1>
-        <p className="page-lede">Nothing to show here yet.</p>
-      </div>
-    </div>
-  );
 }

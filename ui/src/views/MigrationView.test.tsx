@@ -113,4 +113,15 @@ describe('MigrationView guards', () => {
     await screen.findByRole('list', { name: 'Phases' });
     expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it('links the rehearsal view from the rehearse phase on, not before', async () => {
+    show(reply({ phase: 'rehearse' }));
+    expect((await screen.findByRole('link', { name: /Rehearsal diff/ })).getAttribute('href')).toBe('#/m/orders/rehearsal');
+  });
+
+  it('has no rehearsal link before rehearse', async () => {
+    show(reply({ phase: 'replicate' }));
+    await screen.findByRole('list', { name: 'Phases' });
+    expect(screen.queryByRole('link', { name: /Rehearsal diff/ })).toBeNull();
+  });
 });

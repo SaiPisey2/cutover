@@ -16,6 +16,9 @@ type Props = {
   // True while live updates are not flowing: a decision would rest on a
   // view that may be old.
   paused: boolean;
+  // When the gate last opened (the latest gate-opened event). A gate of the
+  // same name that opens again is a new question, so it can be decided again.
+  openedAt?: string;
   onDecided: () => void;
 };
 
@@ -57,7 +60,7 @@ export default function GateCard(props: Props) {
   const decidedFor = useRef('');
   const [decided, setDecided] = useState('');
 
-  const gateName = gate?.name;
+  const gateKey = gate ? `${gate.name}|${props.openedAt ?? ''}` : '';
   useEffect(() => {
     // A different gate is a new question: nothing said about the last one
     // carries over. (A changed digest does not clear the problem: the
@@ -68,12 +71,12 @@ export default function GateCard(props: Props) {
     setSent('');
     decidedFor.current = '';
     setDecided('');
-  }, [gateName]);
+  }, [gateKey]);
 
   async function decide(decision: 'approve' | 'reject') {
     const cur = live.current;
     const g = cur.gate;
-    if (busy.current || !g || cur.paused || decidedFor.current === g.name) return;
+    if (busy.current || !g || cur.paused || decidedFor.current === `${g.name}|${cur.openedAt ?? ''}`) return;
     if (approvedByMe(g, cur.me)) return;
     busy.current = true;
     setPending(true);
@@ -85,8 +88,8 @@ export default function GateCard(props: Props) {
         note: noteRef.current,
         evidence_digest: cur.digest,
       });
-      decidedFor.current = g.name;
-      setDecided(g.name);
+      decidedFor.current = `${g.name}|${cur.openedAt ?? ''}`;
+      setDecided(`${g.name}|${cur.openedAt ?? ''}`);
       setSent(decision === 'approve' ? 'Approval sent.' : 'Rejection sent.');
       cur.onDecided();
     } catch (e) {
@@ -155,10 +158,10 @@ export default function GateCard(props: Props) {
       )}
       {sent && <p className="panel-line" role="status">{sent}</p>}
       <div className="actions">
-        <Button disabled={paused || pending || mine || decided === gate.name} aria-describedby={mine ? 'gate-mine' : undefined} onClick={() => void decide('approve')}>
+        <Button disabled={paused || pending || mine || decided === gateKey} aria-describedby={mine ? 'gate-mine' : undefined} onClick={() => void decide('approve')}>
           Approve
         </Button>
-        <Button disabled={paused || pending || mine || decided === gate.name} onClick={() => void decide('reject')}>
+        <Button disabled={paused || pending || mine || decided === gateKey} onClick={() => void decide('reject')}>
           Reject
         </Button>
         <RollbackDialog migration={migration} paused={paused} onDone={props.onDecided} />

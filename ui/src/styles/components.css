@@ -703,3 +703,25 @@ textarea.field {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.table-wide {
+  min-width: 36rem;
+  table-layout: auto;
+}
+
+.table-wide td,
+.table-wide th {
+  overflow-wrap: anywhere;
+}
+
+.audit-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-3);
+  margin-bottom: var(--s-4);
+}
