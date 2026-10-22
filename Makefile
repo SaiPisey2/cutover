@@ -1,4 +1,4 @@
-.PHONY: test itest itest-up itest-down vet
+.PHONY: test itest itest-up itest-down vet ui ui-test
 
 test:
 	go test -race -count=1 ./...
@@ -18,3 +18,10 @@ itest-up:
 
 itest-down:
 	docker compose -f test/compose.yaml down -v
+
+# ui rebuilds ui/dist, which is committed and embedded into the binary.
+ui:
+	cd ui && npm ci && npm run build
+
+ui-test:
+	cd ui && npm test -- --run

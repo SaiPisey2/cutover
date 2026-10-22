@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -141,11 +142,18 @@ func TestAPIPathsNeverGetTheApp(t *testing.T) {
 	}
 }
 
-func TestEmbeddedPlaceholderIsServable(t *testing.T) {
+func TestEmbeddedUIIsServable(t *testing.T) {
 	srv := httptest.NewServer(NewServer(NewAuth(nil, slog.New(slog.DiscardHandler)), stubAPI, ui.FS()))
 	t.Cleanup(srv.Close)
 	resp, body := send(t, srv, "GET", "/", nil)
 	require.Equal(t, 200, resp.StatusCode)
-	require.NotContains(t, body, "<script")
-	require.NotContains(t, body, "style")
+	// The one script is a file from 'self'; the CSP blocks anything inline.
+	require.Regexp(t, `<script type="module"[^>]* src="/assets/index-[^"]+\.js"></script>`, body)
+	require.NotRegexp(t, `<script(\s[^>]*)?>\s*[^<\s]`, body)
+	require.NotContains(t, body, "style=")
+
+	js := regexp.MustCompile(`src="(/assets/index-[^"]+\.js)"`).FindStringSubmatch(body)
+	require.Len(t, js, 2)
+	resp, _ = send(t, srv, "GET", js[1], nil)
+	require.Equal(t, 200, resp.StatusCode)
 }

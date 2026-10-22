@@ -1,0 +1,146 @@
+/* cutover console tokens.
+
+   Colour is OKLCH so the four severity hues share one lightness per theme:
+   danger, caution, ok and info then read as equally loud. Neutrals carry a
+   faint blue-grey cast (hue 255). Every value stays inside the sRGB gamut.
+   The severity foreground / background / line lightness is
+   dark 0.80 / 0.27 / 0.60 and light 0.47 / 0.955 / 0.60, which keeps text on
+   its own background and on the page above 4.5:1 in both themes (measured
+   for the same values in blastgate's console). */
+
+:root {
+  --font-sans: ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, monospace;
+
+  /* Fixed rem scale, ratio about 1.2. No fluid type: an operator's
+     console is read at one DPI, and a heading that shrinks with the
+     viewport only costs scanning. */
+  --fs-12: 0.75rem;
+  --fs-13: 0.8125rem;
+  --fs-15: 0.9375rem;
+  --fs-18: 1.125rem;
+  --fs-22: 1.375rem;
+  --fs-28: 1.75rem;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 28px;
+  --s-8: 32px;
+  --s-9: 36px;
+  --s-10: 40px;
+  --s-11: 44px;
+  --s-12: 48px;
+
+  /* Radius follows hierarchy only: a tag sits inside a control, which
+     sits inside a panel. */
+  --r-tag: 6px;
+  --r-ctl: 8px;
+  --r-panel: 12px;
+
+  /* The sticky header's height, for scroll-padding: anything the page
+     scrolls to (a focused question, a tree item) lands below it, not
+     under it (WCAG 2.4.11). .shell-header is set to exactly this, and
+     nothing in it wraps, so it holds at any zoom or name length: one
+     row on wide screens; below 880px, brand and controls (56px) over a
+     44px row of tabs, plus the 1px hairline. */
+  --header-h: 61px;
+}
+
+@media (max-width: 880px) {
+  :root {
+    --header-h: 101px;
+  }
+}
+
+/* Dark is the default: when the system says dark, or says nothing.
+
+   The manual choices are written as :root[data-theme=...] (0,2,0), not
+   a bare [data-theme=...] (0,1,0), so no rule that sets these properties
+   on a plain :root can outrank a choice the approver made by hand. */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: oklch(0.17 0.008 255);
+  --surface: oklch(0.205 0.009 255);
+  --raised: oklch(0.245 0.01 255);
+  --line: oklch(0.31 0.01 255);
+  --line-strong: oklch(0.54 0.012 255);
+  --text: oklch(0.95 0.005 255);
+  --text-muted: oklch(0.79 0.01 255);
+  --text-faint: oklch(0.68 0.012 255);
+  --focus: oklch(0.74 0.13 250);
+  --link: oklch(0.8 0.1 250);
+
+  --danger-fg: oklch(0.8 0.11 25);
+  --danger-bg: oklch(0.27 0.06 25);
+  --danger-line: oklch(0.6 0.14 25);
+  --caution-fg: oklch(0.8 0.12 80);
+  --caution-bg: oklch(0.27 0.045 80);
+  --caution-line: oklch(0.6 0.11 80);
+  --ok-fg: oklch(0.8 0.12 150);
+  --ok-bg: oklch(0.27 0.045 150);
+  --ok-line: oklch(0.6 0.12 150);
+  --info-fg: oklch(0.8 0.09 250);
+  --info-bg: oklch(0.27 0.05 250);
+  --info-line: oklch(0.6 0.11 250);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: oklch(0.975 0.003 255);
+    --surface: oklch(1 0 0);
+    --raised: oklch(0.955 0.004 255);
+    --line: oklch(0.9 0.006 255);
+    --line-strong: oklch(0.6 0.012 255);
+    --text: oklch(0.22 0.012 255);
+    --text-muted: oklch(0.42 0.014 255);
+    --text-faint: oklch(0.52 0.014 255);
+    --focus: oklch(0.52 0.17 255);
+    --link: oklch(0.47 0.15 255);
+
+    --danger-fg: oklch(0.47 0.16 25);
+    --danger-bg: oklch(0.955 0.02 25);
+    --danger-line: oklch(0.6 0.17 25);
+    --caution-fg: oklch(0.47 0.095 80);
+    --caution-bg: oklch(0.955 0.04 80);
+    --caution-line: oklch(0.6 0.12 80);
+    --ok-fg: oklch(0.47 0.11 150);
+    --ok-bg: oklch(0.955 0.03 150);
+    --ok-line: oklch(0.6 0.13 150);
+    --info-fg: oklch(0.47 0.13 250);
+    --info-bg: oklch(0.955 0.02 250);
+    --info-line: oklch(0.6 0.13 250);
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: oklch(0.975 0.003 255);
+  --surface: oklch(1 0 0);
+  --raised: oklch(0.955 0.004 255);
+  --line: oklch(0.9 0.006 255);
+  --line-strong: oklch(0.6 0.012 255);
+  --text: oklch(0.22 0.012 255);
+  --text-muted: oklch(0.42 0.014 255);
+  --text-faint: oklch(0.52 0.014 255);
+  --focus: oklch(0.52 0.17 255);
+  --link: oklch(0.47 0.15 255);
+
+  --danger-fg: oklch(0.47 0.16 25);
+  --danger-bg: oklch(0.955 0.02 25);
+  --danger-line: oklch(0.6 0.17 25);
+  --caution-fg: oklch(0.47 0.095 80);
+  --caution-bg: oklch(0.955 0.04 80);
+  --caution-line: oklch(0.6 0.12 80);
+  --ok-fg: oklch(0.47 0.11 150);
+  --ok-bg: oklch(0.955 0.03 150);
+  --ok-line: oklch(0.6 0.13 150);
+  --info-fg: oklch(0.47 0.13 250);
+  --info-bg: oklch(0.955 0.02 250);
+  --info-line: oklch(0.6 0.13 250);
+}

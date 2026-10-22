@@ -1,0 +1,456 @@
+/* Console components, built on tokens.css and base.css. */
+
+/* === Identifiers === */
+
+/* Object names run to 253 characters with no spaces (a DNS subdomain).
+   Without this one long name pushes the page into a sideways scroll at
+   360px; with it the name breaks wherever it has to and stays whole. */
+.mono {
+  overflow-wrap: anywhere;
+}
+
+/* === Shell: top bar, navigation, theme toggle === */
+
+/* Hidden from the eye, kept for the ear: the announcer, and the words
+   behind a count badge. clip-path, not display:none, which would hide it
+   from screen readers too. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* One hairline under it, no shadow and no blur: the header is
+   furniture, and the page below it is the work.
+
+   Its height IS --header-h, by construction: nothing in it wraps, so a
+   long name, a big badge or 200% zoom can never make it taller than the
+   token that scroll-padding reads. What does not fit is cut short (the
+   brand and the name, with an ellipsis) or scrolls inside its own row
+   (the tabs), never pushed onto a new line. */
+.shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  box-sizing: border-box;
+  height: var(--header-h);
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+.shell-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  column-gap: var(--s-7);
+  height: 100%;
+  padding: 0 var(--s-7);
+}
+
+/* The brand and the cluster name, one group: the bar's columns and the
+   narrow grid place them together. */
+.shell-id {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: baseline;
+  gap: var(--s-3);
+  min-width: 0;
+}
+
+.shell-brand {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: var(--s-6);
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  font-size: var(--fs-15);
+  line-height: var(--s-6);
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-brand:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+/* Which cluster this console decides for. Muted, beside the brand: read
+   when looked for, never louder than the page. A long name is cut at
+   24ch; the full name is in its title. */
+.shell-cluster {
+  /* Gives way long before the brand does: "b…" beside a half-shown
+     cluster would name neither. */
+  flex: 0 100 auto;
+  position: relative;
+  min-width: 0;
+  max-width: 24ch;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tabs are plain links. They stretch to the full bar height so the
+   current tab's underline sits on the header's own hairline. If they do
+   not fit they scroll sideways inside the header, never onto a new row. */
+.shell-tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  align-self: stretch;
+  column-gap: var(--s-5);
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.shell-tab {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--text-muted);
+  font-size: var(--fs-15);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  /* Transparent on every tab so the current one's underline does not
+     shift its text. */
+  border-bottom: 2px solid transparent;
+  padding-top: 2px;
+  transition: color 120ms, border-color 120ms;
+}
+
+.shell-tab:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+/* Current is told twice, by colour and by a 2px underline, so it does not
+   rest on the muted/text contrast alone. */
+.shell-tab[aria-current="page"] {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.shell-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 var(--s-2);
+  border: 1px solid var(--danger-line);
+  border-radius: var(--r-tag);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell-meta {
+  display: flex;
+  flex: none;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2) var(--s-4);
+  margin-left: auto;
+}
+
+.shell-who {
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+}
+
+/* Sign out wears the theme toggle's quiet outline: header controls are
+   secondary to the page, and one look for both keeps them a pair. */
+.button.shell-signout {
+  padding: 0 var(--s-3);
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text-muted);
+  font: 500 var(--fs-13) / 1 var(--font-sans);
+}
+
+.button.shell-signout:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+/* Below the width where brand, tabs and controls fit on one row, the
+   header is two fixed rows: brand and controls, then the tabs in a 44px
+   row of their own that scrolls sideways inside itself if it must. The
+   page never scrolls sideways, at 360px or at 200% zoom. */
+@media (max-width: 880px) {
+  .shell-bar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) var(--s-11);
+    padding: 0 var(--s-4);
+    column-gap: var(--s-4);
+  }
+
+  .shell-id {
+    grid-area: 1 / 1;
+    justify-self: start;
+    max-width: 100%;
+  }
+
+  .shell-meta {
+    grid-area: 1 / 2;
+    margin-left: 0;
+  }
+
+  .shell-tabs {
+    grid-area: 2 / 1 / 3 / -1;
+  }
+}
+
+/* At phone width the brand and the controls share one row, tabs below:
+   the name and the cluster move to the screen reader only (they stay in
+   the DOM and their titles; every question still says its cluster), and
+   the gaps close up, so the header is two rows, not three. */
+@media (max-width: 480px) {
+
+}
+
+.theme-toggle {
+  min-height: var(--s-9);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--text-muted);
+  font: 500 var(--fs-13) / 1 var(--font-sans);
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+/* Live status: a tone dot and a word, never the dot alone. */
+.live-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--fs-13);
+  color: var(--text-muted);
+}
+
+.live-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line-strong);
+}
+
+.live-status.tone-ok .live-status-dot {
+  background: var(--ok-line);
+}
+
+.live-status.tone-caution .live-status-dot {
+  background: var(--caution-line);
+}
+
+.live-status.tone-danger .live-status-dot {
+  background: var(--danger-line);
+}
+
+/* === Page frame === */
+
+/* The page sits on the header's gutter, so every screen's left edge lines
+   up under the brand; it narrows with the header below 880px. */
+.shell-main {
+  padding: var(--s-7) var(--s-7) var(--s-12);
+}
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+.page-wide {
+  max-width: 1280px;
+}
+
+/* One title treatment on every screen: the page's name, and one plain
+   line under it where the page needs one. */
+.page-head {
+  margin: 0 0 var(--s-6);
+}
+
+.page-title {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-22);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.page-lede {
+  margin: var(--s-1) 0 0;
+  color: var(--text-muted);
+}
+
+.boot {
+  min-height: 100vh;
+}
+
+@media (max-width: 880px) {
+  .shell-main {
+    padding: var(--s-5) var(--s-4) var(--s-10);
+  }
+}
+
+/* === Buttons and controls === */
+
+/* One button shape everywhere. 36px tall, so every control clears the
+   24px target minimum with room to spare. Hover changes colour only. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--s-9);
+  padding: 0 var(--s-5);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  background: var(--raised);
+  color: var(--text);
+  font: 600 var(--fs-15) / 1.2 var(--font-sans);
+  cursor: pointer;
+  transition: background-color 120ms, border-color 120ms, color 120ms;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+
+.button:active:not(:disabled) {
+  background: var(--surface);
+}
+
+.button-danger {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  border-color: var(--danger-line);
+}
+
+.button-danger:hover:not(:disabled) {
+  border-color: var(--danger-fg);
+}
+
+.button-quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--link);
+  padding: 0 var(--s-2);
+  font-weight: 500;
+}
+
+.button-quiet:hover:not(:disabled) {
+  border-color: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Disabled reads as disabled at a glance; the reason is always in text
+   beside it (aria-describedby), never only in the fade. */
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+/* === Sign in === */
+
+/* One narrow column on the bare page, no card: a heading, a line of help,
+   the field and the button . */
+.sign-in {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: var(--s-6) var(--s-4);
+  background: var(--bg);
+}
+
+.sign-in-box {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 360px;
+}
+
+.sign-in-title {
+  margin: 0 0 var(--s-2);
+  color: var(--text);
+  font-size: var(--fs-22);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.sign-in-lede {
+  margin: 0 0 var(--s-6);
+  color: var(--text-muted);
+}
+
+.sign-in-label {
+  margin-bottom: var(--s-2);
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  font-weight: 500;
+}
+
+/* Two classes deep so the old stylesheet's input[type=password] and
+   input:focus { outline: none } cannot win before it is removed. */
+.sign-in .sign-in-input {
+  height: var(--s-11);
+  margin-bottom: var(--s-3);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  background: var(--bg);
+  color: var(--text);
+  font: 400 var(--fs-15) / 1 var(--font-mono);
+}
+
+.sign-in .sign-in-input::placeholder {
+  color: var(--text-faint);
+}
+
+.sign-in .sign-in-input:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  box-shadow: none;
+  border-color: var(--line-strong);
+}
+
+.sign-in .sign-in-input[aria-invalid="true"] {
+  border-color: var(--danger-line);
+}
+
+.sign-in-error {
+  margin: 0 0 var(--s-3);
+  color: var(--danger-fg);
+  font-size: var(--fs-13);
+}
+
+.sign-in-submit {
+  width: 100%;
+  min-height: var(--s-11);
+}

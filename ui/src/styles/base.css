@@ -1,0 +1,59 @@
+/* Element defaults for the console. Tokens live in tokens.css. Fonts are
+   the system stacks from tokens.css: nothing is downloaded, so the CSP
+   needs no font-src exception. */
+
+body {
+  /* The browser's 8px margin would put a strip of page colour around the
+     header's hairline and pull every page off the header's gutter. */
+  margin: 0;
+  font: var(--fs-15)/1.5 var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  /* Counts and ages line up in columns instead of jittering as they update. */
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+}
+
+a {
+  color: var(--link);
+}
+
+input,
+button {
+  font-family: inherit;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--focus);
+  color: var(--bg);
+}
+
+html {
+  scrollbar-color: var(--line-strong) var(--bg);
+  /* Scrolled-to targets stop clear of the sticky header. */
+  scroll-padding-top: calc(var(--header-h) + var(--s-4));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
