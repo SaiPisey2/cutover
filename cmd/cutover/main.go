@@ -34,6 +34,7 @@ commands:
   server --state FILE --token-file FILE    run the front door's control plane (xDS + API)
   envoy-bootstrap                          print the Envoy bootstrap for the front door
   route apply|list --plan FILE             register the plan's routes at 100% source, or list routes
+  approver new|list|disable --data DIR     manage console approver accounts
 
 positional arguments come before flags (ID, GATE and the decision are positional).
 
@@ -128,6 +129,8 @@ func dispatch(ctx context.Context, cmd string, args []string, stdout, stderr io.
 		return bootstrapCmd(args, stdout, stderr)
 	case "route":
 		return routeCmd(ctx, args, stdout, stderr)
+	case "approver":
+		return approverCmd(ctx, args, stdout, stderr)
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
