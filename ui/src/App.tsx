@@ -4,6 +4,8 @@ import { navigate, parseHash, useHash, type Route } from './router';
 import { openStream } from './stream';
 import Shell from './components/Shell';
 import SignIn from './views/SignIn';
+import Migrations from './views/Migrations';
+import MigrationView from './views/MigrationView';
 
 export default function App() {
   const hash = useHash();
@@ -13,6 +15,7 @@ export default function App() {
   // Where to go back to after signing in, so a 401 mid-task returns the
   // operator to the page they were on.
   const returnTo = useRef('#/');
+  const streamFor = route.name === 'migration' ? route.id : undefined;
   if (route.name !== 'login' && route.name !== 'notfound' && hash) returnTo.current = hash;
 
   useEffect(() => {
@@ -24,30 +27,32 @@ export default function App() {
   useEffect(() => {
     if (!me) return;
     if (window.location.hash === '#/login') navigate(returnTo.current);
-    return openStream();
-  }, [me]);
+    // The migration page needs its status events, which the server sends
+    // only on a stream scoped to that migration.
+    return openStream(streamFor);
+  }, [me, streamFor]);
 
   if (me === undefined) return <div className="boot" aria-busy="true" />;
   if (me === null) return <SignIn onSignedIn={setMe} />;
 
   return (
     <Shell route={route} me={me} onSignOut={() => void logout().catch(() => {})}>
-      <Screen route={route} />
+      <Screen route={route} me={me} />
     </Shell>
   );
 }
 
 // Screen maps a route to its page. The migration pages arrive with the
 // views that fill them; until then each says so plainly.
-function Screen({ route }: { route: Route }) {
+function Screen({ route, me }: { route: Route; me: Me }) {
   switch (route.name) {
     case 'login':
     // Signed in but still on #/login for the moment before the effect
     // above sends the operator back to where they were.
     case 'migrations':
-      return <Page title="Migrations" />;
+      return <Migrations />;
     case 'migration':
-      return <Page title={route.id} />;
+      return <MigrationView key={route.id} id={route.id} me={me} />;
     case 'rehearsal':
       return <Page title={`${route.id}: rehearsal`} />;
     case 'audit':

@@ -454,3 +454,252 @@
   width: 100%;
   min-height: var(--s-11);
 }
+
+/* === Migrations and the migration view === */
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-5);
+}
+
+.panel {
+  box-sizing: border-box;
+  min-width: 0;
+  margin: 0 0 var(--s-5);
+  padding: var(--s-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+}
+
+.stack > .panel {
+  margin-bottom: 0;
+}
+
+.panel-title {
+  margin: 0 0 var(--s-3);
+  font-size: var(--fs-18);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.panel-line {
+  margin: var(--s-2) 0;
+  overflow-wrap: anywhere;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.figure {
+  font-weight: 600;
+}
+
+.plain-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.notice {
+  margin: 0 0 var(--s-4);
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--caution-line);
+  border-radius: var(--r-ctl);
+  background: var(--caution-bg);
+  color: var(--caution-fg);
+}
+
+.form-error {
+  margin: var(--s-3) 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--danger-line);
+  border-radius: var(--r-ctl);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  overflow-wrap: anywhere;
+}
+
+.field-label {
+  display: block;
+  margin: var(--s-3) 0 var(--s-1);
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+  font-weight: 500;
+}
+
+.field {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  background: var(--bg);
+  color: var(--text);
+  font: 400 var(--fs-15) / 1.4 var(--font-sans);
+}
+
+textarea.field {
+  resize: vertical;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  margin-top: var(--s-4);
+}
+
+.rollback {
+  flex: 1 1 100%;
+}
+
+/* Progress bars are native: the browser draws the fill from value. */
+.meter {
+  display: block;
+  width: 100%;
+  height: var(--s-3);
+  accent-color: var(--info-line);
+}
+
+/* Timeline: seven steps, wrapping to rows at phone width. */
+.timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline-step {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 96px;
+  min-width: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+}
+
+.timeline-state {
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+}
+
+.timeline-done {
+  border-color: var(--ok-line);
+}
+
+.timeline-current {
+  border-color: var(--info-line);
+  background: var(--info-bg);
+  color: var(--info-fg);
+  font-weight: 600;
+}
+
+.timeline-skipped {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.gate-card {
+  border-color: var(--caution-line);
+}
+
+.gate-summary {
+  margin: 0 0 var(--s-2);
+  overflow-wrap: anywhere;
+}
+
+.service {
+  margin-bottom: var(--s-4);
+}
+
+.service-name {
+  margin-bottom: var(--s-2);
+  font-weight: 600;
+  text-align: left;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.table th,
+.table td {
+  padding: var(--s-1) var(--s-2);
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.table thead th {
+  color: var(--text-muted);
+  font-size: var(--fs-13);
+}
+
+.findings-title {
+  margin: var(--s-3) 0 var(--s-2);
+  font-size: var(--fs-15);
+}
+
+.tone-danger {
+  color: var(--danger-fg);
+}
+
+.tone-caution {
+  color: var(--caution-fg);
+}
+
+.tone-info {
+  color: var(--info-fg);
+}
+
+.finding,
+.event {
+  padding: var(--s-2) 0;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.migration-list {
+  margin: 0 0 var(--s-6);
+}
+
+.migration-row {
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+}
+
+.migration-id {
+  font-weight: 600;
+}
+
+.migration-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-6);
+  margin: var(--s-2) 0 0;
+}
+
+.migration-facts dt {
+  color: var(--text-muted);
+  font-size: var(--fs-12);
+}
+
+.migration-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
