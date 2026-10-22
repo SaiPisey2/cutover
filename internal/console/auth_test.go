@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -204,18 +205,58 @@ func TestLoginLimiterCountsFailuresOnly(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
 	}
-	for i := 0; i < 4; i++ {
-		require.Equal(t, 401, e.login(bad, "10.0.0.1").Code)
+	// a 415 and a 400 take no slot
+	r := httptest.NewRequest("POST", "/api/login", strings.NewReader(bad))
+	r.Header.Set("Content-Type", "text/plain")
+	r.RemoteAddr = "10.0.0.1:1"
+	w := httptest.NewRecorder()
+	e.a.Login(w, r)
+	require.Equal(t, 415, w.Code)
+	for i := 0; i < 10; i++ {
+		require.Equal(t, 400, e.login(`{"name":"x"}`, "10.0.0.1").Code)
 	}
-	// a success clears the window
-	require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
 	for i := 0; i < 5; i++ {
 		require.Equal(t, 401, e.login(bad, "10.0.0.1").Code)
 	}
-	// over the limit: refused even with the right password
+	// the window is full: refused even with the right password, and a
+	// success elsewhere does not clear it
+	require.Equal(t, 200, e.login(goodBody(), "10.0.0.2").Code)
 	require.Equal(t, 429, e.login(goodBody(), "10.0.0.1").Code)
 	e.advance(time.Minute)
 	require.Equal(t, 200, e.login(goodBody(), "10.0.0.1").Code)
+}
+
+func TestLoginLimiterHoldsUnderParallelFailures(t *testing.T) {
+	e := newEnv(t)
+	var calls atomic.Int32
+	e.a.check = func(phc, pw string) bool {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		return false
+	}
+	bad := `{"name":"nobody","password":"x"}`
+	codes := make([]int, 50)
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = e.login(bad, "10.0.0.1").Code
+		}()
+	}
+	wg.Wait()
+	n401, n429 := 0, 0
+	for _, c := range codes {
+		switch c {
+		case 401:
+			n401++
+		case 429:
+			n429++
+		}
+	}
+	require.Equal(t, 5, n401)
+	require.Equal(t, 45, n429)
+	require.LessOrEqual(t, int(calls.Load()), 5)
 }
 
 func TestLimiterIgnoresForwardedHeaderAndBoundsMemory(t *testing.T) {
@@ -234,11 +275,11 @@ func TestLimiterIgnoresForwardedHeaderAndBoundsMemory(t *testing.T) {
 	l := newLimiter()
 	now := time.Now()
 	for i := 0; i < limiterHosts+10; i++ {
-		l.fail("h"+string(rune(i+0x100)), now)
+		l.reserve("h"+string(rune(i+0x100)), now)
 	}
 	require.Equal(t, limiterHosts, l.size())
-	require.False(t, l.allow("brand-new-host", now))
-	require.True(t, l.allow("h"+string(rune(0x100)), now))
+	require.Nil(t, l.reserve("brand-new-host", now))
+	require.NotNil(t, l.reserve("h"+string(rune(0x100)), now))
 }
 
 func TestStateChangingCallsNeedTheCSRFHeader(t *testing.T) {

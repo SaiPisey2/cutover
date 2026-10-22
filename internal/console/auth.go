@@ -154,11 +154,19 @@ func readLoginBody(r io.Reader) (loginBody, error) {
 func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	host := remoteHost(r)
 	// Before reading the body: a limited address costs nothing.
-	if !a.limiter.allow(host, a.Now()) {
+	slot := a.limiter.reserve(host, a.Now())
+	if slot == nil {
 		a.Log.Warn("login refused", "remote", host, "reason", "rate limited")
 		writeJSON(w, http.StatusTooManyRequests, errLimited)
 		return
 	}
+	// A failed password check keeps the slot; every other exit gives it back.
+	keep := false
+	defer func() {
+		if !keep {
+			a.limiter.release(slot)
+		}
+	}()
 	// Only application/json: a cross-site text/plain form could otherwise
 	// log the browser in as the attacker.
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
@@ -183,7 +191,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	ok := a.check(phc, body.password)
 	if !found || !ok {
-		a.limiter.fail(host, a.Now())
+		keep = true
 		a.failed(r.Context(), host, body.name)
 		writeJSON(w, http.StatusUnauthorized, errUnauthenticated)
 		return
@@ -197,7 +205,6 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	a.limiter.clear(host)
 	id, csrf := randomString(), randomString()
 	now := a.Now()
 	s := store.Session{ApproverID: ap.ID, ApproverName: ap.Name, CSRF: csrf, Created: now, Expires: now.Add(a.SessionTTL)}
@@ -323,10 +330,14 @@ func (a *Auth) Session(w http.ResponseWriter, r *http.Request) (store.Session, b
 	return s, true
 }
 
-// limiter is a fixed window per host: at most loginAttempts failed logins
-// per loginWindow from the host's first failure in the window. Only
-// failures count, and a success clears the host: the console is
-// loopback-only, so every browser and CLI command shares one address.
+// limiter is a fixed window per host: at most loginAttempts slots per
+// loginWindow from the host's first reservation in the window. A login
+// reserves a slot before any password is checked, so parallel requests
+// cannot all slip past; a failed check keeps its slot, and everything
+// else (success, bad body, internal error) releases only its own. The
+// console is loopback-only, so every browser and CLI command shares one
+// address; a success must not clear the window, or one valid account
+// could reset the limit to guess another's password.
 type limiter struct {
 	mu    sync.Mutex
 	hosts map[string]*window
@@ -339,47 +350,38 @@ type window struct {
 
 func newLimiter() *limiter { return &limiter{hosts: map[string]*window{}} }
 
-func (l *limiter) expire(now time.Time) {
+// reserve takes a slot for host, or returns nil when the window is full
+// (or the host table is).
+func (l *limiter) reserve(host string, now time.Time) *window {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for h, w := range l.hosts {
 		if !now.Before(w.start.Add(loginWindow)) {
 			delete(l.hosts, h)
 		}
 	}
-}
-
-// allow reports whether host may attempt a login. It records nothing.
-func (l *limiter) allow(host string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.expire(now)
-	w, ok := l.hosts[host]
-	if !ok {
-		return len(l.hosts) < limiterHosts
-	}
-	return w.n < loginAttempts
-}
-
-// fail records a failed login from host.
-func (l *limiter) fail(host string, now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.expire(now)
 	w, ok := l.hosts[host]
 	if !ok {
 		if len(l.hosts) >= limiterHosts {
-			return
+			return nil
 		}
 		w = &window{start: now}
 		l.hosts[host] = w
 	}
+	if w.n >= loginAttempts {
+		return nil
+	}
 	w.n++
+	return w
 }
 
-// clear forgets host's failures after a successful login.
-func (l *limiter) clear(host string) {
+// release returns a slot taken by reserve.
+func (l *limiter) release(w *window) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.hosts, host)
+	if w.n > 0 {
+		w.n--
+	}
 }
 
 func (l *limiter) size() int {
