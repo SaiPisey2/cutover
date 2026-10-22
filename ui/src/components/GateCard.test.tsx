@@ -27,6 +27,18 @@ describe('GateCard', () => {
     expect(JSON.parse(calls[0].body!)).toMatchObject({ decision: 'approve', evidence_digest: shown });
   });
 
+  it('does not post again after a decision was accepted', async () => {
+    const calls = mockFetch({ [POST + 'prepare']: { status: 202, body: { accepted: true } } });
+    render(<GateCard {...base} gate={gate()} digest="aaaa" />);
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await screen.findByText('Approval sent.');
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Reject' }) as HTMLButtonElement).disabled).toBe(true);
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Reject' }));
+    expect(calls).toHaveLength(1);
+  });
+
   it('sends one POST for a double click', async () => {
     let release: () => void = () => {};
     const calls = mockFetch({
@@ -35,7 +47,7 @@ describe('GateCard', () => {
     render(<GateCard {...base} gate={gate()} digest="aaaa" />);
     await userEvent.dblClick(screen.getByRole('button', { name: 'Approve' }));
     release();
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(false));
+    await screen.findByText('Approval sent.');
     expect(calls).toHaveLength(1);
   });
 
@@ -55,6 +67,7 @@ describe('GateCard', () => {
     const g = gate({ name: 'switch', needs: 2, approvals: ['bob#b1'] });
     render(<GateCard {...base} gate={g} digest="d" names={{ 'bob#b1': 'bob' }} />);
     expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Reject' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(/You approved first/)).toBeTruthy();
     expect(screen.getByText('First approval: bob. Waiting for a second person.')).toBeTruthy();
   });

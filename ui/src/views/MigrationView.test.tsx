@@ -99,3 +99,18 @@ describe('MigrationView', () => {
     for (const n of ['Approve', 'Reject', 'Roll back']) expect((screen.getByRole('button', { name: n }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+describe('MigrationView guards', () => {
+  it('offers no roll back on a finished migration', async () => {
+    show(reply({ state: 'finished', gate: null }));
+    await screen.findByRole('list', { name: 'Phases' });
+    expect(screen.queryByRole('button', { name: 'Roll back' })).toBeNull();
+  });
+
+  it('treats connecting as paused', async () => {
+    live = 'connecting';
+    show(reply());
+    await screen.findByRole('list', { name: 'Phases' });
+    expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});

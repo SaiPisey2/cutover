@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { get, type Me } from '../api';
 import { onStreamStatus, streamStatus, subscribe } from '../stream';
 import { clean, errorText, who } from '../text';
@@ -43,20 +43,27 @@ function EventList({ events, names }: { events: Event[]; names: Record<string, s
 }
 
 // Rolling back stays possible with no gate open, except once it is under way or done.
-const NO_ROLLBACK = ['rolled_back', 'rolling_back'];
+const NO_ROLLBACK = ['rolled_back', 'rolling_back', 'finished', 'failed'];
 
 export default function MigrationView({ id, me }: { id: string; me: Me }) {
   const [reply, setReply] = useState<StatusReply | undefined>(undefined);
   const [error, setError] = useState('');
   const [unavailable, setUnavailable] = useState(false);
   const stream = useStreamStatus();
-  const paused = stream === 'offline' || stream === 'reconnecting';
+  const paused = stream !== 'live';
+  // Bumped by every applied status, so an older GET cannot overwrite a newer one.
+  const seq = useRef(0);
 
   const load = useCallback(() => {
+    const mine = ++seq.current;
     get<StatusReply>(`/api/migrations/${encodeURIComponent(id)}`).then(
       (r) => {
+        if (mine !== seq.current) return;
         const ok = asStatusReply(r);
-        if (ok) setReply(ok);
+        if (ok) {
+          setReply(ok);
+          setUnavailable(false);
+        }
         setError('');
       },
       (e) => setError(errorText(e)),
@@ -69,6 +76,7 @@ export default function MigrationView({ id, me }: { id: string; me: Me }) {
     const offStatus = subscribe('status', (d) => {
       const r = asStatusReply(d);
       if (r && r.status.migration_id === id) {
+        seq.current++;
         setReply(r);
         setUnavailable(false);
       }

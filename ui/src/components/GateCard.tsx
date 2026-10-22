@@ -52,6 +52,10 @@ export default function GateCard(props: Props) {
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<Problem | null>(null);
   const [sent, setSent] = useState('');
+  // The gate this card has already sent a decision for: until the gate
+  // changes, a second click would only post a duplicate.
+  const decidedFor = useRef('');
+  const [decided, setDecided] = useState('');
 
   const gateName = gate?.name;
   useEffect(() => {
@@ -62,13 +66,15 @@ export default function GateCard(props: Props) {
     setNote('');
     setProblem(null);
     setSent('');
+    decidedFor.current = '';
+    setDecided('');
   }, [gateName]);
 
   async function decide(decision: 'approve' | 'reject') {
     const cur = live.current;
     const g = cur.gate;
-    if (busy.current || !g || cur.paused) return;
-    if (decision === 'approve' && approvedByMe(g, cur.me)) return;
+    if (busy.current || !g || cur.paused || decidedFor.current === g.name) return;
+    if (approvedByMe(g, cur.me)) return;
     busy.current = true;
     setPending(true);
     setProblem(null);
@@ -79,6 +85,8 @@ export default function GateCard(props: Props) {
         note: noteRef.current,
         evidence_digest: cur.digest,
       });
+      decidedFor.current = g.name;
+      setDecided(g.name);
       setSent(decision === 'approve' ? 'Approval sent.' : 'Rejection sent.');
       cur.onDecided();
     } catch (e) {
@@ -147,10 +155,10 @@ export default function GateCard(props: Props) {
       )}
       {sent && <p className="panel-line" role="status">{sent}</p>}
       <div className="actions">
-        <Button disabled={paused || pending || mine} aria-describedby={mine ? 'gate-mine' : undefined} onClick={() => void decide('approve')}>
+        <Button disabled={paused || pending || mine || decided === gate.name} aria-describedby={mine ? 'gate-mine' : undefined} onClick={() => void decide('approve')}>
           Approve
         </Button>
-        <Button disabled={paused || pending} onClick={() => void decide('reject')}>
+        <Button disabled={paused || pending || mine || decided === gate.name} onClick={() => void decide('reject')}>
           Reject
         </Button>
         <RollbackDialog migration={migration} paused={paused} onDone={props.onDecided} />
