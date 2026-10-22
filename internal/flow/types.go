@@ -86,7 +86,11 @@ type Gate struct {
 }
 
 type Status struct {
-	MigrationID         string            `json:"migration_id"`
+	MigrationID string `json:"migration_id"`
+	// PlanName and Routed are the plan's name and its routed service
+	// names, in plan order; set once at start, for the console.
+	PlanName            string            `json:"plan_name,omitempty"`
+	Routed              []string          `json:"routed,omitempty"`
 	Phase               string            `json:"phase"`
 	State               string            `json:"state"`
 	Primary             ops.Side          `json:"primary"`

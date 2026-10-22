@@ -46,7 +46,11 @@ func newRunner(ctx workflow.Context, in Input) (*runner, error) {
 		in:     in,
 		gateCh: workflow.GetSignalChannel(ctx, SignalGate),
 		rbCh:   workflow.GetSignalChannel(ctx, SignalRollback),
-		st:     Status{MigrationID: in.MigrationID, State: StateRunning, Primary: ops.Source, Events: []Event{}},
+		st: Status{MigrationID: in.MigrationID, PlanName: in.Plan.Name, State: StateRunning,
+			Primary: ops.Source, Events: []Event{}},
+	}
+	for _, s := range in.Plan.RoutedServices() {
+		r.st.Routed = append(r.st.Routed, s.Name)
 	}
 	err := workflow.SetQueryHandler(ctx, QueryStatus, func() (Status, error) { return r.st, nil })
 	return r, err
