@@ -28,15 +28,15 @@ type Plan struct {
 	Source     Env        `yaml:"source" json:"source"`
 	Target     Env        `yaml:"target" json:"target"`
 	Database   Database   `yaml:"database" json:"database"`
-	FrontDoor  *FrontDoor `yaml:"frontdoor" json:"frontdoor,omitempty"`
-	Services   []Service  `yaml:"services" json:"services,omitempty"`
+	FrontDoor  *FrontDoor `yaml:"frontdoor,omitempty" json:"frontdoor,omitempty"`
+	Services   []Service  `yaml:"services,omitempty" json:"services,omitempty"`
 	Thresholds Thresholds `yaml:"thresholds" json:"thresholds"`
 }
 
 type Env struct {
 	Postgres Postgres        `yaml:"postgres" json:"postgres"`
-	Hosts    map[string]Host `yaml:"hosts" json:"hosts,omitempty"`
-	Kube     *Kube           `yaml:"kube" json:"kube,omitempty"`
+	Hosts    map[string]Host `yaml:"hosts,omitempty" json:"hosts,omitempty"`
+	Kube     *Kube           `yaml:"kube,omitempty" json:"kube,omitempty"`
 }
 
 type Postgres struct {
@@ -48,7 +48,7 @@ type Postgres struct {
 type Database struct {
 	Name      string    `yaml:"name" json:"name"`
 	Schemas   []string  `yaml:"schemas" json:"schemas"`
-	Tables    []string  `yaml:"tables" json:"tables,omitempty"`
+	Tables    []string  `yaml:"tables,omitempty" json:"tables,omitempty"`
 	PgBouncer PgBouncer `yaml:"pgbouncer" json:"pgbouncer"`
 	Tools     Tools     `yaml:"tools" json:"tools"`
 }
@@ -56,9 +56,9 @@ type Database struct {
 type PgBouncer struct {
 	AdminDSN   secret.Ref `yaml:"admin_dsn" json:"admin_dsn"`
 	RoutesFile string     `yaml:"routes_file" json:"routes_file"`
-	Addresses  []string   `yaml:"addresses" json:"addresses,omitempty"`
+	Addresses  []string   `yaml:"addresses,omitempty" json:"addresses,omitempty"`
 	// Host, when set, is where routes_file lives: it is written over SSH.
-	Host *Host `yaml:"host" json:"host,omitempty"`
+	Host *Host `yaml:"host,omitempty" json:"host,omitempty"`
 }
 
 type Tools struct {

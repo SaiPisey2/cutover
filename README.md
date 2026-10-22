@@ -13,8 +13,8 @@ pause cutover bounds (default 10 s): PgBouncer holds queries, nothing
 fails. Two different people approve that switch. Reverse replication keeps
 the old database current until you finish, so rolling back is one command.
 
-Status: release 1 in progress. The database and traffic parts are done;
-the web console and the end-to-end demo are next.
+Status: release 1 in progress. The database, traffic and web console parts
+are done; the end-to-end demo is next.
 
 ## Requirements
 
@@ -120,12 +120,18 @@ from the files `/etc/cutover/source-repl-dsn` and `/etc/cutover/target-repl-dsn`
 
 Run the worker on the PgBouncer host, or anywhere that reaches it over SSH
 when `database.pgbouncer.host` is set, since it rewrites the routes file at
-the switch; the CLI commands can run anywhere that reaches Temporal.
+the switch. `migrate`, `gate` and `rollback` go through the console (see
+below), so start the server with `--data` and create an approver first.
 
 ```bash
 temporal server start-dev --ip 127.0.0.1 &
 go run ./cmd/cutover worker &   # on the PgBouncer host, or one that reaches it over SSH
-go run ./cmd/cutover migrate --plan examples/plan.yaml
+go run ./cmd/cutover approver new --data ./data --name alice   # asks for a password
+head -c 32 /dev/urandom | base64 > ./data/frontdoor-token
+go run ./cmd/cutover server --data ./data --state ./data/frontdoor.json \
+  --token-file ./data/frontdoor-token &
+export CUTOVER_CA=./data/ca.crt
+go run ./cmd/cutover migrate --plan examples/plan.yaml --as alice
 go run ./cmd/cutover status shop
 go run ./cmd/cutover gate shop discover approve --as alice
 go run ./cmd/cutover rollback shop --as alice --reason "why"   # any time before finish
@@ -133,13 +139,71 @@ go run ./cmd/cutover rollback shop --as alice --reason "why"   # any time before
 
 Positional arguments (ID, gate, decision) come before flags.
 
-Every command takes `--temporal HOST:PORT` (default `$CUTOVER_TEMPORAL` or
-`127.0.0.1:7233`) and `--namespace` (default `default`). `status` shows the
-phase, the open gate, readiness findings, recent events, and, when they
-apply, a replication-broken warning and the undo phases a halted unwind left.
+`worker` and `status` take `--temporal HOST:PORT` (default `$CUTOVER_TEMPORAL`
+or `127.0.0.1:7233`) and `--namespace` (default `default`). `status` still
+reads Temporal directly; it shows the phase, the open gate, readiness
+findings, recent events, and, when they apply, a replication-broken warning
+and the undo phases a halted unwind left.
 
 Schema changes are frozen during a migration: logical replication does not
 carry DDL, and cutover stops at a gate if the schemas drift.
+
+## The console
+
+`cutover server --data DIR` also serves a web console: the migrations,
+each one's timeline, live replication and traffic panels, the open gate
+with its evidence, the rehearsal diff, and the audit log. The data
+directory holds the approver accounts, the audit log and the console's
+TLS certificate.
+
+Create an account for each person who approves:
+
+```sh
+cutover approver new --data /var/lib/cutover --name alice
+cutover approver list --data /var/lib/cutover
+cutover approver disable --data /var/lib/cutover alice
+```
+
+Then start the server with the same `--data`. The console listens on
+loopback only, at https://127.0.0.1:7700 (`--console` picks another
+loopback port). From another machine, use an SSH tunnel:
+
+```sh
+ssh -L 7700:127.0.0.1:7700 cutover-host
+```
+
+The server makes its own certificate authority and writes it to
+`<data>/ca.crt`. Trust that file in your browser, and give it to the CLI
+with `--ca`, `CUTOVER_CA` or by copying it to `~/.cutover/ca.crt`. Add
+names to the certificate with `--tls-hosts` if you reach the console by
+another name.
+
+`migrate`, `gate` and `rollback` sign in to the console like the browser
+does: `--server` (default `https://127.0.0.1:7700`), `--ca`, `--as NAME`,
+and the password from the terminal or, with `--password-stdin`, from
+standard input. The server is the only thing that signals workflows, so
+every decision passes the same checks wherever it comes from:
+
+- **Two people switch.** The second approval of `switch` must come from a
+  different account whose name also differs from the first approver's.
+  Disabling an account and making a new one with the same name does not
+  make a second person.
+- **Fresh sign-in for the switch.** Approving `switch` needs a session
+  younger than 15 minutes; sign in again if yours is older.
+- **Decisions are tied to what you saw.** Each decision carries a digest of
+  the gate and the evidence shown with it. If either changed since you
+  looked (another approval arrived, new checks came in), the server refuses
+  with "evidence changed; review the gate again".
+- **Everything is logged.** Every sign-in, migration start, gate decision
+  and rollback goes to an audit log with the account, the time, the
+  decision, the note and the evidence digest. The log is append-only; the
+  database refuses updates and deletes.
+
+With `--data`, the server also asks Envoy to log failed requests to
+`access.log` beside the `--state` file (or `--access-log PATH`), and the
+console shows recent failures per service and side. Envoy must be able to
+write that path. Envoy does not log mirrored requests, so target failures
+appear once traffic starts shifting, not during the rehearsal.
 
 ## Gates
 
@@ -153,9 +217,11 @@ unwind. `replication-broken` is described in the runbook below.
 
 ## Operating notes
 
-- **Approvers are not authenticated.** The name given to `cutover gate --as`
-  is recorded as given. A later release adds accounts. Until then anyone with Temporal
-  access can approve.
+- **Keep Temporal's frontend on loopback.** Approvers are authenticated by
+  the console, but anyone who can reach Temporal directly can signal a
+  workflow and skip those checks. Run Temporal on 127.0.0.1 (as
+  `temporal server start-dev --ip 127.0.0.1` does), on the same host as
+  the server and the worker.
 - **Credentials.** The plan carries only `env:` and `file:` references,
   resolved on the worker. Postgres server logs may record the
   `CREATE SUBSCRIPTION` connection string (`log_min_error_statement`,

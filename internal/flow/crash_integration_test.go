@@ -6,8 +6,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"slices"
@@ -20,8 +18,6 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
-	sdklog "go.temporal.io/sdk/log"
-	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 
 	"github.com/SaiPisey2/cutover/internal/flow"
@@ -41,44 +37,11 @@ import (
 // that is not enforced.
 const holdMargin = 2 * time.Second
 
-// quiet keeps the SDK's client log at warnings and above.
-func quiet() sdklog.Logger {
-	return sdklog.NewStructuredLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
-}
-
 // workerOptions are the product's worker options, named for the test.
 func workerOptions(identity string) worker.Options {
 	o := flow.WorkerOptions()
 	o.Identity = identity
 	return o
-}
-
-// devServer starts a real Temporal dev server (in memory, headless) on a
-// free 127.0.0.1 port, using the installed temporal CLI so nothing is
-// downloaded. It returns a client and the server's host:port.
-func devServer(t *testing.T) (client.Client, string) {
-	t.Helper()
-	bin, err := exec.LookPath("temporal")
-	if err != nil {
-		bin = "/opt/homebrew/bin/temporal"
-		if _, err := os.Stat(bin); err != nil {
-			t.Fatal("temporal CLI not found on PATH or in /opt/homebrew/bin (brew install temporal)")
-		}
-	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostPort := l.Addr().String()
-	l.Close()
-	srv, err := testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{ExistingPath: bin, LogLevel: "error",
-		ClientOptions: &client.Options{HostPort: hostPort, Namespace: "default",
-			Logger: quiet()}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = srv.Stop() })
-	return srv.Client(), hostPort
 }
 
 // attempt is one activity attempt the history records as started: the last
@@ -249,7 +212,7 @@ func TestWorkerCrashDuringSwitch(t *testing.T) {
 	itest.Reset(t)
 	itest.Seed(t, itest.Conn(t, itest.SourceDSN))
 	ctx := context.Background()
-	c, _ := devServer(t)
+	c, _ := itest.StartTemporal(t)
 
 	crash := &crashing{Activities: ops.New(), hit: make(chan struct{}, 1)}
 	w1 := worker.New(c, flow.TaskQueue, workerOptions("w1"))
@@ -384,7 +347,7 @@ func TestPauseBudgetOnRealClock(t *testing.T) {
 	src := itest.Conn(t, itest.SourceDSN)
 	itest.Seed(t, src)
 	ctx := context.Background()
-	c, _ := devServer(t)
+	c, _ := itest.StartTemporal(t)
 
 	maxPause := 2 * time.Second
 	slow := &slowSequences{Activities: ops.New(), hang: 3 * maxPause, returned: make(chan struct{})}
@@ -513,7 +476,7 @@ func TestCrashWorkerChild(t *testing.T) {
 	if hostPort == "" {
 		t.Skip("helper process for TestWorkerKilledDuringSwitch")
 	}
-	c, err := client.Dial(client.Options{HostPort: hostPort, Namespace: "default", Logger: quiet()})
+	c, err := client.Dial(client.Options{HostPort: hostPort, Namespace: "default", Logger: itest.QuietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +524,7 @@ func TestWorkerKilledDuringSwitch(t *testing.T) {
 	itest.Reset(t)
 	itest.Seed(t, itest.Conn(t, itest.SourceDSN))
 	ctx := context.Background()
-	c, hostPort := devServer(t)
+	c, hostPort := itest.StartTemporal(t)
 
 	p := itest.Plan(t) // sets the DSN variables the child inherits
 	maxPause := p.Thresholds.Switch.MaxPause.D()

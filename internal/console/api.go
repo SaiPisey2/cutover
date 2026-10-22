@@ -536,14 +536,17 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		writeJSON(w, http.StatusConflict, errAlreadyDecided)
 		return
 	}
-	if twoPerson && body.Decision == flow.Approve && sameName(g.Approvals, s.ApproverName) {
-		writeJSON(w, http.StatusConflict, errDifferentHuman)
-		return
-	}
 	// Accepted here but not yet visible in the workflow's status: a second
 	// tab would pass every check above and send a duplicate.
 	if h.decided.has(id, gk, me) {
 		writeJSON(w, http.StatusConflict, errAlreadySent)
+		return
+	}
+	// The approvals this server sent count too: the status may not show
+	// them yet.
+	approvals := append(slices.Clone(g.Approvals), h.decided.approvals(id, gk)...)
+	if twoPerson && body.Decision == flow.Approve && sameName(approvals, s.ApproverName) {
+		writeJSON(w, http.StatusConflict, errDifferentHuman)
 		return
 	}
 
@@ -561,7 +564,7 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		h.temporalFailed(w, "gate signal", err)
 		return
 	}
-	h.decided.add(id, gk, me)
+	h.decided.add(id, gk, me, body.Decision)
 	h.log.Info("gate decided", "migration", id, "gate", gate, "decision", body.Decision, "by", s.ApproverName)
 	reply(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
@@ -597,7 +600,7 @@ type decidedGates struct {
 
 type gateDecisions struct {
 	key string
-	ids map[string]bool
+	ids map[string]flow.Decision
 }
 
 // observe records the migration's current gate, forgetting the decisions
@@ -614,18 +617,36 @@ func (d *decidedGates) has(id, key, who string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	e := d.m[id]
-	return e != nil && e.key == key && e.ids[who]
+	return e != nil && e.key == key && e.ids[who] != ""
 }
 
-func (d *decidedGates) add(id, key, who string) {
+// approvals returns the accounts ("name#id") whose approval of the gate
+// this server signalled.
+func (d *decidedGates) approvals(id, key string) []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	e := d.m[id]
 	if e == nil || e.key != key {
-		e = &gateDecisions{key: key, ids: map[string]bool{}}
+		return nil
+	}
+	var out []string
+	for who, dec := range e.ids {
+		if dec == flow.Approve {
+			out = append(out, who)
+		}
+	}
+	return out
+}
+
+func (d *decidedGates) add(id, key, who string, dec flow.Decision) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.m[id]
+	if e == nil || e.key != key {
+		e = &gateDecisions{key: key, ids: map[string]flow.Decision{}}
 		d.m[id] = e
 	}
-	e.ids[who] = true
+	e.ids[who] = dec
 }
 
 // sameName reports whether any approval ("name#id") names this person,

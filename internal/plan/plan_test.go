@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 const minimal = `
@@ -145,6 +147,35 @@ func TestJSONRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(p, q) {
 		t.Fatalf("round trip changed the plan:\n%+v\n%+v", p, q)
+	}
+}
+
+// A plan marshalled to YAML parses back to the same plan: the console's
+// API takes plans as YAML.
+func TestYAMLRoundTrip(t *testing.T) {
+	example, err := Load("../../examples/plan.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := Parse([]byte(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range map[string]Plan{"minimal": small, "example": example} {
+		b, err := yaml.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), "max_pause: 10s") {
+			t.Fatalf("%s: durations should marshal as strings:\n%s", name, b)
+		}
+		q, err := Parse(b)
+		if err != nil {
+			t.Fatalf("%s: marshalled plan does not parse: %v\n%s", name, err, b)
+		}
+		if !reflect.DeepEqual(p, q) {
+			t.Fatalf("%s: round trip changed the plan:\n%+v\n%+v", name, p, q)
+		}
 	}
 }
 

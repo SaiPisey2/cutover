@@ -21,6 +21,8 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	return d.parse(s)
 }
 
+func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
 
 func (d *Duration) UnmarshalJSON(b []byte) error {

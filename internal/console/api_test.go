@@ -942,3 +942,24 @@ func TestFailedSignalIsNotRemembered(t *testing.T) {
 	e.fake.gateErr = nil
 	require.Equal(t, 202, e.decide(alice, "m1", "prepare", "approve").Code)
 }
+
+// TestSameNameBeforeTheStatusShowsIt: on the switch, a second account with
+// the first approver's name (an account disabled and made again) is the
+// same person, even before the status shows the first approval.
+func TestSameNameBeforeTheStatusShowsIt(t *testing.T) {
+	e := newAPIEnv(t)
+	e.account("b1", "bob")
+	e.fake.open("m1", "switch", 2)
+	e.fake.lag = true
+	require.Equal(t, 202, e.decide(e.session("a1"), "m1", "switch", "approve").Code)
+
+	require.NoError(t, e.st.DisableApprover(context.Background(), "alice", e.now))
+	e.account("a2", "Alice")
+	w := e.decide(e.session("a2"), "m1", "switch", "approve")
+	require.Equal(t, 409, w.Code, w.Body.String())
+	require.Equal(t, "the second approval must come from a different person", errBody(t, w))
+	require.Len(t, e.fake.gateCalls(), 1)
+	require.Len(t, e.audit("gate-decision"), 1)
+
+	require.Equal(t, 202, e.decide(e.session("b1"), "m1", "switch", "approve").Code)
+}

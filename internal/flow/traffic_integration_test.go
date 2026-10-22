@@ -188,7 +188,7 @@ func newTrafficRig(t *testing.T) *rig {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	c, _ := devServer(t)
+	c, _ := itest.StartTemporal(t)
 	w := worker.New(c, flow.TaskQueue, flow.WorkerOptions())
 	flow.Register(w)
 	if err := w.Start(); err != nil {

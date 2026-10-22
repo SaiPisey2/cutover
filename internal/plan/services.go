@@ -72,13 +72,13 @@ type Service struct {
 	Kind string `yaml:"kind" json:"kind"`
 	// Route is how users reach the service through the front door; a
 	// service without one (a background worker) is copied but not routed.
-	Route *Route `yaml:"route" json:"route,omitempty"`
+	Route *Route `yaml:"route,omitempty" json:"route,omitempty"`
 	// MirrorMethods are mirrored to the target in Rehearse. Omitted means
 	// GET and HEAD; an empty list turns mirroring off for this service.
 	MirrorMethods []string    `yaml:"mirror_methods" json:"mirror_methods"`
-	Compose       *Compose    `yaml:"compose" json:"compose,omitempty"`
-	Systemd       *Systemd    `yaml:"systemd" json:"systemd,omitempty"`
-	Deployment    *Deployment `yaml:"deployment" json:"deployment,omitempty"`
+	Compose       *Compose    `yaml:"compose,omitempty" json:"compose,omitempty"`
+	Systemd       *Systemd    `yaml:"systemd,omitempty" json:"systemd,omitempty"`
+	Deployment    *Deployment `yaml:"deployment,omitempty" json:"deployment,omitempty"`
 	Source        Placement   `yaml:"source" json:"source"`
 	Target        Placement   `yaml:"target" json:"target"`
 }
@@ -93,8 +93,8 @@ type Route struct {
 // that side's hosts (compose, systemd); Endpoint is host:port the front
 // door connects to (routed services).
 type Placement struct {
-	Host     string `yaml:"host" json:"host,omitempty"`
-	Endpoint string `yaml:"endpoint" json:"endpoint,omitempty"`
+	Host     string `yaml:"host,omitempty" json:"host,omitempty"`
+	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 }
 
 type Compose struct {
@@ -106,7 +106,7 @@ type Compose struct {
 // already there (its binary, environment files, config).
 type Systemd struct {
 	Unit  string   `yaml:"unit" json:"unit"`
-	Files []string `yaml:"files" json:"files,omitempty"`
+	Files []string `yaml:"files,omitempty" json:"files,omitempty"`
 }
 
 type Deployment struct {
