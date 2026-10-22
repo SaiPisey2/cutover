@@ -189,7 +189,8 @@ func listener(l Listener) (*listenerv3.Listener, error) {
 
 // failureFormat is one JSON object per failed request. It names no
 // header but the request ID and no body, and the path drops the query
-// (which can carry tokens) and is cut at 200 bytes.
+// (which can carry tokens) and is cut at 200 bytes. Clients set the
+// request ID, so it is cut at 64.
 var failureFormat = map[string]any{
 	"at":          "%START_TIME%",
 	"method":      "%REQ(:METHOD)%",
@@ -198,7 +199,7 @@ var failureFormat = map[string]any{
 	"flags":       "%RESPONSE_FLAGS%",
 	"duration_ms": "%DURATION%",
 	"cluster":     "%UPSTREAM_CLUSTER%",
-	"request_id":  "%REQ(X-REQUEST-ID)%",
+	"request_id":  "%REQ(X-REQUEST-ID):64%",
 }
 
 // failureLog writes requests that got a 5xx, or that Envoy flagged

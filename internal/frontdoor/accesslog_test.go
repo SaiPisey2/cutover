@@ -150,8 +150,14 @@ func TestFailuresWaitsForTheFile(t *testing.T) {
 	f := NewFailures(p, 50)
 	f.poll = 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go f.Run(ctx)
+	done := make(chan error, 1)
+	go func() { done <- f.Run(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil && err != context.Canceled {
+			t.Errorf("Run: %v", err)
+		}
+	}()
 	time.Sleep(30 * time.Millisecond)
 	// The file did not exist when Run started, so all of it is new.
 	appendLines(t, p, line("c", "first", 503))
@@ -187,6 +193,25 @@ func TestFailuresFollowsRotation(t *testing.T) {
 	appendLines(t, p, line("c", "3", 503))      // the new file
 	if got := waitRecent(t, f, "c", 3); !slices.Equal(ids(got), []string{"3", "2", "1"}) {
 		t.Fatalf("got %v", ids(got))
+	}
+}
+
+func TestFailuresKeepsAtLeastOne(t *testing.T) {
+	for _, n := range []int{0, -3} {
+		p := newLog(t)
+		f := tail(t, p, n)
+		appendLines(t, p, line("c", "1", 503), line("c", "2", 503))
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			got := f.Recent("c")
+			if len(got) == 1 && got[0].RequestID == "2" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("perCluster %d: got %v, want only the newest", n, ids(got))
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 }
 
@@ -262,7 +287,7 @@ func TestListenerHasAccessLogOnlyWhenSet(t *testing.T) {
 		"flags":       "%RESPONSE_FLAGS%",
 		"duration_ms": "%DURATION%",
 		"cluster":     "%UPSTREAM_CLUSTER%",
-		"request_id":  "%REQ(X-REQUEST-ID)%",
+		"request_id":  "%REQ(X-REQUEST-ID):64%",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("format has keys %v, want exactly %v", got, want)

@@ -44,8 +44,9 @@ type Failures struct {
 }
 
 // NewFailures returns a Failures that keeps at most perCluster entries
-// per cluster from the access log at path. Run starts it.
+// per cluster (at least 1) from the access log at path. Run starts it.
 func NewFailures(path string, perCluster int) *Failures {
+	perCluster = max(perCluster, 1)
 	return &Failures{path: path, perCluster: perCluster, poll: 250 * time.Millisecond, byCluster: map[string][]Failure{}}
 }
 
