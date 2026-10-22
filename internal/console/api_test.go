@@ -34,6 +34,8 @@ type fakeTemporal struct {
 	meet    int
 	arrived int
 	gateErr error
+	opened  int  // gates opened so far, for distinct opening times
+	lag     bool // accepted signals are not yet visible in the status
 	// action, when set, runs inside Start, Gate and Rollback with their
 	// context; its error is the call's.
 	action    func(ctx context.Context) error
@@ -49,9 +51,11 @@ func newFake() *fakeTemporal {
 func (f *fakeTemporal) open(id, gate string, needs int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.opened++
 	f.statuses[id] = &flow.Status{MigrationID: id, PlanName: "shop", Routed: []string{"api", "web"},
 		Phase: gate, State: flow.StateWaiting,
-		Gate: &flow.Gate{Name: gate, Phase: gate, Needs: needs, Approvals: []string{}, Summary: "s"}}
+		Gate:   &flow.Gate{Name: gate, Phase: gate, Needs: needs, Approvals: []string{}, Summary: "s"},
+		Events: []flow.Event{{At: time.Unix(int64(f.opened), 0), Phase: gate, Kind: "gate-opened"}}}
 }
 
 func (f *fakeTemporal) List(context.Context) ([]MigrationSummary, error) {
@@ -135,7 +139,7 @@ func (f *fakeTemporal) Gate(ctx context.Context, id string, s flow.GateSignal) e
 		return f.gateErr
 	}
 	f.gates = append(f.gates, s)
-	if st := f.statuses[id]; st != nil && st.Gate != nil && s.Decision == flow.Approve {
+	if st := f.statuses[id]; !f.lag && st != nil && st.Gate != nil && s.Decision == flow.Approve {
 		st.Gate.Approvals = append(st.Gate.Approvals, s.ApproverID)
 		st.Events = append(st.Events, flow.Event{Kind: "approved", Actor: s.ApproverID})
 	}
@@ -181,6 +185,7 @@ type apiEnv struct {
 	*env
 	fake *fakeTemporal
 	mux  *http.ServeMux
+	api  *api
 	n    int
 }
 
@@ -193,8 +198,8 @@ func newAPIEnv(t *testing.T, mod ...func(*Deps)) *apiEnv {
 		m(&d)
 	}
 	mux := http.NewServeMux()
-	Routes(mux, e.a, d)
-	return &apiEnv{env: e, fake: fake, mux: mux}
+	h := routes(mux, e.a, d)
+	return &apiEnv{env: e, fake: fake, mux: mux, api: h}
 }
 
 // user is a session made directly in the store, so tests do not pay for
@@ -887,4 +892,53 @@ func TestActionDeadlineDoesNotLoseTheFailedRow(t *testing.T) {
 			require.True(t, strings.HasPrefix(failed[0].Note, "not confirmed"), failed[0].Note)
 		})
 	}
+}
+
+// TestRepeatDecisionBeforeTheStatusShowsIt: a 202 does not mean the
+// workflow's status already shows the approval. A second tab's repeat is
+// refused by what this server remembers, until the gate changes.
+func TestRepeatDecisionBeforeTheStatusShowsIt(t *testing.T) {
+	e := newAPIEnv(t)
+	e.account("b1", "bob")
+	e.fake.open("m1", "switch", 2)
+	e.fake.lag = true
+	alice, alice2 := e.session("a1"), e.session("a1")
+
+	require.Equal(t, 202, e.decide(alice, "m1", "switch", "approve").Code)
+	for _, dec := range []string{"approve", "reject"} {
+		w := e.decide(alice2, "m1", "switch", dec)
+		require.Equal(t, 409, w.Code, dec)
+		require.Equal(t, "you already decided this gate", errBody(t, w))
+	}
+	require.Len(t, e.fake.gateCalls(), 1)
+	require.Len(t, e.audit("gate-decision"), 1)
+
+	// Another account is not affected.
+	require.Equal(t, 202, e.decide(e.session("b1"), "m1", "switch", "approve").Code)
+
+	// A different gate: alice decides again.
+	e.fake.open("m1", "finish", 1)
+	require.Equal(t, 202, e.decide(alice, "m1", "finish", "approve").Code)
+	// The same gate name reopened (a retry): a new gate, so alice may decide.
+	e.fake.open("m1", "finish", 1)
+	require.Equal(t, 202, e.decide(alice, "m1", "finish", "approve").Code)
+	require.Len(t, e.fake.gateCalls(), 4)
+
+	// No gate open: the memory is dropped.
+	e.fake.statuses["m1"].Gate = nil
+	require.Equal(t, 409, e.do(&alice, "POST", "/api/migrations/m1/gates/finish", decision("approve", "", "")).Code)
+	e.api.decided.mu.Lock()
+	require.Empty(t, e.api.decided.m)
+	e.api.decided.mu.Unlock()
+}
+
+func TestFailedSignalIsNotRemembered(t *testing.T) {
+	e := newAPIEnv(t)
+	e.fake.open("m1", "prepare", 1)
+	e.fake.lag = true
+	alice := e.session("a1")
+	e.fake.gateErr = fmt.Errorf("%w: down", ErrTemporal)
+	require.Equal(t, 503, e.decide(alice, "m1", "prepare", "approve").Code)
+	e.fake.gateErr = nil
+	require.Equal(t, 202, e.decide(alice, "m1", "prepare", "approve").Code)
 }

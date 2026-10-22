@@ -96,6 +96,7 @@ const (
 	errSignInAgain    = `{"error":"sign in again to decide the switch"}`
 	errDifferentHuman = `{"error":"the second approval must come from a different person"}`
 	errAlreadyDecided = `{"error":"you already approved this gate"}`
+	errAlreadySent    = `{"error":"you already decided this gate"}`
 	errNotYAML        = "plan is not valid YAML"
 )
 
@@ -104,8 +105,10 @@ type api struct {
 	d     Deps
 	log   *slog.Logger
 	locks *keyedLocks
-	hub   *hub
-	slots *streamSlots
+	// decided remembers who this server has signalled on each open gate.
+	decided *decidedGates
+	hub     *hub
+	slots   *streamSlots
 }
 
 // Routes mounts the whole /api surface on mux.
@@ -118,7 +121,8 @@ func routes(mux *http.ServeMux, a *Auth, d Deps) *api {
 		log = slog.New(slog.DiscardHandler)
 	}
 	h := &api{auth: a, d: d, log: log, locks: &keyedLocks{m: map[string]*keyedLock{}},
-		slots: &streamSlots{per: map[string]int{}}}
+		decided: &decidedGates{m: map[string]*gateDecisions{}},
+		slots:   &streamSlots{per: map[string]int{}}}
 	h.hub = newHub(d.Context, h, log)
 	mux.HandleFunc("POST /api/login", a.Login)
 	mux.HandleFunc("POST /api/logout", a.Logout) // Require inside
@@ -508,6 +512,8 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		return
 	}
 	g := st.Gate
+	gk := gateKey(st)
+	h.decided.observe(id, gk)
 	if g == nil || g.Name != gate {
 		writeJSON(w, http.StatusConflict, errGateNotOpen)
 		return
@@ -534,6 +540,12 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		writeJSON(w, http.StatusConflict, errDifferentHuman)
 		return
 	}
+	// Accepted here but not yet visible in the workflow's status: a second
+	// tab would pass every check above and send a duplicate.
+	if h.decided.has(id, gk, me) {
+		writeJSON(w, http.StatusConflict, errAlreadySent)
+		return
+	}
 
 	row := store.AuditRow{At: h.auth.Now(), ActorID: me, ActorName: s.ApproverName, Migration: id,
 		Kind: "gate-decision", Gate: gate, Decision: string(body.Decision), Note: body.Note, Evidence: digest}
@@ -549,8 +561,71 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 		h.temporalFailed(w, "gate signal", err)
 		return
 	}
+	h.decided.add(id, gk, me)
 	h.log.Info("gate decided", "migration", id, "gate", gate, "decision", body.Decision, "by", s.ApproverName)
 	reply(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
+// gateKey identifies the open gate instance: its name, its phase and when
+// it opened. The opening time tells apart a gate that reopens under the
+// same name (a discover re-check, a retry gate after another failure). If
+// the gate-opened event has been trimmed from the status it is left out.
+// "" means no gate is open.
+func gateKey(st flow.Status) string {
+	if st.Gate == nil {
+		return ""
+	}
+	opened := ""
+	for i := len(st.Events) - 1; i >= 0; i-- {
+		if e := st.Events[i]; e.Kind == "gate-opened" {
+			opened = e.At.UTC().Format(time.RFC3339Nano)
+			break
+		}
+	}
+	return st.Gate.Name + "\x00" + st.Gate.Phase + "\x00" + opened
+}
+
+// decidedGates remembers, per migration, the accounts whose decision on
+// the open gate this server signalled. It lives in memory: the console is
+// one process, and the per-migration lock already orders every decision.
+// A migration's entry is replaced when its open gate changes and dropped
+// when none is open.
+type decidedGates struct {
+	mu sync.Mutex
+	m  map[string]*gateDecisions
+}
+
+type gateDecisions struct {
+	key string
+	ids map[string]bool
+}
+
+// observe records the migration's current gate, forgetting the decisions
+// on any other.
+func (d *decidedGates) observe(id, key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e := d.m[id]; e != nil && e.key != key {
+		delete(d.m, id)
+	}
+}
+
+func (d *decidedGates) has(id, key, who string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.m[id]
+	return e != nil && e.key == key && e.ids[who]
+}
+
+func (d *decidedGates) add(id, key, who string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.m[id]
+	if e == nil || e.key != key {
+		e = &gateDecisions{key: key, ids: map[string]bool{}}
+		d.m[id] = e
+	}
+	e.ids[who] = true
 }
 
 // sameName reports whether any approval ("name#id") names this person,
