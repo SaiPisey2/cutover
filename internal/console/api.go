@@ -45,13 +45,19 @@ type FailureSource interface {
 	Failures(owner, service string) (source, target []frontdoor.Failure)
 }
 
-// Deps is what the API runs on. Failures and Log may be nil. The clock is
-// the Auth's, so sessions and the switch's freshness rule share one.
+// Deps is what the API runs on. Failures, Log and Context may be nil. The
+// clock is the Auth's, so sessions and the switch's freshness rule share
+// one.
 type Deps struct {
 	Temporal Temporal
 	Store    APIStore
 	Failures FailureSource
 	Log      *slog.Logger
+	// Context bounds the live stream: when it ends, the shared poller
+	// stops and every open stream closes, so a server cancels it before
+	// Shutdown (which would otherwise wait on streams that never idle).
+	// nil means never.
+	Context context.Context
 }
 
 const (
@@ -98,15 +104,22 @@ type api struct {
 	d     Deps
 	log   *slog.Logger
 	locks *keyedLocks
+	hub   *hub
+	slots *streamSlots
 }
 
 // Routes mounts the whole /api surface on mux.
-func Routes(mux *http.ServeMux, a *Auth, d Deps) {
+func Routes(mux *http.ServeMux, a *Auth, d Deps) { routes(mux, a, d) }
+
+// routes is Routes, returning the handlers so a test can reach the hub.
+func routes(mux *http.ServeMux, a *Auth, d Deps) *api {
 	log := d.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	h := &api{auth: a, d: d, log: log, locks: &keyedLocks{m: map[string]*keyedLock{}}}
+	h := &api{auth: a, d: d, log: log, locks: &keyedLocks{m: map[string]*keyedLock{}},
+		slots: &streamSlots{per: map[string]int{}}}
+	h.hub = newHub(d.Context, h, log)
 	mux.HandleFunc("POST /api/login", a.Login)
 	mux.HandleFunc("POST /api/logout", a.Logout) // Require inside
 	mux.HandleFunc("GET /api/me", a.Me)          // Require inside
@@ -117,8 +130,9 @@ func Routes(mux *http.ServeMux, a *Auth, d Deps) {
 	mux.Handle("POST /api/migrations/{id}/rollback", a.Require(h.rollback))
 	mux.Handle("GET /api/migrations/{id}/failures", a.Require(h.failures))
 	mux.Handle("GET /api/audit", a.Require(h.audit))
-	// GET /api/stream (the live updates) is registered here too, by the
-	// stream's own file.
+	// The stream authenticates itself (with Session), so it can key its
+	// slots on the cookie it was given.
+	mux.HandleFunc("GET /api/stream", h.stream)
 
 	// Anything else under /api, a known path with the wrong method
 	// included, is a 401 without a session, so probing learns nothing
@@ -126,6 +140,7 @@ func Routes(mux *http.ServeMux, a *Auth, d Deps) {
 	mux.Handle("/api/", a.Require(func(w http.ResponseWriter, _ *http.Request, _ store.Session) {
 		writeJSON(w, http.StatusNotFound, errNotFound)
 	}))
+	return h
 }
 
 // ---- helpers ----
