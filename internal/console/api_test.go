@@ -855,3 +855,36 @@ func TestDisconnectDoesNotStrandTheAuditRow(t *testing.T) {
 		})
 	}
 }
+
+// TestActionDeadlineDoesNotLoseTheFailedRow: the call fails because the
+// action's own deadline ran out; the row recording that still lands.
+func TestActionDeadlineDoesNotLoseTheFailedRow(t *testing.T) {
+	old := actionTimeout
+	actionTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { actionTimeout = old })
+	for _, c := range []struct{ name, path, failed string }{
+		{"decide", "/api/migrations/m1/gates/prepare", "gate-decision-failed"},
+		{"rollback", "/api/migrations/m1/rollback", "rollback-failed"},
+		{"start", "/api/migrations", "migration-start-failed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newAPIEnv(t)
+			e.fake.open("m1", "prepare", 1)
+			alice := e.session("a1")
+			body := map[string]string{
+				"decide":   decision("approve", "", e.digest(alice, "m1")),
+				"rollback": `{"reason":"r"}`,
+				"start":    startJSON("m2", examplePlan(t)),
+			}[c.name]
+			e.fake.action = func(ctx context.Context) error {
+				<-ctx.Done() // a Temporal that never answers
+				return fmt.Errorf("%w: %w", ErrTemporal, ctx.Err())
+			}
+			w := e.do(&alice, "POST", c.path, body)
+			require.Equal(t, 503, w.Code)
+			failed := e.audit(c.failed)
+			require.Len(t, failed, 1)
+			require.True(t, strings.HasPrefix(failed[0].Note, "not confirmed"), failed[0].Note)
+		})
+	}
+}

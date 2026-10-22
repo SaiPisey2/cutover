@@ -58,13 +58,19 @@ const (
 	apiBodyLimit = 64 << 10
 	// temporalTimeout bounds each Temporal query a request makes.
 	temporalTimeout = 10 * time.Second
-	// actionTimeout bounds a signal or start, on its own clock.
-	actionTimeout = 10 * time.Second
 	// switchFreshness is how old a session may be to approve the switch.
 	switchFreshness = 15 * time.Minute
 	gateSwitch      = "switch"
 	auditLimit      = 100
 	auditLimitMax   = 500
+)
+
+// actionTimeout bounds a signal or start, on its own clock;
+// failedAuditTimeout bounds the row recording that one failed, on another.
+// Vars so a test can shrink them.
+var (
+	actionTimeout      = 10 * time.Second
+	failedAuditTimeout = 5 * time.Second
 )
 
 // gatePattern is the shape of a gate name, retry gates included.
@@ -376,7 +382,7 @@ func (h *api) start(w http.ResponseWriter, r *http.Request, s store.Session) {
 	ctx, cancel := actionCtx(r)
 	defer cancel()
 	if err := h.d.Temporal.Start(ctx, id, p); err != nil {
-		h.auditFailed(ctx, row, "migration-start-failed")
+		h.auditFailed(r, row, "migration-start-failed")
 		h.temporalFailed(w, "start", err)
 		return
 	}
@@ -388,7 +394,13 @@ func (h *api) start(w http.ResponseWriter, r *http.Request, s store.Session) {
 // confirmed. A "*-failed" kind means exactly that, not "did not happen": a
 // signal that timed out may still have reached the workflow, whose own
 // history is the final word.
-func (h *api) auditFailed(ctx context.Context, row store.AuditRow, kind string) {
+//
+// It runs on its own context, cut loose from the client and from the
+// action's deadline: the likeliest failure is that deadline running out,
+// and a row written on the dead context would be refused.
+func (h *api) auditFailed(r *http.Request, row store.AuditRow, kind string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), failedAuditTimeout)
+	defer cancel()
 	row.Kind, row.At = kind, h.auth.Now()
 	if row.Note == "" {
 		row.Note = notConfirmed
@@ -508,7 +520,7 @@ func (h *api) decide(w http.ResponseWriter, r *http.Request, s store.Session) {
 	actx, acancel := actionCtx(r)
 	defer acancel()
 	if err := h.d.Temporal.Gate(actx, id, sig); err != nil {
-		h.auditFailed(actx, row, "gate-decision-failed")
+		h.auditFailed(r, row, "gate-decision-failed")
 		h.temporalFailed(w, "gate signal", err)
 		return
 	}
@@ -566,7 +578,7 @@ func (h *api) rollback(w http.ResponseWriter, r *http.Request, s store.Session) 
 	actx, acancel := actionCtx(r)
 	defer acancel()
 	if err := h.d.Temporal.Rollback(actx, id, flow.RollbackSignal{ApproverID: me, Reason: body.Reason}); err != nil {
-		h.auditFailed(actx, row, "rollback-failed")
+		h.auditFailed(r, row, "rollback-failed")
 		h.temporalFailed(w, "rollback signal", err)
 		return
 	}
