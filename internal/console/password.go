@@ -68,16 +68,17 @@ func CheckPassword(phc, pw string) bool {
 		return false
 	}
 	var v int
-	if n, err := fmt.Sscanf(parts[2], "v=%d", &v); err != nil || n != 1 || v != argon2.Version {
+	if n, err := fmt.Sscanf(parts[2], "v=%d", &v); err != nil || n != 1 || v != argon2.Version || parts[2] != fmt.Sprintf("v=%d", v) {
 		return false
 	}
 	var m, t uint32
 	var p uint8
-	if n, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil || n != 3 {
+	if n, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil || n != 3 ||
+		parts[3] != fmt.Sprintf("m=%d,t=%d,p=%d", m, t, p) {
 		return false
 	}
 	// Refuse parameters that would let a stored hash demand unbounded work.
-	if m == 0 || m > 1<<20 || t == 0 || t > 16 || p == 0 {
+	if m == 0 || m > 1<<18 || t == 0 || t > 16 || p == 0 {
 		return false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])

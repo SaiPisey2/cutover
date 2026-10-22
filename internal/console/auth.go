@@ -53,7 +53,6 @@ type Auth struct {
 	// check and dummyHash exist so an unknown name still costs one hash
 	// check; check is replaceable so a test can count the calls.
 	check     func(phc, pw string) bool
-	dummyOnce sync.Once
 	dummyHash string
 }
 
@@ -61,8 +60,9 @@ func NewAuth(st AuthStore, log *slog.Logger) *Auth {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	dummy, _ := HashPassword("cutover dummy password")
 	return &Auth{Store: st, Now: time.Now, Log: log, SessionTTL: sessionTTL,
-		limiter: newLimiter(), check: CheckPassword}
+		limiter: newLimiter(), check: CheckPassword, dummyHash: dummy}
 }
 
 // ApproverID is the identity recorded in the workflow and audit log.
@@ -179,7 +179,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	phc := ap.PasswordHash
 	if !found {
 		// Same work either way, so timing does not reveal which names exist.
-		phc = a.dummy()
+		phc = a.dummyHash
 	}
 	ok := a.check(phc, body.password)
 	if !found || !ok {
@@ -206,7 +206,9 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	row := store.AuditRow{At: now, ActorID: ApproverID(ap.Name, ap.ID), ActorName: ap.Name, Kind: "login"}
 	if _, err := a.Store.AppendAudit(r.Context(), row); err != nil {
 		// No audit trail, no session.
-		a.Store.RevokeSession(r.Context(), hashOf(id), now)
+		if rerr := a.Store.RevokeSession(r.Context(), hashOf(id), now); rerr != nil {
+			a.Log.Error("console auth: revoke session after audit failure", "err", rerr)
+		}
 		a.internal(w, "audit login", err)
 		return
 	}
@@ -214,11 +216,6 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	out, _ := json.Marshal(map[string]string{"name": ap.Name, "id": ApproverID(ap.Name, ap.ID), "csrf": csrf})
 	a.Log.Info("login", "remote", host, "approver", ap.Name)
 	writeJSON(w, http.StatusOK, string(out))
-}
-
-func (a *Auth) dummy() string {
-	a.dummyOnce.Do(func() { a.dummyHash, _ = HashPassword("cutover dummy password") })
-	return a.dummyHash
 }
 
 func (a *Auth) failed(ctx context.Context, host, name string) {
@@ -255,17 +252,19 @@ func sessionCookie(value string, maxAge int) *http.Cookie {
 func clearCookie(w http.ResponseWriter) { http.SetCookie(w, sessionCookie("", -1)) }
 
 // Logout revokes the session the cookie names and clears the cookie. It
-// is mounted behind Require, so the session is known to be live.
+// checks the session and CSRF header itself (through Require), so mounting
+// it bare cannot allow a cross-site forced logout.
 func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(SessionCookie); err == nil && c.Value != "" {
+	a.Require(func(w http.ResponseWriter, r *http.Request, _ store.Session) {
+		c, _ := r.Cookie(SessionCookie) // Require saw it
 		err := a.Store.RevokeSession(r.Context(), hashOf(c.Value), a.Now())
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			a.internal(w, "revoke session", err)
 			return
 		}
-	}
-	clearCookie(w)
-	w.WriteHeader(http.StatusNoContent)
+		clearCookie(w)
+		w.WriteHeader(http.StatusNoContent)
+	}).ServeHTTP(w, r)
 }
 
 // Me is GET /api/me, behind Require: it returns {name,id,csrf,session_created}.

@@ -217,6 +217,8 @@ func TestLimiterIgnoresForwardedHeaderAndBoundsMemory(t *testing.T) {
 		l.allow("h"+string(rune(i+0x100)), now)
 	}
 	require.Equal(t, limiterHosts, l.size())
+	require.False(t, l.allow("brand-new-host", now))
+	require.True(t, l.allow("h"+string(rune(0x100)), now))
 }
 
 func TestStateChangingCallsNeedTheCSRFHeader(t *testing.T) {
@@ -290,7 +292,7 @@ func TestLogoutRevokes(t *testing.T) {
 	e := newEnv(t)
 	cookie, csrf := e.loggedIn()
 	mux := http.NewServeMux()
-	mux.Handle("POST /api/logout", e.a.Require(func(w http.ResponseWriter, r *http.Request, _ store.Session) { e.a.Logout(w, r) }))
+	mux.HandleFunc("POST /api/logout", e.a.Logout)
 	mux.HandleFunc("GET /api/me", e.a.Me)
 	r := httptest.NewRequest("POST", "/api/logout", nil)
 	r.AddCookie(cookie)
@@ -303,6 +305,29 @@ func TestLogoutRevokes(t *testing.T) {
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
 	require.Equal(t, 401, w.Code)
+}
+
+func TestLogoutChecksCSRFItself(t *testing.T) {
+	e := newEnv(t)
+	cookie, csrf := e.loggedIn()
+	post := func(hdr string) int {
+		r := httptest.NewRequest("POST", "/api/logout", nil)
+		r.AddCookie(cookie)
+		if hdr != "" {
+			r.Header.Set(CSRFHeader, hdr)
+		}
+		w := httptest.NewRecorder()
+		e.a.Logout(w, r)
+		return w.Code
+	}
+	require.Equal(t, 403, post(""))
+	require.Equal(t, 403, post("wrong"))
+	r := httptest.NewRequest("GET", "/api/me", nil)
+	r.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	e.a.Me(w, r)
+	require.Equal(t, 200, w.Code)
+	require.Equal(t, 204, post(csrf))
 }
 
 func TestNewLoginRevokesOldSession(t *testing.T) {
@@ -328,6 +353,14 @@ func TestLogsNeverContainSecrets(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		e.login(`{"name":"alice","password":"wrong wrong wrong"}`, "10.0.0.5")
 	}
+	mr := httptest.NewRequest("GET", "/api/me", nil)
+	mr.AddCookie(cookie)
+	e.a.Me(httptest.NewRecorder(), mr)
+	lr := httptest.NewRequest("POST", "/api/logout", nil)
+	lr.AddCookie(cookie)
+	lr.Header.Set(CSRFHeader, csrf)
+	e.a.Logout(httptest.NewRecorder(), lr)
+	e.a.Logout(httptest.NewRecorder(), lr)
 	require.NotEmpty(t, e.logs.String())
 	for _, secret := range []string{alicePW, cookie.Value, csrf, "wrong wrong wrong", "wrong-csrf-guess", aliceHash} {
 		require.NotContains(t, e.logs.String(), secret)
