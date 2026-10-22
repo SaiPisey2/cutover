@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,12 +108,19 @@ type frontdoorRig struct {
 
 func newRig(t *testing.T) *frontdoorRig {
 	t.Helper()
+	return newRigWithLog(t, "")
+}
+
+// newRigWithLog starts a rig whose listener writes failed requests to
+// accessLog, or writes no access log when it is empty.
+func newRigWithLog(t *testing.T, accessLog string) *frontdoorRig {
+	t.Helper()
 	front := itest.FreePort(t)
 	adminPort := itest.FreePort(t)
 	xdsPort := itest.FreePort(t)
 	rig := &frontdoorRig{
 		store:    newStore(t),
-		listener: Listener{Address: "127.0.0.1", Port: front},
+		listener: Listener{Address: "127.0.0.1", Port: front, AccessLog: accessLog},
 		front:    "http://127.0.0.1:" + strconv.Itoa(front),
 		xdsAddr:  "127.0.0.1:" + strconv.Itoa(xdsPort),
 		client:   &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 16}},
@@ -462,5 +471,121 @@ func TestNoFailedRequestsOnJumps(t *testing.T) {
 	}
 	if tgt.total() == 0 {
 		t.Fatal("the target never received traffic")
+	}
+}
+
+// get sends one GET for path (which may carry a query) through the
+// front door with Host: shop.test.
+func (r *frontdoorRig) get(path string) (int, error) {
+	req, _ := http.NewRequest("GET", r.front+path, nil)
+	req.Host = "shop.test"
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+// failuresAt returns fs's entries whose path is path.
+func failuresAt(fs []Failure, path string) []Failure {
+	var out []Failure
+	for _, f := range fs {
+		if f.Path == path {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func TestAccessLogSamplesFailures(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "access.log")
+	rig := newRigWithLog(t, logPath)
+	fails := NewFailures(logPath, 50)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- fails.Run(ctx) }() // before Envoy creates the file
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	src, tgt := startBackend(t, "source"), startBackend(t, "target")
+	r := shopRoute(src, tgt)
+	rig.apply(t, r)
+	rig.waitHealthy(t, "c_shop_api_target")
+
+	// Shift: every request goes to a target that answers 503.
+	r.TargetWeight = 100
+	rig.apply(t, r)
+	tgt.failing.Store(true)
+	for i := 0; i < 10; i++ {
+		if code, err := rig.get(fmt.Sprintf("/orders?token=s3cret&i=%d", i)); code != 503 {
+			t.Fatalf("shift request %d: %d %v", i, code, err)
+		}
+	}
+	// Envoy flushes the file about once a second.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(fails.Recent("c_shop_api_target")) < 10 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	got := fails.Recent("c_shop_api_target")
+	if len(got) != 10 {
+		t.Fatalf("target has %d logged failures, want 10: %+v", len(got), got)
+	}
+	for _, f := range got {
+		if f.Status != 503 && f.Status != 500 {
+			t.Fatalf("status %d: %+v", f.Status, f)
+		}
+		if strings.Contains(f.Path, "?") || f.Path != "/orders" {
+			t.Fatalf("path %q must carry no query: %+v", f.Path, f)
+		}
+		if f.Method != "GET" || f.Cluster != "c_shop_api_target" || f.RequestID == "" || f.At.IsZero() {
+			t.Fatalf("incomplete entry %+v", f)
+		}
+	}
+	if s, _ := fails.Failures("shop", "api"); len(s) != 0 {
+		t.Fatalf("the source served nothing, yet has failures %+v", s)
+	}
+
+	// Mirroring: the source answers, and GETs are shadowed to the
+	// still-failing target.
+	//
+	// Measured against Envoy 1.39.4: the listener's access log does not
+	// record shadows. It logs the user's request, which the source
+	// answered 200 with no response flag, so the filter drops it; the
+	// shadow's 503 from the target never reaches the log. During
+	// mirroring the target shows no samples, which is why the console
+	// carries the C9 note. If a future Envoy starts logging shadows, this
+	// assertion fails: assert the entries instead and drop the note.
+	r.TargetWeight, r.Mirror, r.MirrorMethods = 0, true, []string{"GET"}
+	rig.apply(t, r)
+	before := tgt.count("GET")
+	for i := 0; i < 10; i++ {
+		if code, err := rig.get("/mirrored?token=s3cret"); code != 200 {
+			t.Fatalf("mirrored request %d: %d %v", i, code, err)
+		}
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for tgt.count("GET")-before < 10 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := tgt.count("GET") - before; n != 10 {
+		t.Fatalf("the target saw %d shadows, want 10", n)
+	}
+	time.Sleep(3 * time.Second) // past Envoy's one-second flush, with room
+	s, tg := fails.Failures("shop", "api")
+	if m := failuresAt(tg, "/mirrored"); len(m) != 0 {
+		t.Fatalf("Envoy now logs failed shadows (%d entries: %+v); assert them and drop the console's C9 note", len(m), m)
+	}
+	if len(tg) != 10 || len(s) != 0 {
+		t.Fatalf("mirroring changed the samples: source %d target %d, want 0 and 10", len(s), len(tg))
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "s3cret") || strings.Contains(string(b), "mirrored") {
+		t.Fatalf("the log holds a query or a shadow:\n%s", b)
 	}
 }

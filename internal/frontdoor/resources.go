@@ -6,13 +6,16 @@ import (
 	"strings"
 	"time"
 
+	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	filev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	reqwithoutqueryv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/formatter/req_without_query/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -20,6 +23,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -32,6 +36,9 @@ const (
 type Listener struct {
 	Address string `json:"address"`
 	Port    int    `json:"port"`
+	// AccessLog is the file Envoy writes failed requests to (see
+	// accesslog.go). Empty means no access log.
+	AccessLog string `json:"access_log,omitempty"`
 }
 
 // retryOn lists only failures where the request never reached the
@@ -141,8 +148,17 @@ func listener(l Listener) (*listenerv3.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	var logs []*accesslogv3.AccessLog
+	if l.AccessLog != "" {
+		al, err := failureLog(l.AccessLog)
+		if err != nil {
+			return nil, err
+		}
+		logs = append(logs, al)
+	}
 	hcm, err := anypb.New(&hcmv3.HttpConnectionManager{
 		StatPrefix: "frontdoor",
+		AccessLog:  logs,
 		CodecType:  hcmv3.HttpConnectionManager_AUTO,
 		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{
 			RouteConfigName: RouteConfigName,
@@ -169,6 +185,70 @@ func listener(l Listener) (*listenerv3.Listener, error) {
 			}},
 		}},
 	}, nil
+}
+
+// failureFormat is one JSON object per failed request. It names no
+// header but the request ID and no body, and the path drops the query
+// (which can carry tokens) and is cut at 200 bytes.
+var failureFormat = map[string]any{
+	"at":          "%START_TIME%",
+	"method":      "%REQ(:METHOD)%",
+	"path":        "%REQ_WITHOUT_QUERY(:PATH):200%",
+	"status":      "%RESPONSE_CODE%",
+	"flags":       "%RESPONSE_FLAGS%",
+	"duration_ms": "%DURATION%",
+	"cluster":     "%UPSTREAM_CLUSTER%",
+	"request_id":  "%REQ(X-REQUEST-ID)%",
+}
+
+// failureLog writes requests that got a 5xx, or that Envoy flagged
+// (no healthy upstream, reset, timeout, ...), to path.
+func failureLog(path string) (*accesslogv3.AccessLog, error) {
+	format, err := structpb.NewStruct(failureFormat)
+	if err != nil {
+		return nil, err
+	}
+	reqWithoutQuery, err := anypb.New(&reqwithoutqueryv3.ReqWithoutQuery{})
+	if err != nil {
+		return nil, err
+	}
+	file := &filev3.FileAccessLog{
+		Path: path,
+		AccessLogFormat: &filev3.FileAccessLog_LogFormat{LogFormat: &corev3.SubstitutionFormatString{
+			Format: &corev3.SubstitutionFormatString_JsonFormat{JsonFormat: format},
+			Formatters: []*corev3.TypedExtensionConfig{{
+				Name:        "envoy.formatter.req_without_query",
+				TypedConfig: reqWithoutQuery,
+			}},
+		}},
+	}
+	if err := file.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid access log: %w", err)
+	}
+	typed, err := anypb.New(file)
+	if err != nil {
+		return nil, err
+	}
+	al := &accesslogv3.AccessLog{
+		Name: "envoy.access_loggers.file",
+		Filter: &accesslogv3.AccessLogFilter{FilterSpecifier: &accesslogv3.AccessLogFilter_OrFilter{OrFilter: &accesslogv3.OrFilter{
+			Filters: []*accesslogv3.AccessLogFilter{
+				{FilterSpecifier: &accesslogv3.AccessLogFilter_StatusCodeFilter{StatusCodeFilter: &accesslogv3.StatusCodeFilter{
+					Comparison: &accesslogv3.ComparisonFilter{
+						Op:    accesslogv3.ComparisonFilter_GE,
+						Value: &corev3.RuntimeUInt32{DefaultValue: 500, RuntimeKey: "cutover.access_log.min_status"},
+					},
+				}}},
+				// No flags listed: any response flag matches.
+				{FilterSpecifier: &accesslogv3.AccessLogFilter_ResponseFlagFilter{ResponseFlagFilter: &accesslogv3.ResponseFlagFilter{}}},
+			},
+		}}},
+		ConfigType: &accesslogv3.AccessLog_TypedConfig{TypedConfig: typed},
+	}
+	if err := al.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid access log: %w", err)
+	}
+	return al, nil
 }
 
 func routeConfig(routes []Route) *routev3.RouteConfiguration {
