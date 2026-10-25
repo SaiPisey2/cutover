@@ -30,6 +30,8 @@ e2e-down:
 e2e-check:
 	test/e2e/fixture/up.sh --check-only
 
+# Only TestE2E: it leaves cloud B populated, so the fixture checks that run
+# after it in the package would fail.
 e2e-test:
 	KUBECONFIG=/nonexistent go test -tags e2e -p 1 -count=1 -timeout 40m -run '^TestE2E$$' ./test/e2e/
 
