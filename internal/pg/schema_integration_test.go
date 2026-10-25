@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/SaiPisey2/cutover/internal/itest"
 	"github.com/SaiPisey2/cutover/internal/pg"
 )
@@ -70,6 +72,69 @@ func TestCopySchemaAndDiff(t *testing.T) {
 	err = pg.CopySchema(ctx, itest.Tools(t), itest.SourceDSN, itest.TargetDSN, schemas, tables)
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second copy should fail on existing objects: %v", err)
+	}
+}
+
+// The target keeps the source's owners and grants, so the application's
+// roles work after the switch. Roles are not copied: they must exist.
+func TestCopySchemaOwnersAndGrants(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src, tgt := itest.Conn(t, itest.SourceDSN), itest.Conn(t, itest.TargetDSN)
+	roles := func(c *pgx.Conn, create bool, names ...string) {
+		t.Helper()
+		for _, r := range names {
+			sql := "DROP TABLE IF EXISTS public.orders; DROP ROLE IF EXISTS " + r
+			if create {
+				sql = "CREATE ROLE " + r + " NOLOGIN"
+			}
+			if _, err := c.Exec(ctx, sql); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Cleanup(func() {
+		for _, dsn := range []string{itest.SourceDSN, itest.TargetDSN} {
+			c := itest.Conn(t, dsn)
+			_, _ = c.Exec(context.Background(), "DROP TABLE IF EXISTS public.orders; DROP ROLE IF EXISTS it_app; DROP ROLE IF EXISTS it_reader")
+		}
+	})
+	roles(src, false, "it_app", "it_reader")
+	roles(tgt, false, "it_app", "it_reader")
+	roles(src, true, "it_app", "it_reader")
+	if _, err := src.Exec(ctx, `CREATE TABLE public.orders (id bigserial PRIMARY KEY);
+		ALTER TABLE public.orders OWNER TO it_app; GRANT SELECT ON public.orders TO it_reader`); err != nil {
+		t.Fatal(err)
+	}
+	tables, schemas := []string{"public.orders"}, []string{"public"}
+
+	// it_reader is missing on the target: the apply fails naming it and
+	// leaves nothing behind.
+	roles(tgt, true, "it_app")
+	err := pg.CopySchema(ctx, itest.Tools(t), itest.SourceDSN, itest.TargetDSN, schemas, tables)
+	if err == nil || !strings.Contains(err.Error(), `role "it_reader" does not exist`) {
+		t.Fatalf("copy without role it_reader on the target: %v", err)
+	}
+	var n int
+	if err := tgt.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relname = 'orders'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("target has %d orders (%v) after a failed copy, want none", n, err)
+	}
+
+	roles(tgt, true, "it_reader")
+	if err := pg.CopySchema(ctx, itest.Tools(t), itest.SourceDSN, itest.TargetDSN, schemas, tables); err != nil {
+		t.Fatal(err)
+	}
+	var owner, seqOwner string
+	var canRead, canWrite bool
+	if err := tgt.QueryRow(ctx, `SELECT pg_get_userbyid(c.relowner), pg_get_userbyid(s.relowner),
+		has_table_privilege('it_reader', 'public.orders', 'SELECT'), has_table_privilege('it_reader', 'public.orders', 'INSERT')
+		FROM pg_class c, pg_class s WHERE c.oid = 'public.orders'::regclass AND s.oid = 'public.orders_id_seq'::regclass`).
+		Scan(&owner, &seqOwner, &canRead, &canWrite); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "it_app" || seqOwner != "it_app" || !canRead || canWrite {
+		t.Fatalf("target: orders owned by %s, its sequence by %s, it_reader select %v insert %v; want it_app, it_app, true, false",
+			owner, seqOwner, canRead, canWrite)
 	}
 }
 

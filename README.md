@@ -33,6 +33,8 @@ are done; the end-to-end demo is next.
   `direct-clients-unchecked`)
 - both `dsn` roles have `SELECT` on every sequence in the plan's schemas
   (sequences are synced in both directions)
+- the application's roles (table owners and grantees) exist on the target
+  before Prepare: it copies owners and grants, not roles
 - sequences not owned by a plan table (standalone ones) already exist on the
   target: Prepare copies only the plan tables and the sequences they own.
   A sequence only the target has is fine until something uses it; after

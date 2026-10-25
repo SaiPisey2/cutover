@@ -30,7 +30,10 @@ const SentinelTable = plan.ReservedSchema + ".sentinel"
 // rollback starts clean. The schemas are created first if missing (pg_dump
 // --table does not emit CREATE SCHEMA). Types, functions and standalone
 // sequences the tables depend on are not copied: the apply then fails naming
-// the missing object, and the operator creates it on the target first. The
+// the missing object, and the operator creates it on the target first.
+// Owners and grants are copied, so the application's roles can use the
+// tables once writes move; roles are cluster-wide and not copied, so a role
+// missing on the target fails the apply the same way. The
 // dump is held in memory, capped at 256 MiB. Passwords go through
 // PGPASSWORD, never argv.
 func CopySchema(ctx context.Context, tools plan.Tools, srcDSN, dstDSN string, schemas, tables []string) error {
@@ -39,7 +42,7 @@ func CopySchema(ctx context.Context, tools plan.Tools, srcDSN, dstDSN string, sc
 	}
 	src, srcPW := redact.Split(srcDSN)
 	dst, dstPW := redact.Split(dstDSN)
-	args := []string{"--schema-only", "--no-owner", "--no-privileges", "--no-tablespaces",
+	args := []string{"--schema-only", "--no-tablespaces",
 		"--no-publications", "--no-subscriptions", "--strict-names", "--dbname", src}
 	for _, t := range tables {
 		args = append(args, "--table", t) // plan.Ident names: no pattern characters
