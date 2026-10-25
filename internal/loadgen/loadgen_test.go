@@ -176,9 +176,9 @@ func TestResultsAfterCancelAreCounted(t *testing.T) {
 	cancel()
 	r := &Run{ctx: ctx}
 	now := time.Now()
-	r.record("GET", "/healthz", 503, now, nil, 0)
-	r.record("POST", "/orders", 201, now, nil, 7)
-	r.record("GET", "/healthz", 0, now, context.Canceled, 0)
+	r.record("GET", "/healthz", 503, nil, now, nil, 0)
+	r.record("POST", "/orders", 201, nil, now, nil, 7)
+	r.record("GET", "/healthz", 0, nil, now, context.Canceled, 0)
 	if r.rep.Requests != 2 || r.rep.Failures != 1 || len(r.rep.IDs) != 1 {
 		t.Fatalf("%+v", r.rep)
 	}
@@ -189,18 +189,48 @@ func TestStatusDecidesOutcomeWhenBodyReadCancelled(t *testing.T) {
 	cancel()
 	r := &Run{ctx: ctx}
 	now := time.Now()
-	r.record("POST", "/orders", 503, now, context.Canceled, 0)
+	r.record("POST", "/orders", 503, nil, now, context.Canceled, 0)
 	if r.rep.Requests != 1 || r.rep.Failures != 1 || r.rep.FailureSamples[0].Status != 503 {
 		t.Fatalf("503 with cancelled body: %+v", r.rep)
 	}
-	r.record("POST", "/orders", 201, now, context.Canceled, 0)
+	r.record("POST", "/orders", 201, nil, now, context.Canceled, 0)
 	if r.rep.Requests != 1 || r.rep.Failures != 1 || len(r.rep.IDs) != 0 {
 		t.Fatalf("201 with cancelled body must be dropped: %+v", r.rep)
 	}
 	// not cancelled by Stop: a 2xx whose body failed is a failure
 	r2 := &Run{ctx: context.Background()}
-	r2.record("POST", "/orders", 201, now, io.ErrUnexpectedEOF, 0)
+	r2.record("POST", "/orders", 201, nil, now, io.ErrUnexpectedEOF, 0)
 	if r2.rep.Failures != 1 {
 		t.Fatalf("%+v", r2.rep)
+	}
+}
+
+func TestEveryFailureReported(t *testing.T) {
+	_, srv := newServer(3)
+	defer srv.Close()
+	c := cfg(srv.URL)
+	c.Interval = time.Millisecond
+	var mu sync.Mutex
+	var seen []Failure
+	c.OnFailure = func(f Failure) {
+		mu.Lock()
+		seen = append(seen, f)
+		mu.Unlock()
+	}
+	run := Start(context.Background(), c)
+	time.Sleep(500 * time.Millisecond)
+	rep := run.Stop()
+	mu.Lock()
+	defer mu.Unlock()
+	if rep.Failures <= 50 {
+		t.Fatalf("only %d failures, want more than the sample cap", rep.Failures)
+	}
+	if len(seen) != rep.Failures {
+		t.Fatalf("OnFailure saw %d failures, report counts %d", len(seen), rep.Failures)
+	}
+	for _, f := range append(seen, rep.FailureSamples...) {
+		if f.Status != 503 || f.Body != "injected fault" {
+			t.Fatalf("failure %+v, want 503 with body %q", f, "injected fault")
+		}
 	}
 }

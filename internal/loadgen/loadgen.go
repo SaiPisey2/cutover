@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const maxSamples = 50
+const (
+	maxSamples = 50
+	maxBody    = 200
+)
 
 type Config struct {
 	Target   string // base URL, e.g. http://127.0.0.1:18080
@@ -24,6 +27,10 @@ type Config struct {
 	Readers  int
 	Interval time.Duration // pause between requests per worker
 	Timeout  time.Duration // per request
+	// OnFailure, when set, is called once for every failure the report
+	// counts, beyond the samples kept. It may be called concurrently, and
+	// every call has returned before Stop does.
+	OnFailure func(Failure)
 }
 
 // Failure describes one failed request: a transport error, a timeout or a
@@ -34,7 +41,8 @@ type Failure struct {
 	At     time.Time
 	Method string
 	Path   string
-	Status int // 0 when there was no response
+	Status int    // 0 when there was no response
+	Body   string // the response body, trimmed and cut to maxBody bytes
 	Err    string
 }
 
@@ -132,7 +140,7 @@ func (r *Run) write() {
 			id = out.ID
 		}
 	}
-	r.record(http.MethodPost, "/orders", status, at, err, id)
+	r.record(http.MethodPost, "/orders", status, resp, at, err, id)
 }
 
 func (r *Run) read() {
@@ -142,8 +150,8 @@ func (r *Run) read() {
 		path = fmt.Sprintf("/orders/%d", r.rep.IDs[rand.IntN(n)])
 	}
 	r.mu.Unlock()
-	status, _, at, err := r.do(http.MethodGet, path, "")
-	r.record(http.MethodGet, path, status, at, err, 0)
+	status, resp, at, err := r.do(http.MethodGet, path, "")
+	r.record(http.MethodGet, path, status, resp, at, err, 0)
 }
 
 func (r *Run) do(method, path, body string) (status int, resp []byte, at time.Time, err error) {
@@ -164,7 +172,7 @@ func (r *Run) do(method, path, body string) (status int, resp []byte, at time.Ti
 	return res.StatusCode, resp, at, err
 }
 
-func (r *Run) record(method, path string, status int, at time.Time, err error, id int64) {
+func (r *Run) record(method, path string, status int, body []byte, at time.Time, err error, id int64) {
 	// A received status decides the outcome; a body read cut by Stop later
 	// does not change a non-2xx into nothing. A 2xx whose body Stop cut has
 	// no known id, so it is dropped rather than counted either way.
@@ -176,22 +184,30 @@ func (r *Run) record(method, path string, status int, at time.Time, err error, i
 		err = nil
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.rep.Requests++
 	if err == nil && status/100 == 2 {
 		if id != 0 {
 			r.rep.IDs = append(r.rep.IDs, id)
 		}
+		r.mu.Unlock()
 		return
 	}
 	r.rep.Failures++
+	f := Failure{At: at, Method: method, Path: path, Status: status}
+	if gotStatus {
+		b := strings.TrimSpace(string(body))
+		f.Body = b[:min(len(b), maxBody)]
+	}
+	if err != nil {
+		f.Err = err.Error()
+	} else {
+		f.Err = fmt.Sprintf("status %d", status)
+	}
 	if len(r.rep.FailureSamples) < maxSamples {
-		f := Failure{At: at, Method: method, Path: path, Status: status}
-		if err != nil {
-			f.Err = err.Error()
-		} else {
-			f.Err = fmt.Sprintf("status %d", status)
-		}
 		r.rep.FailureSamples = append(r.rep.FailureSamples, f)
+	}
+	r.mu.Unlock()
+	if r.cfg.OnFailure != nil {
+		r.cfg.OnFailure(f)
 	}
 }
