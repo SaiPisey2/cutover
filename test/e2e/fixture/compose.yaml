@@ -16,10 +16,9 @@ x-postgres: &postgres
   volumes:
     - ../../run/e2e/pg-password:/run/pg-password:ro
     - ./pg-init:/docker-entrypoint-initdb.d:ro
-  healthcheck: {test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shop"], interval: 1s, timeout: 3s, retries: 60}
+  healthcheck: {test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "shop"], interval: 1s, timeout: 3s, retries: 60}
 x-dockerhost: &dockerhost
   image: cutover-e2e-dockerhost
-  build: ./dockerhost
   privileged: true
   environment: {DOCKER_TLS_CERTDIR: ""}
   volumes:
@@ -47,6 +46,7 @@ services:
       - ../../run/e2e/pgbouncer:/etc/pgbouncer/routes
   dockerhost-a:
     <<: *dockerhost
+    build: ./dockerhost
     networks: {cutover-e2e: {ipv4_address: 172.30.0.21}}
     ports: ["127.0.0.1:52241:22", "127.0.0.1:28080:8080"]
   dockerhost-b:
