@@ -1,0 +1,55 @@
+name: cutover-e2e
+networks:
+  cutover-e2e:
+    name: cutover-e2e
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
+x-postgres: &postgres
+  image: postgres:17-alpine
+  command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10",
+            "-c", "max_wal_senders=10"]
+  environment:
+    POSTGRES_PASSWORD_FILE: /run/pg-password
+    SHOP_PASSWORD_FILE: /run/pg-password
+  volumes:
+    - ../../run/e2e/pg-password:/run/pg-password:ro
+    - ./pg-init:/docker-entrypoint-initdb.d:ro
+  healthcheck: {test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shop"], interval: 1s, timeout: 3s, retries: 60}
+x-dockerhost: &dockerhost
+  image: cutover-e2e-dockerhost
+  build: ./dockerhost
+  privileged: true
+  environment: {DOCKER_TLS_CERTDIR: ""}
+  volumes:
+    - ../../run/e2e/ssh/id_ed25519.pub:/etc/ssh/deploy_authorized_keys:ro
+  healthcheck: {test: ["CMD", "/healthcheck.sh"], interval: 2s, timeout: 5s, retries: 60}
+services:
+  pg-a:
+    <<: *postgres
+    networks: {cutover-e2e: {ipv4_address: 172.30.0.11}}
+    ports: ["127.0.0.1:55442:5432"]
+  pg-b:
+    <<: *postgres
+    networks: {cutover-e2e: {ipv4_address: 172.30.0.12}}
+    ports: ["127.0.0.1:55443:5432"]
+  pgbouncer:
+    build: ../../pgbouncer
+    depends_on:
+      pg-a: {condition: service_healthy}
+      pg-b: {condition: service_healthy}
+    networks: {cutover-e2e: {ipv4_address: 172.30.0.10}}
+    ports: ["127.0.0.1:56442:6432"]
+    volumes:
+      - ../../pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ../../run/e2e/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ../../run/e2e/pgbouncer:/etc/pgbouncer/routes
+  dockerhost-a:
+    <<: *dockerhost
+    networks: {cutover-e2e: {ipv4_address: 172.30.0.21}}
+    ports: ["127.0.0.1:52241:22", "127.0.0.1:28080:8080"]
+  dockerhost-b:
+    <<: *dockerhost
+    networks: {cutover-e2e: {ipv4_address: 172.30.0.22}}
+    ports: ["127.0.0.1:52242:22", "127.0.0.1:38080:8080"]
