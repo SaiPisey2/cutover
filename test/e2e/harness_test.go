@@ -212,13 +212,9 @@ func setup(t *testing.T) *env {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
-	temporalBin, err := exec.LookPath("temporal")
-	if err != nil {
-		temporalBin = "/opt/homebrew/bin/temporal"
-	}
 	tport := freePort(t)
 	e.temporal = "127.0.0.1:" + strconv.Itoa(tport)
-	temporal = e.start(t, "temporal", temporalBin, e.baseEnv(), nil, "server", "start-dev", "--headless",
+	temporal = e.start(t, "temporal", temporalBin(), e.baseEnv(), nil, "server", "start-dev", "--headless",
 		"--ip", "127.0.0.1", "--port", strconv.Itoa(tport), "--http-port", strconv.Itoa(freePort(t)),
 		"--metrics-port", strconv.Itoa(freePort(t)), "--log-level", "error")
 	waitUntil(t, "temporal", time.Minute, temporal, func() error {
@@ -302,6 +298,14 @@ func setup(t *testing.T) *env {
 		return nil
 	})
 	return e
+}
+
+// temporalBin is the Temporal CLI: on PATH, or where Homebrew puts it.
+func temporalBin() string {
+	if p, err := exec.LookPath("temporal"); err == nil {
+		return p
+	}
+	return "/opt/homebrew/bin/temporal"
 }
 
 func (e *env) login(caPEM []byte, name string) (*console.Client, error) {
@@ -557,31 +561,43 @@ func (e *env) follow(ctx context.Context, t testing.TB, out chan<- flow.Status) 
 	}
 }
 
-func (e *env) stream(ctx context.Context, out chan<- flow.Status) error {
+// session signs name in on an HTTP/2 client of its own, for console reads
+// console.Client has no method for. The caller closes its idle connections.
+func (e *env) session(ctx context.Context, name string) (*http.Client, error) {
 	caPEM, err := os.ReadFile(filepath.Join(e.data(), "ca.crt"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
 	jar, _ := cookiejar.New(nil)
 	hc := &http.Client{Jar: jar, Transport: &http.Transport{ForceAttemptHTTP2: true,
 		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}}
-	defer hc.CloseIdleConnections()
-	body, _ := json.Marshal(map[string]string{"name": "bob", "password": e.pw})
+	body, _ := json.Marshal(map[string]string{"name": name, "password": e.pw})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, consoleURL+"/api/login", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := hc.Do(req)
 	if err != nil {
-		return err
+		hc.CloseIdleConnections()
+		return nil, err
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("login: %s", resp.Status)
+		hc.CloseIdleConnections()
+		return nil, fmt.Errorf("login: %s", resp.Status)
 	}
-	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, consoleURL+"/api/stream?migration="+migrationID, nil)
+	return hc, nil
+}
+
+func (e *env) stream(ctx context.Context, out chan<- flow.Status) error {
+	hc, err := e.session(ctx, "bob")
+	if err != nil {
+		return err
+	}
+	defer hc.CloseIdleConnections()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, consoleURL+"/api/stream?migration="+migrationID, nil)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err = hc.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return err
 	}
