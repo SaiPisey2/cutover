@@ -119,6 +119,17 @@ func fixtureProblems(t testing.TB) []string {
 		return nil
 	}())
 
+	for _, side := range []struct {
+		name string
+		port int
+	}{{"pg-a", pgAPort}, {"pg-b", pgBPort}} {
+		left, err := replicationLeft(ctx, side.port, pw)
+		check(side.name, err)
+		for _, l := range left {
+			problems = append(problems, side.name+": "+l+" left over, want none")
+		}
+	}
+
 	check("pgbouncer", func() error {
 		a, err := pgbouncer.Dial(ctx, pgbAdmin)
 		if err != nil {
@@ -154,6 +165,35 @@ func fixtureProblems(t testing.TB) []string {
 		return nil
 	}())
 	return problems
+}
+
+// replicationLeft lists the replication slots, publications and
+// subscriptions on one Postgres: a migration that ended leaves none.
+func replicationLeft(ctx context.Context, port int, pw string) ([]string, error) {
+	c, err := pgConn(ctx, port, pw)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close(context.Background())
+	var left []string
+	for _, q := range []struct{ kind, sql string }{
+		{"replication slot", `SELECT slot_name FROM pg_replication_slots`},
+		{"publication", `SELECT pubname FROM pg_publication`},
+		{"subscription", `SELECT subname FROM pg_subscription`},
+	} {
+		rows, err := c.Query(ctx, q.sql)
+		if err != nil {
+			return nil, err
+		}
+		names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range names {
+			left = append(left, q.kind+" "+n)
+		}
+	}
+	return left, nil
 }
 
 func kubeClient(t testing.TB, cloud string) (kubernetes.Interface, error) {
