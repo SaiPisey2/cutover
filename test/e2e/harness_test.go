@@ -456,13 +456,25 @@ func requireClean(t testing.TB, e *env) {
 	switch {
 	case err != nil:
 		problems = append(problems, "front door: "+err.Error())
-	case len(routes) > 0:
-		problems = append(problems, fmt.Sprintf("front door: %d routes registered, want none", len(routes)))
+	default:
+		for _, r := range routes {
+			if !sourceOnly(r) {
+				problems = append(problems, fmt.Sprintf("front door: route %s sends or mirrors traffic to the target", r.Key()))
+			}
+		}
 	}
 	if len(problems) > 0 {
 		t.Logf("not clean:\n  %s", strings.Join(problems, "\n  "))
 		t.Fatal("fixture is not clean; " + hint)
 	}
+}
+
+// sourceOnly reports whether r is what route apply registers: all traffic
+// on the source, which is not cloud B, and nothing sent or mirrored to a
+// target. A rollback leaves the route like this, and no command removes a
+// route, so it counts as clean; the next route apply re-registers it as is.
+func sourceOnly(r frontdoor.Route) bool {
+	return r.Source != nil && r.Source.String() != apiB && r.Target == nil && r.TargetWeight == 0 && !r.Mirror
 }
 
 // drive follows migration shop's status over the console's event stream
@@ -632,6 +644,29 @@ func (e *env) stream(ctx context.Context, out chan<- flow.Status) error {
 		return err
 	}
 	return io.EOF
+}
+
+func TestSourceOnly(t *testing.T) {
+	src := &frontdoor.Upstream{Address: "127.0.0.1", Port: 28080}
+	tgt := &frontdoor.Upstream{Address: "127.0.0.1", Port: 38080}
+	for _, c := range []struct {
+		name string
+		r    frontdoor.Route
+		want bool
+	}{
+		{"as route apply leaves it", frontdoor.Route{Source: src}, true},
+		{"target at weight 0", frontdoor.Route{Source: src, Target: tgt}, false},
+		{"target weight", frontdoor.Route{Source: src, Target: tgt, TargetWeight: 10}, false},
+		{"weight without a target", frontdoor.Route{Source: src, TargetWeight: 10}, false},
+		{"mirror", frontdoor.Route{Source: src, Target: tgt, Mirror: true}, false},
+		{"mirror without a target", frontdoor.Route{Source: src, Mirror: true}, false},
+		{"source on cloud b", frontdoor.Route{Source: tgt}, false},
+		{"finished", frontdoor.Route{Target: tgt, TargetWeight: 100}, false},
+	} {
+		if got := sourceOnly(c.r); got != c.want {
+			t.Errorf("%s: sourceOnly = %v, want %v", c.name, got, c.want)
+		}
+	}
 }
 
 // TestHarnessStarts proves the harness without migrating: every binary
