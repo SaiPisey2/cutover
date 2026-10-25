@@ -234,3 +234,35 @@ func TestEveryFailureReported(t *testing.T) {
 		}
 	}
 }
+
+func TestMaxLatency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprint(w, `{"id":1}`)
+	}))
+	defer srv.Close()
+	run := Start(context.Background(), cfg(srv.URL))
+	time.Sleep(400 * time.Millisecond)
+	rep := run.Stop()
+	if rep.Requests == 0 {
+		t.Fatal("no requests counted")
+	}
+	if rep.MaxLatency < 150*time.Millisecond || rep.MaxLatency >= time.Second {
+		t.Fatalf("MaxLatency = %v, want at least the server's 150ms and under the 1s timeout", rep.MaxLatency)
+	}
+}
+
+func TestMaxLatencyCountsFailuresNotDropped(t *testing.T) {
+	r := &Run{ctx: context.Background()}
+	r.record("GET", "/healthz", 0, nil, time.Now().Add(-3*time.Second), context.DeadlineExceeded, 0)
+	if r.rep.MaxLatency < 3*time.Second {
+		t.Fatalf("a timed-out request is counted, so its latency is: MaxLatency = %v", r.rep.MaxLatency)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r2 := &Run{ctx: ctx}
+	r2.record("GET", "/healthz", 0, nil, time.Now().Add(-time.Minute), context.Canceled, 0)
+	if r2.rep.MaxLatency != 0 {
+		t.Fatalf("a request Stop dropped is not counted: MaxLatency = %v", r2.rep.MaxLatency)
+	}
+}

@@ -51,8 +51,12 @@ type Report struct {
 	Failures       int
 	IDs            []int64 // ids the server acknowledged with a 2xx
 	FailureSamples []Failure
-	Started        time.Time
-	Stopped        time.Time
+	// MaxLatency is the longest any counted request took, from its start
+	// until its response was read or it failed: successes and failures
+	// (timeouts included) alike. Requests cut short by Stop are not counted.
+	MaxLatency time.Duration
+	Started    time.Time
+	Stopped    time.Time
 }
 
 type Run struct {
@@ -183,8 +187,10 @@ func (r *Run) record(method, path string, status int, body []byte, at time.Time,
 	if gotStatus && status/100 != 2 {
 		err = nil
 	}
+	took := time.Since(at)
 	r.mu.Lock()
 	r.rep.Requests++
+	r.rep.MaxLatency = max(r.rep.MaxLatency, took)
 	if err == nil && status/100 == 2 {
 		if id != 0 {
 			r.rep.IDs = append(r.rep.IDs, id)
