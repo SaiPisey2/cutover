@@ -1,4 +1,4 @@
-.PHONY: test itest itest-up itest-down vet ui ui-test
+.PHONY: test itest itest-up itest-down e2e-up e2e-down e2e-check vet ui ui-test
 
 test:
 	go test -race -count=1 ./...
@@ -18,6 +18,17 @@ itest-up:
 
 itest-down:
 	docker compose -f test/compose.yaml down -v
+
+# The kind fixture for test/e2e. up.sh refuses to start over an existing one.
+e2e-up:
+	test/e2e/fixture/up.sh
+
+e2e-down:
+	test/e2e/fixture/down.sh
+
+# e2e-check runs only up.sh's refusals (disk, existing clusters, ports).
+e2e-check:
+	test/e2e/fixture/up.sh --check-only
 
 # ui rebuilds ui/dist, which is committed and embedded into the binary.
 ui:

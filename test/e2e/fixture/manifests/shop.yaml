@@ -1,0 +1,32 @@
+# The demo worker in cloud A. Secret shop-db (DATABASE_URL) is created by
+# up.sh from the generated password, so it never lands in the repo.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-worker
+  namespace: shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: shop-worker}
+  template:
+    metadata:
+      labels: {app: shop-worker}
+    spec:
+      containers:
+        - name: worker
+          image: cutover-demo:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["worker"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shop-db, key: DATABASE_URL}
