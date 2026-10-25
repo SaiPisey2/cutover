@@ -21,13 +21,16 @@ func main() {
 	readers := flag.Int("readers", 2, "concurrent readers")
 	interval := flag.Duration("interval", 20*time.Millisecond, "pause between requests per worker")
 	duration := flag.Duration("duration", 10*time.Second, "how long to run")
+	// A switch holds writes for up to max_pause (10s by default); a shorter
+	// timeout fails requests the switch was only pausing.
+	timeout := flag.Duration("timeout", 15*time.Second, "per-request timeout")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	run := loadgen.Start(ctx, loadgen.Config{
 		Target: *target, Host: *host, Writers: *writers, Readers: *readers,
-		Interval: *interval, Timeout: 5 * time.Second,
+		Interval: *interval, Timeout: *timeout,
 	})
 	select {
 	case <-time.After(*duration):
