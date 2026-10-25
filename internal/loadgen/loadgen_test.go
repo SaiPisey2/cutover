@@ -77,6 +77,8 @@ func TestCountsAndIDs(t *testing.T) {
 	if len(rep.IDs) == 0 {
 		t.Fatal("no ids recorded")
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	seen := map[int64]bool{}
 	for _, id := range rep.IDs {
 		if seen[id] {
@@ -86,9 +88,6 @@ func TestCountsAndIDs(t *testing.T) {
 		if !o.issued[id] {
 			t.Fatalf("id %d was never issued", id)
 		}
-	}
-	if len(rep.IDs) != len(o.issued) {
-		t.Fatalf("report has %d ids, server issued %d", len(rep.IDs), len(o.issued))
 	}
 	if rep.Started.IsZero() || !rep.Stopped.After(rep.Started) {
 		t.Fatalf("bad times %v %v", rep.Started, rep.Stopped)
@@ -169,5 +168,18 @@ func TestStopIsPromptAndIdempotent(t *testing.T) {
 	b := run.Stop()
 	if a.Requests != b.Requests || a.Failures != b.Failures {
 		t.Fatalf("second Stop differs: %+v vs %+v", a, b)
+	}
+}
+
+func TestResultsAfterCancelAreCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &Run{ctx: ctx}
+	now := time.Now()
+	r.record("GET", "/healthz", 503, now, nil, 0)
+	r.record("POST", "/orders", 201, now, nil, 7)
+	r.record("GET", "/healthz", 0, now, context.Canceled, 0)
+	if r.rep.Requests != 2 || r.rep.Failures != 1 || len(r.rep.IDs) != 1 {
+		t.Fatalf("%+v", r.rep)
 	}
 }

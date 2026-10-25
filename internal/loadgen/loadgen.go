@@ -165,8 +165,8 @@ func (r *Run) do(method, path, body string) (status int, resp []byte, at time.Ti
 }
 
 func (r *Run) record(method, path string, status int, at time.Time, err error, id int64) {
-	if r.ctx.Err() != nil {
-		return // aborted by Stop, not a real result
+	if err != nil && r.ctx.Err() != nil {
+		return // aborted by Stop; a completed response is counted even so
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
