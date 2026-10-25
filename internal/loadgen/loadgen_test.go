@@ -183,3 +183,24 @@ func TestResultsAfterCancelAreCounted(t *testing.T) {
 		t.Fatalf("%+v", r.rep)
 	}
 }
+
+func TestStatusDecidesOutcomeWhenBodyReadCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &Run{ctx: ctx}
+	now := time.Now()
+	r.record("POST", "/orders", 503, now, context.Canceled, 0)
+	if r.rep.Requests != 1 || r.rep.Failures != 1 || r.rep.FailureSamples[0].Status != 503 {
+		t.Fatalf("503 with cancelled body: %+v", r.rep)
+	}
+	r.record("POST", "/orders", 201, now, context.Canceled, 0)
+	if r.rep.Requests != 1 || r.rep.Failures != 1 || len(r.rep.IDs) != 0 {
+		t.Fatalf("201 with cancelled body must be dropped: %+v", r.rep)
+	}
+	// not cancelled by Stop: a 2xx whose body failed is a failure
+	r2 := &Run{ctx: context.Background()}
+	r2.record("POST", "/orders", 201, now, io.ErrUnexpectedEOF, 0)
+	if r2.rep.Failures != 1 {
+		t.Fatalf("%+v", r2.rep)
+	}
+}

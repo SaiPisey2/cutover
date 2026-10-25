@@ -165,8 +165,15 @@ func (r *Run) do(method, path, body string) (status int, resp []byte, at time.Ti
 }
 
 func (r *Run) record(method, path string, status int, at time.Time, err error, id int64) {
-	if err != nil && r.ctx.Err() != nil {
-		return // aborted by Stop; a completed response is counted even so
+	// A received status decides the outcome; a body read cut by Stop later
+	// does not change a non-2xx into nothing. A 2xx whose body Stop cut has
+	// no known id, so it is dropped rather than counted either way.
+	gotStatus := status != 0
+	if err != nil && r.ctx.Err() != nil && (!gotStatus || status/100 == 2) {
+		return
+	}
+	if gotStatus && status/100 != 2 {
+		err = nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
