@@ -47,8 +47,10 @@ func cutoverUnderLoad(t *testing.T, e *env) {
 	ctx := context.Background()
 	podsA := workerPods(t, "a")
 
+	// The switch may hold writes for max_pause (10s); a shorter client
+	// timeout would fail by design. 15s is max_pause plus a 5s margin.
 	lg := loadgen.Start(ctx, loadgen.Config{Target: "http://" + listenAddr, Host: "localhost",
-		Writers: 4, Readers: 2, Interval: 50 * time.Millisecond, Timeout: 5 * time.Second})
+		Writers: 4, Readers: 2, Interval: 50 * time.Millisecond, Timeout: 15 * time.Second})
 	defer func() {
 		if r := lg.Stop(); t.Failed() {
 			t.Logf("load at the end: %d requests, %d failures", r.Requests, r.Failures)
