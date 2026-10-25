@@ -27,6 +27,7 @@ import (
 	"github.com/SaiPisey2/cutover/internal/loadgen"
 	"github.com/SaiPisey2/cutover/internal/ops"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
+	"github.com/SaiPisey2/cutover/internal/plan"
 	"github.com/SaiPisey2/cutover/internal/sshx"
 	"github.com/SaiPisey2/cutover/internal/svc"
 )
@@ -307,7 +308,8 @@ func cutoverUnderLoad(t *testing.T, e *env) {
 	podsA := workerPods(t, "a")
 
 	// The switch may hold writes for max_pause (10s); a shorter client
-	// timeout would fail by design. 15s is max_pause plus a 5s margin.
+	// timeout would fail by design. 15s is max_pause plus a 5s margin, and
+	// the longest request is checked against max_pause below.
 	lg := loadgen.Start(ctx, loadgen.Config{Target: "http://" + listenAddr, Host: "localhost",
 		Writers: 4, Readers: 2, Interval: 50 * time.Millisecond, Timeout: 15 * time.Second})
 	defer func() {
@@ -353,6 +355,7 @@ func cutoverUnderLoad(t *testing.T, e *env) {
 		return st.Phase == flow.PhaseSwitch && st.Gate == nil
 	})
 	e.killWorker()
+	killAt := time.Now()
 	t.Logf("killed the worker mid-switch at %s; last events: %s", time.Now().Format("15:04:05.000"), lastEvents(st))
 	time.Sleep(2 * time.Second)
 	e.startWorker(t)
@@ -378,7 +381,23 @@ func cutoverUnderLoad(t *testing.T, e *env) {
 	rep := lg.Stop()
 	t.Logf("the switch:%s", switchEvents(t, e))
 
-	t.Logf("load: %d requests, %d failures, %d acknowledged orders", rep.Requests, rep.Failures, len(rep.IDs))
+	// The kill races the switch; which side it landed on is logged, not
+	// asserted (F-3).
+	if sw := switchedAt(t, st); killAt.Before(sw) {
+		t.Logf("kill landed: before-switched, %s before the switched event", sw.Sub(killAt).Round(time.Millisecond))
+	} else {
+		t.Logf("kill landed: after-switched, %s after the switched event", killAt.Sub(sw).Round(time.Millisecond))
+	}
+
+	t.Logf("load: %d requests, %d failures, %d acknowledged orders, longest request %s",
+		rep.Requests, rep.Failures, len(rep.IDs), rep.MaxLatency.Round(time.Millisecond))
+	p, err := plan.Load(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit := p.Thresholds.Switch.MaxPause.D() + 2*time.Second; rep.MaxLatency > limit {
+		t.Errorf("load: the longest request took %s, want at most max_pause plus 2s (%s)", rep.MaxLatency, limit)
+	}
 	if rep.Failures != 0 {
 		t.Errorf("load: %d failed requests, want 0", rep.Failures)
 	}
@@ -472,6 +491,9 @@ func workerPods(t *testing.T, cloud string) []string {
 // the primary (named name) once.
 func checkOrders(t *testing.T, ctx context.Context, db *pgx.Conn, name string, ids []int64) {
 	t.Helper()
+	if len(ids) == 0 {
+		t.Errorf("orders: no acknowledged ids to look for on %s", name)
+	}
 	seen := map[int64]bool{}
 	for _, id := range ids {
 		if seen[id] {
