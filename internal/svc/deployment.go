@@ -508,9 +508,14 @@ func (d deployment) Undo(ctx context.Context, tgt Side) error {
 	if err != nil {
 		return err
 	}
+	// Foreground: the Deployment and its replica sets stay until their pods
+	// are gone, so the emptiness check below never sees an orphaned pod.
+	fg := metav1.DeletePropagationForeground
 	for _, o := range deps.Items {
 		if d.mine(&o) {
-			if err := del("Deployment", o.Name, func() error { return c.AppsV1().Deployments(ns).Delete(ctx, o.Name, metav1.DeleteOptions{}) }); err != nil {
+			if err := del("Deployment", o.Name, func() error {
+				return c.AppsV1().Deployments(ns).Delete(ctx, o.Name, metav1.DeleteOptions{PropagationPolicy: &fg})
+			}); err != nil {
 				return err
 			}
 		}

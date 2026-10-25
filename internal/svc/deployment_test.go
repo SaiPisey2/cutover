@@ -425,6 +425,32 @@ func TestDeploymentUndoIgnoresOwnReplicaSetsAndPods(t *testing.T) {
 	}
 }
 
+// With background deletion the garbage collector may remove the replica set
+// before its terminating pods, which then look like somebody else's and keep
+// the namespace. Foreground deletion keeps the owner chain until they are gone.
+func TestDeploymentUndoDeletesInForeground(t *testing.T) {
+	tgt := fake.NewClientset()
+	d := prepared(t, sourceObjects(), tgt)
+	tgt.ClearActions()
+	if err := d.Undo(context.Background(), kubeSide(tgt)); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range tgt.Actions() {
+		del, ok := a.(k8stesting.DeleteAction)
+		if !ok || a.GetResource().Resource != "deployments" {
+			continue
+		}
+		found = true
+		if pp := del.GetDeleteOptions().PropagationPolicy; pp == nil || *pp != metav1.DeletePropagationForeground {
+			t.Fatalf("deployment %s deleted with propagation %v, want Foreground", del.GetName(), pp)
+		}
+	}
+	if !found {
+		t.Fatal("undo deleted no deployment")
+	}
+}
+
 func TestDeploymentUndoKeepsNamespaceWithSamePlanOtherService(t *testing.T) {
 	ctx := context.Background()
 	tgt := fake.NewClientset()
