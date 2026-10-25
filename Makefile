@@ -1,4 +1,4 @@
-.PHONY: test itest itest-up itest-down e2e-up e2e-down e2e-check vet ui ui-test
+.PHONY: test itest itest-up itest-down e2e-up e2e-down e2e-check e2e-test vet ui ui-test
 
 test:
 	go test -race -count=1 ./...
@@ -29,6 +29,9 @@ e2e-down:
 # e2e-check runs only up.sh's refusals (disk, existing clusters, ports).
 e2e-check:
 	test/e2e/fixture/up.sh --check-only
+
+e2e-test:
+	KUBECONFIG=/nonexistent go test -tags e2e -p 1 -count=1 -timeout 40m -run '^TestE2E$$' ./test/e2e/
 
 # ui rebuilds ui/dist, which is committed and embedded into the binary.
 ui:

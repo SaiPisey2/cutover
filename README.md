@@ -35,6 +35,9 @@ are done; the end-to-end demo is next.
   (sequences are synced in both directions)
 - the application's roles (table owners and grantees) exist on the target
   before Prepare: it copies owners and grants, not roles
+- the target `dsn` role is a superuser or a member of each role that owns the
+  copied tables: cutover copies table owners (`ALTER ... OWNER TO`), and undo
+  and reverse replication need the same
 - sequences not owned by a plan table (standalone ones) already exist on the
   target: Prepare copies only the plan tables and the sequences they own.
   A sequence only the target has is fine until something uses it; after
@@ -49,6 +52,28 @@ are done; the end-to-end demo is next.
 - Kubernetes (deployment): a kubeconfig file and context per side, named in
   the plan. cutover reads only that file, never `KUBECONFIG` or
   `~/.kube/config`
+
+## End-to-end run
+
+`test/e2e` moves a demo app (an API on a Docker host, a worker on
+Kubernetes, and Postgres) from one simulated cloud to another, on your
+machine. Each cloud is a Docker host container, a kind cluster and a
+Postgres. A load generator runs throughout, and the test fails on any
+failed request. It proves the move completes with zero failed requests,
+rolls back on an injected fault, and resumes after the worker is killed
+mid-switch.
+
+It needs Docker with 8 GB of memory, 20 GiB of free disk, `kind`, Envoy, the
+temporal CLI, and `pg_dump` and `psql` 17.
+
+```bash
+make e2e-up     # builds the fixture; refuses below 20 GiB free
+make e2e-test
+make e2e-down   # removes the fixture and the images it built
+```
+
+It never touches your default kubeconfig: every command names its own
+kubeconfig under `test/run/e2e/`.
 
 ## The front door
 
