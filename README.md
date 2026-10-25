@@ -14,7 +14,7 @@ fails. Two different people approve that switch. Reverse replication keeps
 the old database current until you finish, so rolling back is one command.
 
 Status: release 1 in progress. The database, traffic and web console parts
-are done; the end-to-end demo is next.
+are done, and an end-to-end run on kind exercises them together.
 
 ## Requirements
 
@@ -63,8 +63,9 @@ failed request. It proves the move completes with zero failed requests,
 rolls back on an injected fault, and resumes after the worker is killed
 mid-switch.
 
-It needs Docker with 8 GB of memory, 20 GiB of free disk, `kind`, Envoy, the
-temporal CLI, and `pg_dump` and `psql` 17.
+It needs Docker with 8 GB of memory, 20 GiB of free disk, `kind`, `kubectl`,
+Envoy, the temporal CLI, `pg_dump` and `psql` 17, and `openssl`, `lsof`,
+`ssh-keyscan`, `scp` and `curl`.
 
 ```bash
 make e2e-up     # builds the fixture; refuses below 20 GiB free
