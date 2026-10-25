@@ -140,19 +140,19 @@ export default function Audit() {
                   <td>{stamp(r.at)}</td>
                   <td>
                     {clean(r.actor_name)}
-                    {actorAccount(r.actor_id, r.actor_name) !== '' && (
+                    {actorAccount(r.actor_id, r.actor_name) !== '' && actorAccount(r.actor_id, r.actor_name) !== clean(r.actor_name) && (
                       <>
                         {' '}
                         <span className="muted">{actorAccount(r.actor_id, r.actor_name)}</span>
                       </>
                     )}
                   </td>
-                  <td className="mono">{clean(r.migration)}</td>
-                  <td>{kindLabel(r.kind)}</td>
-                  <td>{clean(r.gate)}</td>
-                  <td>{clean(r.decision)}</td>
-                  <td>{clean(r.note)}</td>
-                  <td className="mono">{clean(r.evidence).slice(0, 12)}</td>
+                  <td className="mono" data-label="Migration">{clean(r.migration)}</td>
+                  <td data-label="Kind">{kindLabel(r.kind)}</td>
+                  <td data-label="Gate">{clean(r.gate)}</td>
+                  <td data-label="Decision">{clean(r.decision)}</td>
+                  <td className="long" data-label="Note">{clean(r.note)}</td>
+                  <td className="mono long" data-label="Digest">{clean(r.evidence).slice(0, 12)}</td>
                 </tr>
               ))}
             </tbody>

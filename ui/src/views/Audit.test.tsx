@@ -30,7 +30,8 @@ describe('Audit', () => {
     render(<Audit />);
     expect(await screen.findByText('#n2')).toBeTruthy();
     expect(screen.getByText('#o1')).toBeTruthy();
-    expect(screen.getByText('cli', { selector: 'span' })).toBeTruthy();
+    expect(screen.getAllByText('cli')).toHaveLength(1);
+    expect(screen.queryByText('cli', { selector: 'span' })).toBeNull();
   });
 
   it('pages with before=<last id>', async () => {
