@@ -6,6 +6,7 @@ test:
 vet:
 	go vet ./...
 	go vet -tags integration ./...
+	go vet -tags e2e ./...
 
 itest:
 	go test -race -count=1 -p 1 -tags integration ./...
@@ -30,10 +31,11 @@ e2e-down:
 e2e-check:
 	test/e2e/fixture/up.sh --check-only
 
-# Only TestE2E: it leaves cloud B populated, so the fixture checks that run
-# after it in the package would fail.
+# TestE2E and the unit test TestSourceOnly, not TestFixture: TestE2E leaves
+# cloud B populated, so the fixture check would fail after it. A run takes a
+# few minutes; the timeout stays inside CI's job limit so a hang dumps stacks.
 e2e-test:
-	KUBECONFIG=/nonexistent go test -tags e2e -p 1 -count=1 -timeout 40m -run '^TestE2E$$' ./test/e2e/
+	KUBECONFIG=/nonexistent go test -tags e2e -p 1 -count=1 -timeout 20m -run '^(TestE2E|TestSourceOnly)$$' ./test/e2e/
 
 # ui rebuilds ui/dist, which is committed and embedded into the binary.
 ui:
