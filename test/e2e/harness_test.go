@@ -428,7 +428,8 @@ func routeApply(t testing.TB, e *env, planPath string) {
 }
 
 // requireClean fails the test unless the fixture is as make e2e-up left
-// it, no migration shop runs, and the front door has no route.
+// it, no migration shop runs, and every front door route is source-only
+// (see sourceOnly).
 func requireClean(t testing.TB, e *env) {
 	t.Helper()
 	problems := fixtureProblems(t)
