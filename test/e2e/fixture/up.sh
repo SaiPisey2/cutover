@@ -76,9 +76,17 @@ say "starting databases, pgbouncer and docker hosts"
 
 say "recording docker host keys"
 # Both hosts share a host key baked into the image, which changes on rebuild.
-for p in 52241 52242; do
-	ssh-keyscan -q -t ed25519 -p "$p" 127.0.0.1
-done >"$run/ssh/known_hosts"
+# The published ports can lag the healthchecks briefly, so retry.
+for _ in $(seq 30); do
+	for p in 52241 52242; do
+		# No -q (Linux's OpenSSH lacks it), so drop the "#" banner lines,
+		# which some builds print to stdout. A refused port exits non-zero;
+		# the line count below decides.
+		ssh-keyscan -t ed25519 -p "$p" 127.0.0.1 2>/dev/null | grep -v '^#' || true
+	done >"$run/ssh/known_hosts"
+	[ "$(wc -l <"$run/ssh/known_hosts")" -eq 2 ] && break
+	sleep 1
+done
 [ "$(wc -l <"$run/ssh/known_hosts")" -eq 2 ] || die "ssh-keyscan did not return both host keys"
 
 say "building the demo image"
