@@ -1,5 +1,7 @@
 # cutover
 
+<!-- demo -->
+
 Move an application to another cloud while your users keep working: its
 Postgres database and its stateless services.
 
@@ -15,6 +17,141 @@ the old database current until you finish, so rolling back is one command.
 
 Status: release 1 in progress. The database, traffic and web console parts
 are done, and an end-to-end run on kind exercises them together.
+
+## How it works
+
+`cutover server` is the only thing operators talk to; it starts and
+signals the migration workflow in Temporal, and `cutover worker` does the
+work against both clouds. Users reach the app through Envoy, and every app
+copy reaches Postgres through PgBouncer, so cutover can move traffic and
+writes without changing the app.
+
+```mermaid
+flowchart TB
+    users(("Users"))
+    subgraph operator["Operator"]
+        browser["Browser console"]
+        cli["CLI: migrate, gate, rollback"]
+    end
+    subgraph host["cutover host"]
+        server["cutover server<br/>console 127.0.0.1:7700<br/>front-door API, xDS, audit log"]
+        temporal["Temporal"]
+        worker["cutover worker"]
+        envoy["Envoy front door"]
+    end
+    pgb["PgBouncer<br/>(database front door)"]
+    subgraph cloudA["Cloud A (source)"]
+        dockA["SSH host<br/>compose / systemd"]
+        kubeA["Kubernetes<br/>Deployment"]
+        pgA[("Postgres")]
+    end
+    subgraph cloudB["Cloud B (target)"]
+        dockB["SSH host<br/>compose / systemd"]
+        kubeB["Kubernetes<br/>Deployment"]
+        pgB[("Postgres")]
+    end
+
+    browser -->|HTTPS| server
+    cli -->|HTTPS| server
+    server -->|"start, signal"| temporal
+    worker <-->|"workflow tasks"| temporal
+    worker -->|"weights, counters"| server
+    server -->|xDS| envoy
+    worker -->|SSH| dockA & dockB
+    worker -->|"client-go"| kubeA & kubeB
+    worker -->|"admin: PAUSE, RESUME, repoint"| pgb
+    worker -->|"pgx, pg_dump, psql"| pgA & pgB
+    users -->|HTTP| envoy
+    envoy -->|"weighted split, mirror"| dockA & kubeA & dockB & kubeB
+    dockA & kubeA & dockB & kubeB -->|SQL| pgb
+    pgb -->|"before the switch"| pgA
+    pgb -.->|"after the switch"| pgB
+    pgA <-.->|"logical replication"| pgB
+```
+
+A migration runs as one workflow. Each phase stops at a gate for a person
+to approve; rejecting any gate, or running `cutover rollback` before
+Finish, undoes every completed phase in reverse. A failed step stops at a
+`retry-<step>` gate instead.
+
+```mermaid
+flowchart TD
+    discover["Discover<br/>readiness report"]
+    gDiscover{{"gate: discover"}}
+    prepare["Prepare<br/>target schema and services"]
+    gPrepare{{"gate: prepare"}}
+    replicate["Replicate<br/>forward link, wait until lag stays low"]
+    rehearse["Rehearse<br/>schema and data checks, mirror GET/HEAD"]
+    gRehearse{{"gate: rehearse"}}
+    gShift{{"gate: shift-N, one per step"}}
+    hold["Shift step<br/>set weight, hold for shift.hold"]
+    gTripped{{"gate: shift-tripped<br/>traffic back at 0%"}}
+    gSwitch{{"gate: switch<br/>two different approvers"}}
+    sw["Switch the database"]
+    gBroken{{"gate: replication-broken"}}
+    watch["Finish watch<br/>reverse replication stays on"]
+    gFinish{{"gate: finish"}}
+    finished(["Finished<br/>reverse link dropped, route on target only"])
+    rollback["Roll back<br/>switch back if needed, undo phases in reverse"]
+    rolledBack(["Rolled back"])
+
+    discover --> gDiscover
+    gDiscover -->|"blockers: fix, approve to check again"| discover
+    gDiscover -->|approve| prepare --> gPrepare
+    gPrepare -->|approve| replicate --> rehearse --> gRehearse
+    gRehearse -->|approve| gShift
+    gShift -->|approve| hold
+    hold -->|"step held, next step"| gShift
+    hold -->|"target error rate or p99 worse"| gTripped
+    gTripped -->|"approve: ramp again"| hold
+    hold -->|"100% held"| gSwitch
+    gSwitch -->|"two approvals"| sw
+    sw -->|"aborted, writes still on source"| gSwitch
+    sw -->|"aborted, replication left stopped"| gBroken
+    sw -->|switched| watch --> gFinish
+    gFinish -->|approve| finished
+    gDiscover & gPrepare & gRehearse & gShift & gTripped & gSwitch & gFinish -.->|reject| rollback
+    gBroken -->|"any decision"| rollback
+    rollback --> rolledBack
+```
+
+The database switch happens while PgBouncer holds every query, inside a
+budget of `switch.max_pause` (default 10 s). Until the repoint succeeds,
+any failure or a spent budget undoes the completed steps in reverse and
+writes resume on the old side.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as cutover worker
+    participant B as PgBouncer
+    participant S as Source Postgres
+    participant T as Target Postgres
+
+    Note over W,T: switch gate approved by two people. Pause budget starts.
+    W->>B: PAUSE (new queries wait in PgBouncer)
+    W->>S: write a sentinel token
+    W->>T: wait until the token arrives (drain)
+    W->>T: drop forward subscription and its slot
+    W->>S: read sequence values
+    W->>T: setval to source value + sequence_margin
+    W->>T: create reverse publication
+    W->>S: create reverse subscription (copy_data = false)
+    W->>B: repoint: rewrite routes file, RELOAD, check, RECONNECT
+    alt every step done within max_pause
+        Note over W,B: point of no return, writes now belong to the target
+        W->>B: RESUME (retried until it succeeds)
+        B->>T: held queries run on the target
+        W->>S: drop forward publication (after the pause)
+    else a step failed or max_pause ran out
+        Note over W,T: undo completed steps in reverse
+        W->>B: repoint back to the source, if the repoint was tried
+        W->>S: stop reverse replication, if it was created
+        W->>T: recreate forward subscription, if it was dropped
+        W->>B: RESUME
+        B->>S: held queries run on the source
+    end
+```
 
 ## Requirements
 
