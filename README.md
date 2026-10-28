@@ -1,6 +1,8 @@
 # cutover
 
-<!-- demo -->
+![A real migration in the console: gates approved, traffic moved 10% to 100%, a two-person database switch with the worker killed mid-switch, finished on cloud B with 0 failed requests](assets/demo.gif)
+
+A real run on two kind clusters under load. [Watch the 85-second video](assets/demo.mp4) for the full migration and an automatic rollback.
 
 Move an application to another cloud while your users keep working: its
 Postgres database and its stateless services.
