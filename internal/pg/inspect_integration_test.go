@@ -74,7 +74,7 @@ func mkRoles(t *testing.T, c *pgx.Conn, stmts ...string) {
 	ctx := context.Background()
 	t.Cleanup(func() {
 		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "stats_r", "nostats_r", "rds_replication", "rds_superuser",
-			"own_m", "own_a", "own_b", "own_c"} {
+			"own_m", "own_a", "own_b", "own_c", "own_d"} {
 			c.Exec(ctx, "DROP OWNED BY "+r)
 			c.Exec(ctx, "DROP ROLE IF EXISTS "+r)
 		}
@@ -233,20 +233,27 @@ func TestOwnersAndRoles(t *testing.T) {
 	itest.Reset(t)
 	ctx := context.Background()
 	src := itest.Conn(t, itest.SourceDSN)
-	mkRoles(t, src, "CREATE ROLE own_a", "CREATE ROLE own_b", "CREATE ROLE own_c",
-		"CREATE ROLE own_m LOGIN IN ROLE own_a")
+	mkRoles(t, src, "CREATE ROLE own_a", "CREATE ROLE own_b", "CREATE ROLE own_c", "CREATE ROLE own_d",
+		"CREATE ROLE own_m LOGIN IN ROLE own_a",
+		// A member without SET cannot SET ROLE, so cannot act as own_d (16+).
+		"GRANT own_d TO own_m WITH SET FALSE")
 	if _, err := src.Exec(ctx, `CREATE TABLE public.owned (id bigserial PRIMARY KEY);
 		ALTER TABLE public.owned OWNER TO own_a;
 		GRANT SELECT ON public.owned TO own_b, PUBLIC;
 		GRANT USAGE ON SEQUENCE public.owned_id_seq TO own_b;
-		GRANT USAGE ON SCHEMA public TO own_m`); err != nil {
+		GRANT USAGE ON SCHEMA public TO own_m;
+		GRANT CREATE ON SCHEMA public TO own_b;
+		GRANT SELECT (id) ON public.owned TO own_c;
+		CREATE POLICY p ON public.owned TO own_d USING (true);
+		CREATE POLICY q ON public.owned TO PUBLIC USING (true)`); err != nil {
 		t.Fatal(err)
 	}
-	f, err := pg.Inspect(ctx, src, []string{"public"})
+	f, err := pg.Inspect(ctx, src, []string{"public", "no_such_schema"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(f.Tables) != 1 || f.Tables[0].Owner != "own_a" || !slices.Equal(f.Tables[0].Grantees, []string{"own_a", "own_b"}) {
+	// Column grants (own_c) and policy roles (own_d) are named too.
+	if len(f.Tables) != 1 || f.Tables[0].Owner != "own_a" || !slices.Equal(f.Tables[0].Grantees, []string{"own_a", "own_b", "own_c", "own_d"}) {
 		t.Errorf("table: %+v", f.Tables)
 	}
 	if len(f.Sequences) != 1 || f.Sequences[0].Owner != "own_a" || !slices.Equal(f.Sequences[0].Grantees, []string{"own_a", "own_b"}) {
@@ -257,6 +264,14 @@ func TestOwnersAndRoles(t *testing.T) {
 	}
 	if _, ok := f.Roles["public"]; ok {
 		t.Errorf("PUBLIC is not a role: %v", f.Roles)
+	}
+	// Schemas that exist map to the roles with CREATE on them.
+	if pub, ok := f.SchemaCreate["public"]; !ok || !slices.Contains(pub, "own_b") || !slices.Contains(pub, "postgres") ||
+		slices.Contains(pub, "own_c") {
+		t.Errorf("schema create: %v", f.SchemaCreate)
+	}
+	if _, ok := f.SchemaCreate["no_such_schema"]; ok {
+		t.Errorf("absent schema must be absent: %v", f.SchemaCreate)
 	}
 
 	c := itest.Conn(t, itest.SourceDSN)
@@ -269,7 +284,7 @@ func TestOwnersAndRoles(t *testing.T) {
 	if f.User != "own_m" || f.Superuser {
 		t.Errorf("member: user %q superuser %v", f.User, f.Superuser)
 	}
-	for role, want := range map[string]bool{"own_m": true, "own_a": true, "own_b": false, "own_c": false, "postgres": false} {
+	for role, want := range map[string]bool{"own_m": true, "own_a": true, "own_b": false, "own_c": false, "own_d": false, "postgres": false} {
 		if got, ok := f.Roles[role]; !ok || got != want {
 			t.Errorf("member: Roles[%s] = %v (present %v), want %v", role, got, ok, want)
 		}

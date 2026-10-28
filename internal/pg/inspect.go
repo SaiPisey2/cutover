@@ -108,6 +108,10 @@ type Facts struct {
 	// ALTER ... OWNER TO needs: all true for a superuser, otherwise SET
 	// membership on 16+ and plain membership before.
 	Roles map[string]bool `json:"roles"`
+	// SchemaCreate maps each inspected schema that exists to the sorted roles
+	// with CREATE on it: a non-superuser's ALTER ... OWNER TO needs the new
+	// owner to have it. A schema missing from the map does not exist.
+	SchemaCreate map[string][]string `json:"schema_create"`
 }
 
 func (f Facts) Major() int { return f.VersionNum / 10000 }
@@ -142,6 +146,9 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 		return f, fmt.Errorf("role: %w", err)
 	}
 	if f.Roles, err = actableRoles(ctx, c, f.Superuser, f.VersionNum); err != nil {
+		return f, err
+	}
+	if f.SchemaCreate, err = schemaCreate(ctx, c, schemas); err != nil {
 		return f, err
 	}
 	if f.Replication, err = CanReplicate(ctx, c, f.User); err != nil {
@@ -221,12 +228,34 @@ func actableRoles(ctx context.Context, c *pgx.Conn, superuser bool, versionNum i
 	return out, nil
 }
 
-// grantees is a SQL expression: the sorted distinct role names in the ACL
-// of the pg_class row aliased rel. PUBLIC (grantee 0) has no pg_roles row and
-// drops out of the join.
+// grantees is a SQL expression: the sorted role names pg_dump names for the
+// pg_class row aliased rel, from its ACL, its column ACLs (GRANT ... (col))
+// and its policies (CREATE POLICY ... TO). PUBLIC (oid 0) has no pg_roles
+// row and drops out.
 func grantees(rel string) string {
-	return fmt.Sprintf(`coalesce((SELECT array_agg(DISTINCT r.rolname ORDER BY r.rolname)::text[]
-		FROM aclexplode(%s.relacl) e JOIN pg_roles r ON r.oid = e.grantee), '{}')`, rel)
+	return fmt.Sprintf(`coalesce((SELECT array_agg(r.rolname ORDER BY r.rolname)::text[] FROM pg_roles r WHERE r.oid IN (
+		  SELECT e.grantee FROM aclexplode(%[1]s.relacl) e
+		  UNION SELECT e.grantee FROM pg_attribute a, aclexplode(a.attacl) e
+		    WHERE a.attrelid = %[1]s.oid AND a.attnum > 0 AND NOT a.attisdropped
+		  UNION SELECT unnest(p.polroles) FROM pg_policy p WHERE p.polrelid = %[1]s.oid)), '{}')`, rel)
+}
+
+// schemaCreate maps each of schemas that exists to the sorted roles with
+// CREATE on it.
+func schemaCreate(ctx context.Context, c *pgx.Conn, schemas []string) (map[string][]string, error) {
+	rows, _ := c.Query(ctx, `SELECT n.nspname::text, coalesce(array_agg(r.rolname ORDER BY r.rolname)
+		  FILTER (WHERE has_schema_privilege(r.oid, n.oid, 'CREATE')), '{}')::text[]
+		FROM pg_namespace n CROSS JOIN pg_roles r WHERE n.nspname = ANY($1) GROUP BY 1`, schemas)
+	out := map[string][]string{}
+	var name string
+	var roles []string
+	if _, err := pgx.ForEachRow(rows, []any{&name, &roles}, func() error {
+		out[name] = roles
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("schema privileges: %w", err)
+	}
+	return out, nil
 }
 
 // memberOf is a SQL expression, true when the role in param is a member of

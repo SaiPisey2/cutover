@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/SaiPisey2/cutover/internal/frontdoor"
 	"github.com/SaiPisey2/cutover/internal/pg"
 	"github.com/SaiPisey2/cutover/internal/pgbouncer"
@@ -223,16 +225,25 @@ func Assess(in Input) Report {
 }
 
 // assessRoles checks the roles Prepare's schema copy names on the target:
-// the owners (ALTER ... OWNER TO) and grantees (GRANT ... TO) of the plan
-// tables and the sequences they own. Each must exist there, and the target
-// role must be able to act as each owner. One finding per role.
+// the owners (ALTER ... OWNER TO) and grantees (GRANT ... TO, CREATE POLICY
+// ... TO) of the plan tables and the sequences they own. Each must exist
+// there; the target role must be able to act as each owner; and, unless it
+// is a superuser, each owner needs CREATE on the object's schema (a schema
+// Prepare creates is owned by the target role).
 func assessRoles(tables []string, byName map[string]pg.Table, seqs []pg.Sequence, tgt pg.Facts,
 	add func(Severity, string, string, string, ...any)) {
+	// Facts gathered before roles were inspected say nothing about them.
+	if tgt.Roles == nil {
+		return
+	}
+	type owned struct{ role, schema string }
 	owns, named := map[string][]string{}, map[string][]string{}
-	note := func(object, owner string, grantees []string) {
+	inSchema := map[owned][]string{}
+	note := func(object, schema, owner string, grantees []string) {
 		if owner != "" {
 			owns[owner] = append(owns[owner], object)
 			named[owner] = append(named[owner], object)
+			inSchema[owned{owner, schema}] = append(inSchema[owned{owner, schema}], object)
 		}
 		for _, g := range grantees {
 			// "public" is reserved: it means every role, not one to create.
@@ -243,28 +254,51 @@ func assessRoles(tables []string, byName map[string]pg.Table, seqs []pg.Sequence
 	}
 	for _, name := range tables {
 		t := byName[name]
-		note(name, t.Owner, t.Grantees)
+		note(name, t.Schema, t.Owner, t.Grantees)
 	}
 	for _, s := range seqs {
 		if slices.Contains(tables, s.OwnedBy) {
-			note(s.Qualified(), s.Owner, s.Grantees)
+			note(s.Qualified(), s.Schema, s.Owner, s.Grantees)
 		}
 	}
 	// objects names the first object and counts the rest.
 	objects := func(list []string) string {
-		if len(list) == 1 {
+		switch len(list) {
+		case 1:
 			return list[0]
+		case 2:
+			return list[0] + " and 1 other object"
 		}
 		return fmt.Sprintf("%s and %d other objects", list[0], len(list)-1)
 	}
+	quote := func(role string) string { return pgx.Identifier{role}.Sanitize() }
 	for role, list := range named {
 		if _, ok := tgt.Roles[role]; !ok {
-			add(Blocker, "role-missing", role, "role %q owns or has grants on %s on the source but does not exist on the target; create it on the target first (cutover copies owners and grants, not roles)", role, objects(list))
+			verb := "has grants on"
+			if _, owner := owns[role]; owner {
+				verb = "owns"
+			}
+			add(Blocker, "role-missing", role, "role %q %s %s on the source but does not exist on the target; create it on the target first (cutover copies owners and grants, not roles)", role, verb, objects(list))
 		}
 	}
 	for role, list := range owns {
 		if ok, exists := tgt.Roles[role]; exists && !ok {
-			add(Blocker, "role-cannot-act", role, "the target role %q cannot act as %q, which owns %s, so Prepare cannot set the owner; make %q a superuser or run GRANT %s TO %s on the target", tgt.User, role, objects(list), tgt.User, role, tgt.User)
+			add(Blocker, "role-cannot-act", role, "the target role %q cannot act as %q, which owns %s, so Prepare cannot set the owner; make %q a superuser or run GRANT %s TO %s on the target", tgt.User, role, objects(list), tgt.User, quote(role), quote(tgt.User))
+		}
+	}
+	if tgt.Superuser {
+		return
+	}
+	for o, list := range inSchema {
+		if _, exists := tgt.Roles[o.role]; !exists {
+			continue // role-missing already
+		}
+		create, present := tgt.SchemaCreate[o.schema]
+		switch {
+		case !present && o.role != tgt.User:
+			add(Blocker, "role-schema-create", o.role, "schema %s does not exist on the target, and Prepare would create it owned by %q, so %q (owner of %s) could not own objects in it; create schema %s on the target and run GRANT CREATE ON SCHEMA %s TO %s, or make %q a superuser", o.schema, tgt.User, o.role, objects(list), o.schema, quote(o.schema), quote(o.role), tgt.User)
+		case present && !slices.Contains(create, o.role):
+			add(Blocker, "role-schema-create", o.role, "%q owns %s but has no CREATE on schema %s on the target, which ALTER ... OWNER TO needs when the target role %q is not a superuser; run GRANT CREATE ON SCHEMA %s TO %s on the target, or make %q a superuser", o.role, objects(list), o.schema, tgt.User, quote(o.schema), quote(o.role), tgt.User)
 		}
 	}
 }

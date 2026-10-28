@@ -37,8 +37,12 @@ are done, and an end-to-end run on kind exercises them together.
   before Prepare: it copies owners and grants, not roles
 - the target `dsn` role is a superuser or a member of each role that owns the
   copied tables: cutover copies table owners (`ALTER ... OWNER TO`), and undo
-  and reverse replication need the same. Readiness reports both before
-  Prepare, as blockers `role-missing` and `role-cannot-act`
+  and reverse replication need the same; unless it is a superuser, each
+  owner also needs `CREATE` on the table's schema on the target. Readiness
+  reports all three before Prepare, as blockers `role-missing`,
+  `role-cannot-act` and `role-schema-create`. Grants made by a role other
+  than the owner (`WITH GRANT OPTION`) also need that grantor role on the
+  target, and a superuser target role; readiness does not check those
 - sequences not owned by a plan table (standalone ones) already exist on the
   target: Prepare copies only the plan tables and the sequences they own.
   A sequence only the target has is fine until something uses it; after

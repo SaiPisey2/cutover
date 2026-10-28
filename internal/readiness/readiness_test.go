@@ -294,6 +294,7 @@ func TestTargetRoles(t *testing.T) {
 		in.Target.User = "migrator"
 		in.Target.Superuser = false
 		in.Target.Roles = map[string]bool{"migrator": true, "app": true, "reader": false}
+		in.Target.SchemaCreate = map[string][]string{"public": {"app", "migrator"}}
 	}
 	for _, tc := range []struct {
 		name    string
@@ -304,11 +305,28 @@ func TestTargetRoles(t *testing.T) {
 	}{
 		{"all present", func(in *Input) {}, "", "", nil},
 		{"missing owner", func(in *Input) { delete(in.Target.Roles, "app") },
-			"role-missing", "app", []string{`"app"`, "public.orders", "and 1 other", "create it on the target first"}},
+			"role-missing", "app", []string{`"app" owns public.orders and 1 other object on`, "create it on the target first"}},
+		{"missing owner of many", func(in *Input) {
+			delete(in.Target.Roles, "app")
+			in.Source.Tables = append(in.Source.Tables, pg.Table{Schema: "public", Name: "lines", ReplIdent: "d", PKCols: []string{"id"}, Owner: "app"})
+		}, "role-missing", "app", []string{"public.lines and 2 other objects"}},
 		{"missing grantee", func(in *Input) { delete(in.Target.Roles, "reader") },
-			"role-missing", "reader", []string{`"reader"`, "public.orders", "create it on the target first"}},
+			"role-missing", "reader", []string{`"reader" has grants on public.orders on`, "create it on the target first"}},
 		{"owner present, cannot act", func(in *Input) { in.Target.Roles["app"] = false },
-			"role-cannot-act", "app", []string{`"migrator"`, `"app"`, "public.orders", "GRANT app TO migrator", "superuser"}},
+			"role-cannot-act", "app", []string{`"migrator"`, `"app"`, "public.orders", `GRANT "app" TO "migrator"`, "superuser"}},
+		{"owner lacks create on schema", func(in *Input) { in.Target.SchemaCreate["public"] = []string{"migrator"} },
+			"role-schema-create", "app", []string{`"app"`, "public.orders", `GRANT CREATE ON SCHEMA "public" TO "app"`}},
+		{"schema absent, owner is not the target role", func(in *Input) { in.Target.SchemaCreate = map[string][]string{} },
+			"role-schema-create", "app", []string{`"app"`, "public.orders", "does not exist on the target", `GRANT CREATE ON SCHEMA "public" TO "app"`}},
+		{"schema absent, owner is the target role", func(in *Input) {
+			in.Target.SchemaCreate = map[string][]string{}
+			in.Source.Tables[0].Owner, in.Source.Sequences[0].Owner = "migrator", "migrator"
+		}, "", "", nil},
+		{"superuser target needs no create", func(in *Input) {
+			in.Target.Superuser = true
+			in.Target.SchemaCreate = map[string][]string{"public": {"migrator"}}
+		}, "", "", nil},
+		{"roles unknown", func(in *Input) { in.Target.Roles = nil }, "", "", nil},
 		{"superuser target", func(in *Input) {
 			in.Target.User, in.Target.Superuser = "postgres", true
 			in.Target.Roles = map[string]bool{"postgres": true, "app": true, "reader": true}
@@ -334,7 +352,7 @@ func TestTargetRoles(t *testing.T) {
 			r := Assess(in)
 			var got []Finding
 			for _, f := range r.Findings {
-				if f.Code == "role-missing" || f.Code == "role-cannot-act" {
+				if strings.HasPrefix(f.Code, "role-") {
 					got = append(got, f)
 				}
 			}
