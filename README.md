@@ -20,53 +20,60 @@ are done, and an end-to-end run on kind exercises them together.
 
 ## How it works
 
-`cutover server` is the only thing operators talk to; it starts and
+`cutover server` is the only thing operators talk to. It starts and
 signals the migration workflow in Temporal, and `cutover worker` does the
-work against both clouds. Users reach the app through Envoy, and every app
-copy reaches Postgres through PgBouncer, so cutover can move traffic and
-writes without changing the app.
+work in both clouds through four connectors.
 
 ```mermaid
 flowchart TB
-    users(("Users"))
     subgraph operator["Operator"]
+        direction LR
         browser["Browser console"]
         cli["CLI: migrate, gate, rollback"]
     end
-    subgraph host["cutover host"]
-        server["cutover server<br/>console 127.0.0.1:7700<br/>front-door API, xDS, audit log"]
-        temporal["Temporal"]
-        worker["cutover worker"]
-        envoy["Envoy front door"]
-    end
-    pgb["PgBouncer<br/>(database front door)"]
-    subgraph cloudA["Cloud A (source)"]
-        dockA["SSH host<br/>compose / systemd"]
-        kubeA["Kubernetes<br/>Deployment"]
-        pgA[("Postgres")]
-    end
-    subgraph cloudB["Cloud B (target)"]
-        dockB["SSH host<br/>compose / systemd"]
-        kubeB["Kubernetes<br/>Deployment"]
-        pgB[("Postgres")]
-    end
+    server["cutover server<br/>console 127.0.0.1:7700<br/>front-door API, xDS, audit log"]
+    temporal["Temporal"]
+    worker["cutover worker"]
+    ssh["SSH hosts<br/>compose, systemd"]
+    kube["Kubernetes<br/>Deployments"]
+    pg["Postgres<br/>replication, checks<br/>+ PgBouncer admin"]
+    envoy["Envoy front door"]
+    clouds["Cloud A (source) and Cloud B (target)"]
 
     browser -->|HTTPS| server
     cli -->|HTTPS| server
     server -->|"start, signal"| temporal
-    worker <-->|"workflow tasks"| temporal
-    worker -->|"weights, counters"| server
+    temporal <-->|"workflow tasks"| worker
+    worker --> ssh & kube & pg
+    worker -->|"front-door API"| server
     server -->|xDS| envoy
-    worker -->|SSH| dockA & dockB
-    worker -->|"client-go"| kubeA & kubeB
-    worker -->|"admin: PAUSE, RESUME, repoint"| pgb
-    worker -->|"pgx, pg_dump, psql"| pgA & pgB
+    ssh & kube & pg & envoy --> clouds
+```
+
+Users reach the app through Envoy, and every copy of the app reaches
+Postgres through PgBouncer, so cutover can move traffic and writes without
+changing the app.
+
+```mermaid
+flowchart TB
+    users(("Users"))
+    envoy["Envoy front door"]
+    appA["Cloud A services"]
+    appB["Cloud B services"]
+    pgb["PgBouncer"]
+    pgA[("Postgres A<br/>source")]
+    pgB[("Postgres B<br/>target")]
+    repl["logical replication A to B<br/>reversed after the switch"]
+
     users -->|HTTP| envoy
-    envoy -->|"weighted split, mirror"| dockA & kubeA & dockB & kubeB
-    dockA & kubeA & dockB & kubeB -->|SQL| pgb
+    envoy -->|"100% → 0%"| appA
+    envoy -->|"mirror, then 0% → 100%"| appB
+    appA -->|SQL| pgb
+    appB -->|SQL| pgb
     pgb -->|"before the switch"| pgA
     pgb -.->|"after the switch"| pgB
-    pgA <-.->|"logical replication"| pgB
+    pgA -.- repl
+    pgB -.- repl
 ```
 
 A migration runs as one workflow. Each phase stops at a gate for a person
@@ -110,7 +117,8 @@ flowchart TD
     sw -->|"aborted, replication left stopped"| gBroken
     sw -->|switched| watch --> gFinish
     gFinish -->|approve| finished
-    gDiscover & gPrepare & gRehearse & gShift & gTripped & gSwitch & gFinish -.->|reject| rollback
+    anyGate["any gate: reject<br/>or cutover rollback before Finish"]
+    anyGate -.-> rollback
     gBroken -->|"any decision"| rollback
     rollback --> rolledBack
 ```
