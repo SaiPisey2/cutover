@@ -281,3 +281,88 @@ func TestSequenceOnlyOnTarget(t *testing.T) {
 		t.Fatalf("want sequence-target-only warning: %+v", r.Findings)
 	}
 }
+
+// Prepare copies owners and grants (ALTER ... OWNER TO, GRANT ... TO), not
+// roles, so every role it names must exist on the target, and the target
+// role must be able to act as each owner, or the apply fails mid-Prepare.
+func TestTargetRoles(t *testing.T) {
+	// owned gives the plan table and its sequence an owner and grantees,
+	// with the target role "migrator" able to act as every role it knows.
+	owned := func(in *Input) {
+		in.Source.Tables[0].Owner, in.Source.Tables[0].Grantees = "app", []string{"app", "reader"}
+		in.Source.Sequences[0].Owner = "app"
+		in.Target.User = "migrator"
+		in.Target.Superuser = false
+		in.Target.Roles = map[string]bool{"migrator": true, "app": true, "reader": false}
+	}
+	for _, tc := range []struct {
+		name    string
+		edit    func(*Input)
+		code    string // "" means neither role code
+		subject string
+		says    []string
+	}{
+		{"all present", func(in *Input) {}, "", "", nil},
+		{"missing owner", func(in *Input) { delete(in.Target.Roles, "app") },
+			"role-missing", "app", []string{`"app"`, "public.orders", "and 1 other", "create it on the target first"}},
+		{"missing grantee", func(in *Input) { delete(in.Target.Roles, "reader") },
+			"role-missing", "reader", []string{`"reader"`, "public.orders", "create it on the target first"}},
+		{"owner present, cannot act", func(in *Input) { in.Target.Roles["app"] = false },
+			"role-cannot-act", "app", []string{`"migrator"`, `"app"`, "public.orders", "GRANT app TO migrator", "superuser"}},
+		{"superuser target", func(in *Input) {
+			in.Target.User, in.Target.Superuser = "postgres", true
+			in.Target.Roles = map[string]bool{"postgres": true, "app": true, "reader": true}
+		}, "", "", nil},
+		{"public ignored", func(in *Input) { in.Source.Tables[0].Grantees = append(in.Source.Tables[0].Grantees, "public") }, "", "", nil},
+		{"non-plan table ignored", func(in *Input) {
+			in.Plan.Database.Tables = []string{"public.orders"}
+			in.Source.Tables = append(in.Source.Tables, pg.Table{Schema: "public", Name: "other", ReplIdent: "d", PKCols: []string{"id"},
+				Owner: "ghost", Grantees: []string{"ghost2"}})
+			in.Target.Sequences = []pg.Sequence{{Schema: "public", Name: "other_id_seq", Increment: 1}}
+			in.Source.Sequences = append(in.Source.Sequences, pg.Sequence{Schema: "public", Name: "other_id_seq", Increment: 1,
+				OwnedBy: "public.other", Owner: "ghost3"})
+		}, "", "", nil},
+		{"owned sequence owner missing", func(in *Input) { in.Source.Sequences[0].Owner = "seqowner" },
+			"role-missing", "seqowner", []string{`"seqowner"`, "public.orders_id_seq"}},
+		{"owned sequence grantee missing", func(in *Input) { in.Source.Sequences[0].Grantees = []string{"seqreader"} },
+			"role-missing", "seqreader", []string{"public.orders_id_seq"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := good()
+			owned(&in)
+			tc.edit(&in)
+			r := Assess(in)
+			var got []Finding
+			for _, f := range r.Findings {
+				if f.Code == "role-missing" || f.Code == "role-cannot-act" {
+					got = append(got, f)
+				}
+			}
+			if tc.code == "" {
+				if len(got) > 0 {
+					t.Fatalf("want no role findings, got %+v", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Code != tc.code || got[0].Severity != Blocker || got[0].Subject != tc.subject {
+				t.Fatalf("want one %s blocker for %s, got %+v", tc.code, tc.subject, got)
+			}
+			for _, s := range tc.says {
+				if !strings.Contains(got[0].Message, s) {
+					t.Errorf("message %q should contain %q", got[0].Message, s)
+				}
+			}
+		})
+	}
+}
+
+// A grantee-only role needs only to exist: the target role never acts as it.
+func TestGranteeNeedNotBeActable(t *testing.T) {
+	in := good()
+	in.Source.Tables[0].Owner, in.Source.Tables[0].Grantees = "app", []string{"reader"}
+	in.Target.User = "migrator"
+	in.Target.Roles = map[string]bool{"migrator": true, "app": true, "reader": false}
+	if r := Assess(in); r.Blocked() {
+		t.Fatalf("%+v", r.Findings)
+	}
+}

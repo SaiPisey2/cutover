@@ -23,6 +23,10 @@ type Table struct {
 	PKCols      []string `json:"pk_cols"`
 	// Unlogged tables are not written to WAL, so logical replication skips them.
 	Unlogged bool `json:"unlogged"`
+	// Owner and Grantees are the roles Prepare's ALTER ... OWNER TO and
+	// GRANT ... TO name on the target. PUBLIC is left out; Grantees is sorted.
+	Owner    string   `json:"owner"`
+	Grantees []string `json:"grantees"`
 }
 
 func (t Table) Qualified() string { return t.Schema + "." + t.Name }
@@ -58,7 +62,9 @@ type Sequence struct {
 	// OwnedBy is the qualified table owning the sequence (a serial or
 	// identity column), or "" for a standalone sequence. Prepare copies only
 	// sequences owned by plan tables.
-	OwnedBy string `json:"owned_by,omitempty"`
+	OwnedBy  string   `json:"owned_by,omitempty"`
+	Owner    string   `json:"owner"`
+	Grantees []string `json:"grantees"` // as Table.Grantees
 }
 
 func (s Sequence) Qualified() string { return s.Schema + "." + s.Name }
@@ -96,6 +102,12 @@ type Facts struct {
 	// (superuser, or a member of pg_read_all_stats). Without it their
 	// client_addr and application_name read as NULL, and Sessions misses them.
 	SeesAllSessions bool `json:"sees_all_sessions"`
+	// User is the connecting role (current_user).
+	User string `json:"user"`
+	// Roles maps every role on the server to whether User can act as it, as
+	// ALTER ... OWNER TO needs: all true for a superuser, otherwise SET
+	// membership on 16+ and plain membership before.
+	Roles map[string]bool `json:"roles"`
 }
 
 func (f Facts) Major() int { return f.VersionNum / 10000 }
@@ -125,12 +137,14 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 	if err := c.QueryRow(ctx, "SELECT count(*) FROM pg_replication_slots").Scan(&f.UsedSlots); err != nil {
 		return f, fmt.Errorf("slots: %w", err)
 	}
-	var user string
 	if err := c.QueryRow(ctx, "SELECT current_user::text, rolsuper FROM pg_roles WHERE rolname = current_user").
-		Scan(&user, &f.Superuser); err != nil {
+		Scan(&f.User, &f.Superuser); err != nil {
 		return f, fmt.Errorf("role: %w", err)
 	}
-	if f.Replication, err = CanReplicate(ctx, c, user); err != nil {
+	if f.Roles, err = actableRoles(ctx, c, f.Superuser, f.VersionNum); err != nil {
+		return f, err
+	}
+	if f.Replication, err = CanReplicate(ctx, c, f.User); err != nil {
 		return f, err
 	}
 	f.CreateSubscription = f.Superuser
@@ -141,7 +155,7 @@ func Inspect(ctx context.Context, c *pgx.Conn, schemas []string) (Facts, error) 
 		if f.VersionNum >= 160000 {
 			role = "pg_create_subscription"
 		}
-		if err := c.QueryRow(ctx, "SELECT "+memberOf("$1", role), user).
+		if err := c.QueryRow(ctx, "SELECT "+memberOf("$1", role), f.User).
 			Scan(&f.CreateSubscription); err != nil {
 			return f, fmt.Errorf("%s: %w", role, err)
 		}
@@ -186,6 +200,35 @@ func Sessions(ctx context.Context, c *pgx.Conn) (_ []Session, all bool, err erro
 	return out, all, nil
 }
 
+// actableRoles maps every role to whether the connecting role can act as it
+// (SET ROLE, and so ALTER ... OWNER TO): all of them for a superuser. The SET
+// option exists from 16; before that membership is what counts.
+func actableRoles(ctx context.Context, c *pgx.Conn, superuser bool, versionNum int) (map[string]bool, error) {
+	priv := "MEMBER"
+	if versionNum >= 160000 {
+		priv = "SET"
+	}
+	rows, _ := c.Query(ctx, "SELECT rolname::text, $1 OR pg_has_role(current_user, oid, $2) FROM pg_roles", superuser, priv)
+	out := map[string]bool{}
+	var name string
+	var ok bool
+	if _, err := pgx.ForEachRow(rows, []any{&name, &ok}, func() error {
+		out[name] = ok
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("roles: %w", err)
+	}
+	return out, nil
+}
+
+// grantees is a SQL expression: the sorted distinct role names in the ACL
+// of the pg_class row aliased rel. PUBLIC (grantee 0) has no pg_roles row and
+// drops out of the join.
+func grantees(rel string) string {
+	return fmt.Sprintf(`coalesce((SELECT array_agg(DISTINCT r.rolname ORDER BY r.rolname)::text[]
+		FROM aclexplode(%s.relacl) e JOIN pg_roles r ON r.oid = e.grantee), '{}')`, rel)
+}
+
 // memberOf is a SQL expression, true when the role in param is a member of
 // the named role. The CASE keeps pg_has_role, which errors on unknown role
 // names, from running when the named role does not exist.
@@ -212,14 +255,14 @@ func CanReplicate(ctx context.Context, c *pgx.Conn, role string) (bool, error) {
 }
 
 // Tables lists ordinary and partitioned tables (not partitions) in schemas,
-// with primary key columns in index order.
+// with primary key columns in index order, owner and grantees.
 func Tables(ctx context.Context, c *pgx.Conn, schemas []string) ([]Table, error) {
 	rows, _ := c.Query(ctx, `
 		SELECT n.nspname::text, c.relname::text, c.relkind = 'p', c.relreplident::text,
 		       coalesce((SELECT array_agg(a.attname::text ORDER BY array_position(i.indkey::int2[], a.attnum))
 		                 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
 		                 WHERE i.indrelid = c.oid AND i.indisprimary), '{}'),
-			       c.relpersistence = 'u'
+			       c.relpersistence = 'u', pg_get_userbyid(c.relowner)::text, `+grantees("c")+`
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition AND n.nspname = ANY($1)
 		ORDER BY 1, 2`, schemas)
@@ -249,6 +292,8 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 		Schema, Name     string
 		Start, Increment int64
 		OwnedBy          string
+		Owner            string
+		Grantees         []string
 	}
 	// deptype a: OWNED BY (serial); i: identity column.
 	rows, _ := c.Query(ctx, `SELECT s.schemaname::text, s.sequencename::text, s.start_value, s.increment_by,
@@ -256,8 +301,11 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 		    FROM pg_depend d JOIN pg_class tc ON tc.oid = d.refobjid JOIN pg_namespace tn ON tn.oid = tc.relnamespace
 		    WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
 		      AND d.objid = (quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename))::regclass
-		      AND d.deptype IN ('a', 'i') LIMIT 1), '')
-		FROM pg_sequences s WHERE s.schemaname = ANY($1) ORDER BY 1, 2`, schemas)
+		      AND d.deptype IN ('a', 'i') LIMIT 1), ''),
+		  s.sequenceowner::text, `+grantees("sc")+`
+		FROM pg_sequences s JOIN pg_class sc
+		  ON sc.oid = (quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename))::regclass
+		WHERE s.schemaname = ANY($1) ORDER BY 1, 2`, schemas)
 	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
 		return nil, fmt.Errorf("sequences: %w", err)
@@ -272,7 +320,8 @@ func Sequences(ctx context.Context, c *pgx.Conn, schemas []string) ([]Sequence, 
 	}
 	br := c.SendBatch(ctx, batch)
 	for _, r := range list {
-		s := Sequence{Schema: r.Schema, Name: r.Name, Increment: r.Increment, OwnedBy: r.OwnedBy}
+		s := Sequence{Schema: r.Schema, Name: r.Name, Increment: r.Increment, OwnedBy: r.OwnedBy,
+			Owner: r.Owner, Grantees: r.Grantees}
 		var last int64
 		if err := br.QueryRow().Scan(&last, &s.IsCalled); err != nil {
 			br.Close()

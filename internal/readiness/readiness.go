@@ -167,6 +167,8 @@ func Assess(in Input) Report {
 		}
 	}
 
+	assessRoles(r.Tables, byName, src.Sequences, tgt, add)
+
 	// Compared as Repoint verifies a route: host (any case), port, dbname.
 	db := in.Plan.Database.Name
 	srcRoute, routeErr := route.Resolve(in.Plan.Source.Postgres.Route, db)
@@ -218,6 +220,53 @@ func Assess(in Input) Report {
 		return strings.Compare(a.Message, b.Message)
 	})
 	return r
+}
+
+// assessRoles checks the roles Prepare's schema copy names on the target:
+// the owners (ALTER ... OWNER TO) and grantees (GRANT ... TO) of the plan
+// tables and the sequences they own. Each must exist there, and the target
+// role must be able to act as each owner. One finding per role.
+func assessRoles(tables []string, byName map[string]pg.Table, seqs []pg.Sequence, tgt pg.Facts,
+	add func(Severity, string, string, string, ...any)) {
+	owns, named := map[string][]string{}, map[string][]string{}
+	note := func(object, owner string, grantees []string) {
+		if owner != "" {
+			owns[owner] = append(owns[owner], object)
+			named[owner] = append(named[owner], object)
+		}
+		for _, g := range grantees {
+			// "public" is reserved: it means every role, not one to create.
+			if g != owner && g != "public" {
+				named[g] = append(named[g], object)
+			}
+		}
+	}
+	for _, name := range tables {
+		t := byName[name]
+		note(name, t.Owner, t.Grantees)
+	}
+	for _, s := range seqs {
+		if slices.Contains(tables, s.OwnedBy) {
+			note(s.Qualified(), s.Owner, s.Grantees)
+		}
+	}
+	// objects names the first object and counts the rest.
+	objects := func(list []string) string {
+		if len(list) == 1 {
+			return list[0]
+		}
+		return fmt.Sprintf("%s and %d other objects", list[0], len(list)-1)
+	}
+	for role, list := range named {
+		if _, ok := tgt.Roles[role]; !ok {
+			add(Blocker, "role-missing", role, "role %q owns or has grants on %s on the source but does not exist on the target; create it on the target first (cutover copies owners and grants, not roles)", role, objects(list))
+		}
+	}
+	for role, list := range owns {
+		if ok, exists := tgt.Roles[role]; exists && !ok {
+			add(Blocker, "role-cannot-act", role, "the target role %q cannot act as %q, which owns %s, so Prepare cannot set the owner; make %q a superuser or run GRANT %s TO %s on the target", tgt.User, role, objects(list), tgt.User, role, tgt.User)
+		}
+	}
 }
 
 // DirectClients returns the sessions whose client address is outside

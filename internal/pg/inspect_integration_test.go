@@ -4,6 +4,7 @@ package pg_test
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -72,7 +73,8 @@ func mkRoles(t *testing.T, c *pgx.Conn, stmts ...string) {
 	t.Helper()
 	ctx := context.Background()
 	t.Cleanup(func() {
-		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "stats_r", "nostats_r", "rds_replication", "rds_superuser"} {
+		for _, r := range []string{"rr_member", "rs_member", "plain_r", "seq_noacc", "seq_sel", "stats_r", "nostats_r", "rds_replication", "rds_superuser",
+			"own_m", "own_a", "own_b", "own_c"} {
 			c.Exec(ctx, "DROP OWNED BY "+r)
 			c.Exec(ctx, "DROP ROLE IF EXISTS "+r)
 		}
@@ -221,6 +223,55 @@ func TestSeesAllSessions(t *testing.T) {
 		}
 		if f.SeesAllSessions != want {
 			t.Errorf("%q: SeesAllSessions %v, want %v", role, f.SeesAllSessions, want)
+		}
+	}
+}
+
+// Prepare names each plan table's owner and grantees on the target, so
+// Inspect reports them, and which roles the connecting role can act as.
+func TestOwnersAndRoles(t *testing.T) {
+	itest.Reset(t)
+	ctx := context.Background()
+	src := itest.Conn(t, itest.SourceDSN)
+	mkRoles(t, src, "CREATE ROLE own_a", "CREATE ROLE own_b", "CREATE ROLE own_c",
+		"CREATE ROLE own_m LOGIN IN ROLE own_a")
+	if _, err := src.Exec(ctx, `CREATE TABLE public.owned (id bigserial PRIMARY KEY);
+		ALTER TABLE public.owned OWNER TO own_a;
+		GRANT SELECT ON public.owned TO own_b, PUBLIC;
+		GRANT USAGE ON SEQUENCE public.owned_id_seq TO own_b;
+		GRANT USAGE ON SCHEMA public TO own_m`); err != nil {
+		t.Fatal(err)
+	}
+	f, err := pg.Inspect(ctx, src, []string{"public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Tables) != 1 || f.Tables[0].Owner != "own_a" || !slices.Equal(f.Tables[0].Grantees, []string{"own_a", "own_b"}) {
+		t.Errorf("table: %+v", f.Tables)
+	}
+	if len(f.Sequences) != 1 || f.Sequences[0].Owner != "own_a" || !slices.Equal(f.Sequences[0].Grantees, []string{"own_a", "own_b"}) {
+		t.Errorf("sequence: %+v", f.Sequences)
+	}
+	if f.User != "postgres" || !f.Roles["own_a"] || !f.Roles["own_c"] || !f.Roles["postgres"] {
+		t.Errorf("superuser: user %q roles %v", f.User, f.Roles)
+	}
+	if _, ok := f.Roles["public"]; ok {
+		t.Errorf("PUBLIC is not a role: %v", f.Roles)
+	}
+
+	c := itest.Conn(t, itest.SourceDSN)
+	if _, err := c.Exec(ctx, "SET ROLE own_m"); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = pg.Inspect(ctx, c, []string{"public"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.User != "own_m" || f.Superuser {
+		t.Errorf("member: user %q superuser %v", f.User, f.Superuser)
+	}
+	for role, want := range map[string]bool{"own_m": true, "own_a": true, "own_b": false, "own_c": false, "postgres": false} {
+		if got, ok := f.Roles[role]; !ok || got != want {
+			t.Errorf("member: Roles[%s] = %v (present %v), want %v", role, got, ok, want)
 		}
 	}
 }
